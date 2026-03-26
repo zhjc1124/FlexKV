@@ -34,6 +34,11 @@ try:
 except ImportError as e:
     raise RuntimeError("FlexKV is not installed. Please install it.") from e
 
+try:
+    from sglang.srt.mem_cache.memory_pool import NSATokenToKVPool
+except ImportError:
+    NSATokenToKVPool = None
+
 logger = logging.getLogger(__name__)
 
 
@@ -142,6 +147,7 @@ class FlexKVConnector:
         k_pool: torch.Tensor,
         v_pool: torch.Tensor,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        indexer_buffers: Optional[List[torch.Tensor]] = None,
     ):
         self.flexkv_config = FlexKVConfig.from_env()
         self.flexkv_config.post_init_from_sglang_config(
@@ -154,6 +160,8 @@ class FlexKVConnector:
         self.k_pool = k_pool
         self.v_pool = v_pool
         self.tp_group = tp_group
+        self.indexer_buffers = indexer_buffers
+        self.page_size = page_size
 
         if self.rank == 0:
             self.kv_manager = KVManager(
@@ -164,7 +172,7 @@ class FlexKVConnector:
             self.kv_manager.start()
 
         self.tp_client = KVTPClient(self.flexkv_config.gpu_register_port, 0, self.rank)
-        self.register_to_server(self.k_pool, self.v_pool)
+        self.register_to_server(self.k_pool, self.v_pool, self.indexer_buffers)
 
         # task_id -> req_id mapping (rank 0 only)
         self.inflight_taskid2reqid: Dict[int, int] = {}
@@ -379,13 +387,34 @@ class FlexKVConnector:
         if self.tp_group is not None and self.tp_size > 1:
             torch.distributed.barrier(self.tp_group)
 
-    def register_to_server(self, k_caches: List[torch.Tensor], v_caches: List[torch.Tensor]) -> None:
-        """Register GPU KV cache buffers to FlexKV server."""
+    def register_to_server(
+        self,
+        k_caches: List[torch.Tensor],
+        v_caches: List[torch.Tensor],
+        indexer_buffers: Optional[List[torch.Tensor]] = None,
+    ) -> None:
+        """Register GPU KV cache buffers to FlexKV server.
+
+        For MLA models (e.g., DeepSeek), ``is_mla`` is derived from the
+        FlexKV model config so that K/V are treated as a single latent
+        representation.
+
+        If *indexer_buffers* is provided (NSA sparse attention), they are
+        registered as a separate indexer cache via FlexKV's shadow-worker
+        mechanism.  Because sglang stores indexer data at **page-level**
+        granularity while the main KV cache uses **token-level** indices,
+        the indexer registration is only possible when ``page_size == 1``
+        (i.e. the two granularities coincide).  When ``page_size > 1`` a
+        warning is logged and the indexer is **not** registered -- the main
+        KV cache will still be offloaded correctly.
+        """
         assert len(k_caches) == len(v_caches)
         assert k_caches[0].ndim == 3, f"Expected 3D tensor, got shape={k_caches[0].shape}"
 
         num_layer = len(k_caches)
         num_blocks, num_kv_heads, head_size = k_caches[0].shape
+
+        is_mla = self.flexkv_config.model_config.use_mla
 
         gpu_layout = KVCacheLayout(
             type=KVCacheLayoutType.LAYERFIRST,
@@ -394,9 +423,73 @@ class FlexKVConnector:
             tokens_per_block=1,
             num_head=num_kv_heads,
             head_size=head_size,
-            is_mla=False,
+            is_mla=is_mla,
         )
-        self.tp_client.register_to_server(k_caches + v_caches, gpu_layout)
+
+        # Build indexer cache layout for NSA sparse attention if provided.
+        # The indexer buffer shape is (num_pages, page_stride_size) per layer,
+        # dtype=uint8.  FlexKV's shadow worker reuses the same block_ids as
+        # the main KV cache, so the indexer must share the same block
+        # granularity.  In sglang the main KV cache is token-level
+        # (tokens_per_block=1) while the indexer is page-level
+        # (num_pages = num_tokens / page_size).  When page_size == 1 the two
+        # are identical and we can register normally.  For page_size > 1 we
+        # cannot directly use the shadow worker because block_ids would be
+        # out-of-range for the smaller indexer dimension.
+        indexer_caches_list = None
+        indexer_layout = None
+        indexer_dtype = None
+
+        if indexer_buffers is not None and len(indexer_buffers) > 0:
+            indexer_tensor = indexer_buffers[0]
+            assert indexer_tensor.ndim == 2, (
+                f"Expected 2D indexer tensor (num_pages, page_stride_size), "
+                f"got shape={indexer_tensor.shape}"
+            )
+            indexer_num_pages = indexer_tensor.shape[0]
+            indexer_page_stride = indexer_tensor.shape[1]
+            indexer_dtype = indexer_tensor.dtype
+
+            if self.page_size == 1:
+                # page_size == 1: token-level == page-level, safe to register
+                indexer_caches_list = indexer_buffers
+                indexer_layout = KVCacheLayout(
+                    type=KVCacheLayoutType.LAYERFIRST,
+                    num_layer=len(indexer_buffers),
+                    num_block=indexer_num_pages,
+                    tokens_per_block=1,
+                    num_head=1,
+                    head_size=indexer_page_stride,
+                    is_mla=True,  # indexer cache is K-only, no K/V split
+                )
+                logger.info(
+                    f"[FlexKV] Registering NSA indexer cache: "
+                    f"num_layers={len(indexer_buffers)}, "
+                    f"num_pages={indexer_num_pages}, "
+                    f"page_stride={indexer_page_stride}, "
+                    f"dtype={indexer_dtype}"
+                )
+            else:
+                # page_size > 1: block_ids granularity mismatch
+                # TODO: support page-level indexer offloading via custom
+                #       block_id mapping in FlexKV transfer engine, or
+                #       manual adapter-side transfer with page-index
+                #       conversion.
+                logger.warning(
+                    f"[FlexKV] NSA indexer cache detected but page_size={self.page_size} > 1. "
+                    f"FlexKV shadow worker requires matching block granularity between "
+                    f"main KV cache (token-level) and indexer (page-level). "
+                    f"Indexer cache will NOT be offloaded. "
+                    f"Main KV cache offloading will still work correctly."
+                )
+
+        self.tp_client.register_to_server(
+            k_caches + v_caches,
+            gpu_layout,
+            indexer_caches=indexer_caches_list,
+            indexer_layout=indexer_layout,
+            indexer_dtype=indexer_dtype,
+        )
         logger.info("[FlexKV] Registered KV caches to server")
 
     def shutdown(self) -> None:
@@ -425,6 +518,18 @@ class FlexKVRadixCache(RadixCache):
         self.sts_flexkv_cache_len = 0
 
         kvcache = params.token_to_kv_pool_allocator.get_kvcache()
+
+        # Detect NSA sparse attention indexer cache
+        indexer_buffers = None
+        if NSATokenToKVPool is not None and isinstance(kvcache, NSATokenToKVPool):
+            indexer_buffers = getattr(kvcache, "index_k_with_scale_buffer", None)
+            if indexer_buffers is not None:
+                logger.info(
+                    f"[FlexKV] Detected NSATokenToKVPool with "
+                    f"{len(indexer_buffers)} indexer layers, "
+                    f"shape={indexer_buffers[0].shape}"
+                )
+
         self.flexkv_connector = FlexKVConnector(
             sgl_config=model_config,
             page_size=params.page_size,
@@ -441,6 +546,7 @@ class FlexKVRadixCache(RadixCache):
                 "v_buffer",
                 getattr(params.token_to_kv_pool_allocator._kvcache, "v_buffer"),
             ),
+            indexer_buffers=indexer_buffers,
         )
 
         self.layer_done_counter = self.flexkv_connector.layer_done_counter
