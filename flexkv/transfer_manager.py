@@ -43,8 +43,9 @@ class TransferManager:
         self.instance_num = GLOBAL_CONFIG_FROM_ENV.instance_num
         
         # Calculate total expected GPUs across all instances
-        self.expected_gpus = self.instance_num * model_config.tp_size * model_config.dp_size
-
+        self.expected_gpus = self.instance_num * \
+                             (model_config.cp_size if model_config.cp_size > 1 else model_config.tp_size) * \
+                             model_config.dp_size
         self.all_gpu_layouts: Dict[int, KVCacheLayout] = {}
         self.all_gpu_blocks: Dict[int, List[TensorSharedHandle]] = {}  # device_id -> gpu_blocks
         self.gpu_client_mapping: Dict[int, int] = {}  # device_id -> dp_client_id
@@ -86,7 +87,8 @@ class TransferManager:
         try:
             flexkv_logger.info(f"GPU tensor registration server started on port {self.gpu_register_port}, "
                                f"expected {self.expected_gpus} GPUs to register "
-                               f"(instance_num={self.instance_num}, tp={self.model_config.tp_size}, "
+                               f"(instance_num={self.instance_num}, "
+                               f"{f'cp={self.model_config.cp_size}, ' if self.model_config.cp_size > 1 else f'tp={self.model_config.tp_size}, '}"
                                f"dp={self.model_config.dp_size})")
             last_log_time = time.time()
             while len(self.all_gpu_blocks) < self.expected_gpus:
