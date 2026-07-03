@@ -358,6 +358,7 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
             self.cpu_layer_stride_in_bytes,
             self.cpu_block_stride_in_bytes,
             self.chunk_size_in_bytes,
+            0,
             self.num_layers,
             transfer_num_cta,
             transfer_type == TransferType.H2D,

@@ -143,6 +143,11 @@ class LayerwiseTransferWorker(TransferWorkerBase):
         else:
             layer_eventfds_tensor = torch.empty(0, dtype=torch.int32)
         flexkv_logger.debug(f"[LayerwiseWorker] Eventfds received, tensor shape={layer_eventfds_tensor.shape}")
+        # Pre-convert eventfds to Python list for O(1) indexing and pre-pack write value.
+        # This enables Python-side eventfd notification as a fallback for platforms
+        # (e.g. P800/XPU/Hygon DCU) where CUDA host callbacks may not fire.
+        self._layer_eventfds_list = layer_eventfds_tensor.tolist() if layer_eventfds_tensor.numel() > 0 else []
+        self._eventfd_val = struct.pack('Q', 1)
 
         # initialize CPU storage
         flexkv_logger.info(f"[LayerwiseWorker] Pinning CPU Memory: "
@@ -455,6 +460,28 @@ class LayerwiseTransferWorker(TransferWorkerBase):
             f"counters={num_counters}, tp_size_per_rank={tp_group_size}, layers={num_layers}"
         )
         return tensor
+
+    def _write_layer_eventfds(self, counter_id: int, layer_id: int) -> None:
+        """Write eventfd for a completed layer (all TP ranks).
+
+        On platforms where CUDA host callbacks (cudaLaunchHostFunc) do not fire
+        reliably (e.g. Hygon DCU, XPU), this Python-side fallback writes eventfds
+        after the C++ layerwise_transfer returns.
+        """
+        if not self._layer_eventfds_list:
+            return
+        base = counter_id * self.tp_group_size * self.num_layers + layer_id
+        step = self.num_layers
+        eventfd_val = self._eventfd_val
+        for tp_rank in range(self.tp_group_size):
+            idx = base + tp_rank * step
+            if idx < len(self._layer_eventfds_list):
+                fd = self._layer_eventfds_list[idx]
+                if fd >= 0:
+                    try:
+                        os.write(fd, eventfd_val)
+                    except OSError:
+                        pass
 
     def _transfer_impl(self,
                       src_block_ids_h2d: torch.Tensor,

@@ -1,6 +1,8 @@
 #include "layerwise.h"
 #include <atomic>
+#include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <fcntl.h>
 #include <stdexcept>
 #include <sys/eventfd.h>
@@ -9,53 +11,73 @@
 
 namespace flexkv {
 
-struct LayerCallbackData {
-  int start_layer;
-  int layers_this_batch;
-  int num_gpus;
-  std::atomic<int> *counter;
-  // Eventfd info for notification
-  bool enable_eventfd;
-  int tp_size;
-  int num_layers;
-  int *layer_eventfds;  // Pointer to eventfds array for current counter set
-  // NVTX range id for CPU->GPU transfer
-  nvtxRangeId_t *current_range_id_ptr;  // Pointer to current layer's range ID
-  bool is_last_batch;  // Whether this is the last batch
-  char next_range_name[64];  // Name for next layer's range (if not last batch)
-  nvtxRangeId_t *next_range_id_ptr;  // Pointer to next layer's range ID storage
-};
+// ===== Event-based layerwise notification =====
+// Replaces cudaLaunchHostFunc (which does not fire on some platforms:
+// Hygon DCU, XPU, and certain NVIDIA driver versions).
+// The polling thread queries per-batch CUDA events and writes eventfds
+// as soon as each batch completes on all GPUs.
 
-static void CUDART_CB layer_done_host_callback(void *userData) {
-  LayerCallbackData *data = static_cast<LayerCallbackData *>(userData);
-  int completed = data->counter->fetch_add(1) + 1;
-  if (completed == data->num_gpus) {
-    // Notify via eventfd when all GPUs complete this layer batch
-    if (data->enable_eventfd && data->layer_eventfds != nullptr) {
-      // Signal each tp_rank's eventfd for completed layers
-      for (int layer = data->start_layer; 
-           layer < data->start_layer + data->layers_this_batch; ++layer) {
-        for (int tp_rank = 0; tp_rank < data->tp_size; ++tp_rank) {
-          int fd = data->layer_eventfds[tp_rank * data->num_layers + layer];
-          if (fd >= 0) {
-            // Write 2 to support both get_key_buffer and get_value_buffer waits
-            uint64_t val = 2;
-            ssize_t ret = write(fd, &val, sizeof(val));
-          }
-        }
+void LayerwiseTransferGroup::notify_layer_batch(int start_layer,
+                                                 int layers_this_batch) {
+  if (!enable_eventfd_ || layer_eventfds_.empty()) return;
+
+  int offset = current_counter_id_ * tp_size_ * num_layers_;
+  int *eventfds_base = layer_eventfds_.data() + offset;
+
+  for (int layer = start_layer;
+       layer < start_layer + layers_this_batch; ++layer) {
+    for (int tp_rank = 0; tp_rank < tp_size_; ++tp_rank) {
+      int fd = eventfds_base[tp_rank * num_layers_ + layer];
+      if (fd >= 0) {
+        uint64_t val = 2;
+        ssize_t ret = write(fd, &val, sizeof(val));
+        (void)ret;
       }
     }
-    // End current NVTX range when all GPUs complete
-    if (data->current_range_id_ptr != nullptr && *data->current_range_id_ptr != 0) {
-      nvtxRangeEnd(*data->current_range_id_ptr);
-    }
-    // Start next layer's NVTX range (so it begins right after current layer ends)
-    if (!data->is_last_batch && data->next_range_id_ptr != nullptr) {
-      *data->next_range_id_ptr = nvtxRangeStartA(data->next_range_name);
-    }
-    delete data->counter;
   }
-  delete data;
+  fprintf(stderr, "[LW-EVT] notified layers [%d, %d) counter_id=%d\n",
+          start_layer, start_layer + layers_this_batch, current_counter_id_);
+}
+
+void LayerwiseTransferGroup::event_polling_loop() {
+  fprintf(stderr, "[LW-EVT] polling thread started, num_batches=%zu\n",
+          poll_batches_.size());
+
+  while (!poll_stop_.load(std::memory_order_acquire)) {
+    int next = poll_next_batch_.load(std::memory_order_acquire);
+    if (next >= (int)poll_batches_.size()) {
+      break;
+    }
+
+    PollBatchInfo &batch = poll_batches_[next];
+    if (batch.notified) {
+      poll_next_batch_.fetch_add(1, std::memory_order_acq_rel);
+      continue;
+    }
+
+    bool all_done = true;
+    for (int g = 0; g < num_gpus_ && all_done; ++g) {
+      cudaSetDevice(gpu_device_ids_[g]);
+      cudaError_t err = cudaEventQuery(batch.per_gpu_events[g]);
+      if (err == cudaErrorNotReady) {
+        all_done = false;
+      } else if (err != cudaSuccess) {
+        fprintf(stderr, "[LW-EVT] cudaEventQuery error GPU=%d batch=%d: %s\n",
+                g, next, cudaGetErrorString(err));
+        all_done = false;
+      }
+    }
+
+    if (all_done) {
+      batch.notified = true;
+      notify_layer_batch(batch.start_layer, batch.layers_this_batch);
+      poll_next_batch_.fetch_add(1, std::memory_order_acq_rel);
+    } else {
+      std::this_thread::yield();
+    }
+  }
+
+  fprintf(stderr, "[LW-EVT] polling thread exiting\n");
 }
 
 LayerwiseTransferGroup::LayerwiseTransferGroup(
@@ -79,6 +101,17 @@ LayerwiseTransferGroup::LayerwiseTransferGroup(
   num_layers_ = num_layers;
   tp_size_ = tp_size;
   current_counter_id_ = 0;
+
+  // Determine notification mode.
+  // Default: cudaLaunchHostFunc (original behavior, works on NVIDIA GPUs).
+  // Non-NVIDIA platforms (Hygon DCU, XPU) where cudaLaunchHostFunc doesn't
+  // fire should set FLEXKV_LAYERWISE_NOTIFY_MODE=polling.
+  {
+    const char *mode_env = std::getenv("FLEXKV_LAYERWISE_NOTIFY_MODE");
+    notify_mode_ = (mode_env != nullptr && std::string(mode_env) == "polling")
+                       ? NotifyMode::POLLING
+                       : NotifyMode::HOSTFUNC;
+  }
 
   // Initialize eventfds
   enable_eventfd_ = (layer_eventfds_tensor.numel() > 0);
@@ -247,6 +280,12 @@ LayerwiseTransferGroup::LayerwiseTransferGroup(
 }
 
 LayerwiseTransferGroup::~LayerwiseTransferGroup() {
+  // Stop polling thread if running
+  poll_stop_.store(true, std::memory_order_release);
+  if (poll_thread_.joinable()) {
+    poll_thread_.join();
+  }
+
   for (int i = 0; i < num_gpus_; i++) {
     cudaSetDevice(gpu_device_ids_[i]);
     cudaStreamDestroy(streams_[i]);
@@ -272,33 +311,48 @@ LayerwiseTransferGroup::~LayerwiseTransferGroup() {
   }
 }
 
-void LayerwiseTransferGroup::layer_done_callback(int start_layer,
-                                                 int layers_this_batch,
-                                                 nvtxRangeId_t *current_range_id_ptr,
-                                                 bool is_last_batch,
-                                                 const char *next_range_name,
-                                                 nvtxRangeId_t *next_range_id_ptr) {
-  std::atomic<int> *counter = new std::atomic<int>(0);
-  
-  // Get eventfd pointer for current counter set
-  int *eventfds_ptr = nullptr;
-  if (enable_eventfd_ && num_counters_ > 0) {
-    // Offset into layer_eventfds_ for current counter set
-    int offset = current_counter_id_ * tp_size_ * num_layers_;
-    eventfds_ptr = layer_eventfds_.data() + offset;
-  }
-  
-  for (int i = 0; i < num_gpus_; ++i) {
-    LayerCallbackData *data = new LayerCallbackData{
-        start_layer, layers_this_batch, num_gpus_, counter,
-        enable_eventfd_, tp_size_, num_layers_, eventfds_ptr,
-        current_range_id_ptr, is_last_batch, {0}, next_range_id_ptr};
-    // Copy next range name
-    if (next_range_name != nullptr) {
-      snprintf(data->next_range_name, sizeof(data->next_range_name), "%s", next_range_name);
+// Legacy host-function callback mode (kept for backward compatibility).
+// Most codepaths use the polling-based notification above instead.
+struct LayerCallbackData {
+  int start_layer;
+  int layers_this_batch;
+  int num_gpus;
+  std::atomic<int> *counter;
+  bool enable_eventfd;
+  int tp_size;
+  int num_layers;
+  int *layer_eventfds;
+  nvtxRangeId_t *current_range_id_ptr;
+  bool is_last_batch;
+  char next_range_name[64];
+  nvtxRangeId_t *next_range_id_ptr;
+};
+
+static void CUDART_CB layer_done_host_callback(void *userData) {
+  LayerCallbackData *data = static_cast<LayerCallbackData *>(userData);
+  int completed = data->counter->fetch_add(1) + 1;
+  if (completed == data->num_gpus) {
+    if (data->enable_eventfd && data->layer_eventfds != nullptr) {
+      for (int layer = data->start_layer;
+           layer < data->start_layer + data->layers_this_batch; ++layer) {
+        for (int tp_rank = 0; tp_rank < data->tp_size; ++tp_rank) {
+          int fd = data->layer_eventfds[tp_rank * data->num_layers + layer];
+          if (fd >= 0) {
+            uint64_t val = 2;
+            ssize_t ret = write(fd, &val, sizeof(val));
+          }
+        }
+      }
     }
-    cudaLaunchHostFunc(streams_[i], layer_done_host_callback, data);
+    if (data->current_range_id_ptr != nullptr && *data->current_range_id_ptr != 0) {
+      nvtxRangeEnd(*data->current_range_id_ptr);
+    }
+    if (!data->is_last_batch && data->next_range_id_ptr != nullptr) {
+      *data->next_range_id_ptr = nvtxRangeStartA(data->next_range_name);
+    }
+    delete data->counter;
   }
+  delete data;
 }
 
 void LayerwiseTransferGroup::layerwise_transfer(
@@ -358,9 +412,29 @@ void LayerwiseTransferGroup::layerwise_transfer(
 
   // Create CUDA events for timing each layer batch (on GPU 0)
   int num_batches = (num_layers + layer_granularity - 1) / layer_granularity;
-  std::vector<cudaEvent_t> timing_events(num_batches + 1);  // +1 for start event
+  std::vector<cudaEvent_t> timing_events(num_batches + 1);
   std::vector<int> batch_start_layers(num_batches);
   std::vector<int> batch_layers_count(num_batches);
+  
+  // Prepare poll batches for event-based notification
+  if (notify_mode_ == NotifyMode::POLLING && num_batches > 0) {
+    poll_batches_.clear();
+    poll_batches_.resize(num_batches);
+    for (int b = 0; b < num_batches; ++b) {
+      poll_batches_[b].start_layer = b * layer_granularity;
+      poll_batches_[b].layers_this_batch =
+          std::min(layer_granularity, num_layers - b * layer_granularity);
+      poll_batches_[b].per_gpu_events.resize(num_gpus_);
+      poll_batches_[b].notified = false;
+      for (int g = 0; g < num_gpus_; ++g) {
+        cudaSetDevice(gpu_device_ids_[g]);
+        cudaEventCreateWithFlags(&poll_batches_[b].per_gpu_events[g],
+                                 cudaEventDisableTiming);
+      }
+    }
+    poll_stop_.store(false, std::memory_order_release);
+    poll_next_batch_.store(0, std::memory_order_release);
+  }
   
   cudaSetDevice(gpu_device_ids_[0]);
   for (int i = 0; i <= num_batches; ++i) {
@@ -372,17 +446,14 @@ void LayerwiseTransferGroup::layerwise_transfer(
 
   // Allocate storage for NVTX range IDs (one per batch)
   std::vector<nvtxRangeId_t> h2d_range_ids(num_batches, 0);
-  // Pre-generate all range names with data size info
   std::vector<std::string> h2d_range_names(num_batches);
   for (int b = 0; b < num_batches; ++b) {
     int sl = b * layer_granularity;
     int ltb = std::min(layer_granularity, num_layers - sl);
-    // Calculate data size for this batch: chunk_size * 2 (K+V) * layers * num_blocks
     int64_t bytes_this_batch = 0;
     for (int g = 0; g < num_gpus_; ++g) {
       bytes_this_batch += gpu_chunk_sizes_in_bytes_[g] * 2 * ltb * num_blocks;
     }
-    // Add indexer bytes if applicable
     int64_t indexer_bytes_this_batch = 0;
     if (do_indexer_transfer) {
       for (int g = 0; g < num_gpus_; ++g) {
@@ -402,7 +473,6 @@ void LayerwiseTransferGroup::layerwise_transfer(
     h2d_range_names[b] = name;
   }
 
-  // Start the first batch's NVTX range in main thread
   if (num_batches > 0) {
     h2d_range_ids[0] = nvtxRangeStartA(h2d_range_names[0].c_str());
   }
@@ -570,26 +640,83 @@ void LayerwiseTransferGroup::layerwise_transfer(
       }
     }
 
-    // Record event after this batch on GPU 0
-    cudaSetDevice(gpu_device_ids_[0]);
-    cudaEventRecord(timing_events[batch_idx + 1], streams_[0]);
+    // Record event after this batch on each GPU
+    if (notify_mode_ == NotifyMode::POLLING) {
+      for (int i = 0; i < num_gpus_; ++i) {
+        cudaSetDevice(gpu_device_ids_[i]);
+        cudaEventRecord(poll_batches_[batch_idx].per_gpu_events[i], streams_[i]);
+      }
+    }
 
     // NVTX: current range ends in callback, next range starts in callback
     bool is_last_batch = (batch_idx == num_batches - 1);
-    const char *next_name = is_last_batch ? nullptr : h2d_range_names[batch_idx + 1].c_str();
-    nvtxRangeId_t *next_id_ptr = is_last_batch ? nullptr : &h2d_range_ids[batch_idx + 1];
-    
-    layer_done_callback(start_layer, layers_this_batch,
-                        &h2d_range_ids[batch_idx], is_last_batch,
-                        next_name, next_id_ptr);
+
+    if (notify_mode_ == NotifyMode::HOSTFUNC) {
+      // Legacy: use cudaLaunchHostFunc for notification
+      const char *next_name = is_last_batch ? nullptr : h2d_range_names[batch_idx + 1].c_str();
+      nvtxRangeId_t *next_id_ptr = is_last_batch ? nullptr : &h2d_range_ids[batch_idx + 1];
+
+      std::atomic<int> *counter = new std::atomic<int>(0);
+      int *eventfds_ptr = nullptr;
+      if (enable_eventfd_ && num_counters_ > 0) {
+        int offset = current_counter_id_ * tp_size_ * num_layers_;
+        eventfds_ptr = layer_eventfds_.data() + offset;
+      }
+      for (int i = 0; i < num_gpus_; ++i) {
+        LayerCallbackData *data = new LayerCallbackData{
+            start_layer, layers_this_batch, num_gpus_, counter,
+            enable_eventfd_, tp_size_, num_layers_, eventfds_ptr,
+            &h2d_range_ids[batch_idx], is_last_batch, {0}, next_id_ptr};
+        if (next_name != nullptr) {
+          snprintf(data->next_range_name, sizeof(data->next_range_name), "%s", next_name);
+        }
+        cudaLaunchHostFunc(streams_[i], layer_done_host_callback, data);
+      }
+    }
+
     batch_idx++;
   }
-  for (int i = 0; i < num_gpus_; ++i) {
-    cudaError_t err = cudaStreamSynchronize(streams_[i]);
-    if (err != cudaSuccess) {
-      throw std::runtime_error("layerwise_transfer failed on GPU " +
-                               std::to_string(i) + ": " +
-                               cudaGetErrorString(err));
+
+  if (notify_mode_ == NotifyMode::POLLING) {
+    // Start polling thread — it writes eventfds as each batch completes,
+    // allowing the inference engine to start attention on ready layers
+    // before all layers are transferred.
+    poll_stop_.store(false, std::memory_order_release);
+    poll_next_batch_.store(0, std::memory_order_release);
+    if (poll_thread_.joinable()) {
+      poll_thread_.join();
+    }
+    poll_thread_ = std::thread(&LayerwiseTransferGroup::event_polling_loop, this);
+
+    // Block until all GPU work is complete. cudaStreamSynchronize is the
+    // correct primitive — it yields the CPU (OS-level sleep) instead of
+    // busy-waiting. The polling thread will have fired all eventfds by
+    // the time sync returns.
+    for (int i = 0; i < num_gpus_; ++i) {
+      cudaSetDevice(gpu_device_ids_[i]);
+      cudaError_t err = cudaStreamSynchronize(streams_[i]);
+      if (err != cudaSuccess) {
+        poll_stop_.store(true, std::memory_order_release);
+        if (poll_thread_.joinable()) poll_thread_.join();
+        throw std::runtime_error("layerwise_transfer failed on GPU " +
+                                 std::to_string(i) + ": " +
+                                 cudaGetErrorString(err));
+      }
+    }
+    // Join polling thread (should be done or nearly done after sync).
+    poll_stop_.store(true, std::memory_order_release);
+    if (poll_thread_.joinable()) {
+      poll_thread_.join();
+    }
+  } else {
+    // Legacy: blocking sync with cudaLaunchHostFunc for eventfd notification
+    for (int i = 0; i < num_gpus_; ++i) {
+      cudaError_t err = cudaStreamSynchronize(streams_[i]);
+      if (err != cudaSuccess) {
+        throw std::runtime_error("layerwise_transfer failed on GPU " +
+                                 std::to_string(i) + ": " +
+                                 cudaGetErrorString(err));
+      }
     }
   }
 
@@ -641,6 +768,15 @@ void LayerwiseTransferGroup::layerwise_transfer(
   for (int i = 0; i <= num_batches; ++i) {
     cudaEventDestroy(timing_events[i]);
   }
+
+  // Cleanup poll batch events
+  for (int b = 0; b < (int)poll_batches_.size(); ++b) {
+    for (int g = 0; g < num_gpus_; ++g) {
+      cudaSetDevice(gpu_device_ids_[g]);
+      cudaEventDestroy(poll_batches_[b].per_gpu_events[g]);
+    }
+  }
+  poll_batches_.clear();
 }
 
 } // namespace flexkv

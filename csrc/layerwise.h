@@ -1,10 +1,17 @@
 #pragma once
 
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cuda_runtime.h>
+#include <exception>
 #include <fcntl.h>
+#include <functional>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <torch/extension.h>
 #include <vector>
 #include <sys/eventfd.h>
@@ -75,6 +82,27 @@ public:
       const int indexer_num_blocks_per_file = 0);
 
 private:
+  // ===== Notification mode =====
+  // "polling" (default): per-batch cudaEventRecord + cudaEventQuery polling
+  // "hostfunc": legacy cudaLaunchHostFunc (unreliable on some platforms)
+  enum class NotifyMode { POLLING, HOSTFUNC };
+  NotifyMode notify_mode_ = NotifyMode::POLLING;
+
+  struct PollBatchInfo {
+    int start_layer;
+    int layers_this_batch;
+    std::vector<cudaEvent_t> per_gpu_events;
+    bool notified = false;
+  };
+
+  std::vector<PollBatchInfo> poll_batches_;
+  std::atomic<bool> poll_stop_{false};
+  std::atomic<int> poll_next_batch_{0};
+  std::thread poll_thread_;
+
+  void notify_layer_batch(int start_layer, int layers_this_batch);
+  void event_polling_loop();
+
   int num_gpus_;
   void **gpu_blocks_;
   void *cpu_blocks_;
@@ -112,19 +140,12 @@ private:
   std::unique_ptr<SSDIOCTX> indexer_ioctx_;
 
   // Layer eventfds for notification
-  // Shape: [tp_size, num_counters, num_layers]
   bool enable_eventfd_;
   int tp_size_;
   int num_counters_;
   int num_layers_;
   std::vector<int> layer_eventfds_;  // Flat array
-  int current_counter_id_;  // Current counter set index for this transfer
-
-  void layer_done_callback(int start_layer, int layers_this_batch,
-                           nvtxRangeId_t *current_range_id_ptr,
-                           bool is_last_batch,
-                           const char *next_range_name,
-                           nvtxRangeId_t *next_range_id_ptr);
+  int current_counter_id_;
 };
 
 } // namespace flexkv

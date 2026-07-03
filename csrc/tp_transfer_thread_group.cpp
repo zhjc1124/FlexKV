@@ -166,9 +166,18 @@ void TPTransferThreadGroup::tp_group_transfer(
   std::vector<std::future<void>> futures;
   futures.reserve(num_gpus_);
 
-  bool enable_sharded_d2h = is_mla && !is_host_to_device;
+  // MLA D2H: sharded means each GPU transfers 1/N of data.
+  // For MLA (kv_heads=1), all TP ranks share identical KV cache, so sharded
+  // transfer is redundant — only one rank needs to write. Disable by default.
+  static const bool _disable_sharded = []() {
+    const char* e = std::getenv("FLEXKV_DISABLE_SHARDED_D2H");
+    return e && (std::string(e) == "1" || std::string(e) == "true");
+  }();
+  bool enable_sharded_d2h = is_mla && !is_host_to_device && !_disable_sharded;
 
-  for (int i = 0; i < num_gpus_; ++i) {
+  // When MLA D2H non-sharded, only GPU 0 needs to transfer (all ranks identical)
+  int active_gpus = (is_mla && !is_host_to_device && _disable_sharded) ? 1 : num_gpus_;
+  for (int i = 0; i < active_gpus; ++i) {
     futures.emplace_back(enqueue_for_gpu(i, [&, i]() {
       try {
         int num_blocks = gpu_block_id_tensor.numel();
