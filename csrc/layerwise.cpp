@@ -129,7 +129,9 @@ LayerwiseTransferGroup::LayerwiseTransferGroup(
     torch::Tensor indexer_gpu_block_strides_tensor,
     torch::Tensor indexer_gpu_layer_strides_tensor,
     torch::Tensor indexer_gpu_chunk_sizes_tensor,
-    std::map<int, std::vector<std::string>> indexer_ssd_files) {
+    std::map<int, std::vector<std::string>> indexer_ssd_files,
+    CETransferConfig ce_config)
+    : ce_config_(ce_config) {
 
   num_gpus_ = num_gpus;
   num_layers_ = num_layers;
@@ -146,7 +148,7 @@ LayerwiseTransferGroup::LayerwiseTransferGroup(
     
     int32_t *fds_ptr = layer_eventfds_tensor.data_ptr<int32_t>();
     layer_eventfds_.assign(fds_ptr, fds_ptr + total_fds);
-    
+
     printf("[LayerwiseTransferGroup] Initialized with eventfds: "
            "tp_size=%d, num_counters=%d, num_layers=%d, total_fds=%d\n",
            tp_size_, num_counters_, num_layers_, total_fds);
@@ -216,12 +218,18 @@ LayerwiseTransferGroup::LayerwiseTransferGroup(
   // Get highest priority (lowest value)
   int leastPriority, greatestPriority;
   cudaDeviceGetStreamPriorityRange(&leastPriority, &greatestPriority);
-  
+
+  // Save/restore current device around the per-GPU setup loop so we don't
+  // leave the calling thread pinned to the last GPU (see the destructor for
+  // why a leaked current-device causes cross-case segfaults).
+  int prev_device_ctor = 0;
+  cudaGetDevice(&prev_device_ctor);
   for (int i = 0; i < num_gpus_; i++) {
     cudaSetDevice(gpu_device_ids_[i]);
     cudaStreamCreateWithPriority(&streams_[i], cudaStreamNonBlocking, greatestPriority);
     cudaEventCreate(&events_[i]);
   }
+  cudaSetDevice(prev_device_ctor);
 
   // Initialize SSD IO context if ssd_files is not empty
   enable_ssd_ = !ssd_files.empty();
@@ -311,11 +319,22 @@ LayerwiseTransferGroup::~LayerwiseTransferGroup() {
     }
   }
 
+  // Save/restore the current device around the per-GPU cudaSetDevice loop.
+  // Otherwise the destructor leaves the calling thread's current device set
+  // to the LAST gpu (e.g. device 3). In a long-lived process (pytest running
+  // many cases in one thread), a later case that relies on cudaGetDevice()
+  // without an explicit cudaSetDevice — e.g. the device-keyed ping-pong event
+  // cache in ce_transfer.cu — would then key/use a CUDA event on the wrong
+  // device and hit "invalid resource handle" / segfault. Restoring the device
+  // keeps the thread's CUDA state clean across group lifetimes.
+  int prev_device = 0;
+  cudaGetDevice(&prev_device);
   for (int i = 0; i < num_gpus_; i++) {
     cudaSetDevice(gpu_device_ids_[i]);
     cudaStreamDestroy(streams_[i]);
     cudaEventDestroy(events_[i]);
   }
+  cudaSetDevice(prev_device);
 
   cudaFreeHost(gpu_blocks_);
 
@@ -572,10 +591,15 @@ void LayerwiseTransferGroup::layerwise_transfer(
     
     // Validate mla_d2h_mode once before the per-GPU loop
     std::string mode = mla_d2h_mode;
-    if (is_mla && mode != "sharded" && mode != "all_write" && mode != "rank0_only") {
-      fprintf(stderr, "[FlexKV] Warning: Invalid mla_d2h_mode='%s', using default 'sharded'\n",
+    if (is_mla && mode != "sharded" && mode != "all_write" && mode != "rank0_only"
+        && mode != "auto") {
+      fprintf(stderr, "[FlexKV] Warning: Invalid mla_d2h_mode='%s', using default 'auto'\n",
               mode.c_str());
-      mode = "sharded";
+      mode = "auto";
+    }
+    // Resolve "auto": sharded when CE is off, rank0_only when CE is on.
+    if (mode == "auto") {
+      mode = use_ce_transfer ? "rank0_only" : "sharded";
     }
 
     for (int i = 0; i < num_gpus_; ++i) {
@@ -609,7 +633,10 @@ void LayerwiseTransferGroup::layerwise_transfer(
             gpu_tensor_handlers_[i], gpu_startoff_inside_chunks, cpu_block_ids,
             cpu_ptr, h2d_cpu_kv_stride_in_bytes, h2d_cpu_layer_stride_in_bytes,
             cpu_block_stride_in_bytes, cpu_startoff_inside_chunks, chunk_size,
-            streams_[i], transfer_cta_num, true, use_ce_transfer, is_mla, false);
+            streams_[i], transfer_cta_num, /*is_host_to_device=*/true,
+            use_ce_transfer, is_mla,
+            /*gpu_block_stride_in_bytes=*/0,  // 0 = GPU stride == chunk_size (GPU physically contiguous)
+            /*sync=*/false, ce_config_);
         break;
       case BackendType::TRTLLM:
         flexkv::transfer_kv_blocks<BackendType::TRTLLM>(
@@ -617,7 +644,10 @@ void LayerwiseTransferGroup::layerwise_transfer(
             gpu_tensor_handlers_[i], gpu_startoff_inside_chunks, cpu_block_ids,
             cpu_ptr, h2d_cpu_kv_stride_in_bytes, h2d_cpu_layer_stride_in_bytes,
             cpu_block_stride_in_bytes, cpu_startoff_inside_chunks, chunk_size,
-            streams_[i], transfer_cta_num, true, use_ce_transfer, is_mla, false);
+            streams_[i], transfer_cta_num, /*is_host_to_device=*/true,
+            use_ce_transfer, is_mla,
+            /*gpu_block_stride_in_bytes=*/0,  // 0 = GPU stride == chunk_size (GPU physically contiguous)
+            /*sync=*/false, ce_config_);
         break;
       case BackendType::SGLANG:
         flexkv::transfer_kv_blocks<BackendType::SGLANG>(
@@ -625,7 +655,10 @@ void LayerwiseTransferGroup::layerwise_transfer(
             gpu_tensor_handlers_[i], gpu_startoff_inside_chunks, cpu_block_ids,
             cpu_ptr, h2d_cpu_kv_stride_in_bytes, h2d_cpu_layer_stride_in_bytes,
             cpu_block_stride_in_bytes, cpu_startoff_inside_chunks, chunk_size,
-            streams_[i], transfer_cta_num, true, use_ce_transfer, is_mla, false);
+            streams_[i], transfer_cta_num, /*is_host_to_device=*/true,
+            use_ce_transfer, is_mla,
+            /*gpu_block_stride_in_bytes=*/0,  // 0 = GPU stride == chunk_size (GPU physically contiguous)
+            /*sync=*/false, ce_config_);
         break;
       }
 
@@ -652,7 +685,7 @@ void LayerwiseTransferGroup::layerwise_transfer(
               indexer_cpu_block_stride_in_bytes,
               idx_cpu_startoff, idx_chunk_size,
               streams_[i], transfer_cta_num, true /* h2d */,
-              use_ce_transfer, true /* is_mla */, false /* sync */);
+              use_ce_transfer, true /* is_mla */, 0, false /* sync */, ce_config_);
           break;
         case BackendType::TRTLLM:
           flexkv::transfer_kv_blocks<BackendType::TRTLLM>(
@@ -665,7 +698,7 @@ void LayerwiseTransferGroup::layerwise_transfer(
               indexer_cpu_block_stride_in_bytes,
               idx_cpu_startoff, idx_chunk_size,
               streams_[i], transfer_cta_num, true /* h2d */,
-              use_ce_transfer, true /* is_mla */, false /* sync */);
+              use_ce_transfer, true /* is_mla */, 0, false /* sync */, ce_config_);
           break;
         case BackendType::SGLANG:
           flexkv::transfer_kv_blocks<BackendType::SGLANG>(
@@ -678,7 +711,7 @@ void LayerwiseTransferGroup::layerwise_transfer(
               indexer_cpu_block_stride_in_bytes,
               idx_cpu_startoff, idx_chunk_size,
               streams_[i], transfer_cta_num, true /* h2d */,
-              use_ce_transfer, true /* is_mla */, false /* sync */);
+              use_ce_transfer, true /* is_mla */, 0, false /* sync */, ce_config_);
           break;
         }
       }

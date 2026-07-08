@@ -20,6 +20,7 @@ import pytest
 import torch
 
 from flexkv.c_ext import TPTransferThreadGroup, LayerwiseTransferGroup
+from flexkv.common.config import GLOBAL_CONFIG_FROM_ENV
 from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
 
 
@@ -76,7 +77,12 @@ def _probe_engine(use_ce):
         del tp
         globals()[cache_key] = True
         return True
-    except Exception:
+    except Exception as _e:
+        # Surface the real probe failure (was swallowed -> silent mass-skip).
+        import traceback as _tb
+        print("\n[engine probe {} FAILED] {}: {}".format(
+            use_ce, type(_e).__name__, _e))
+        _tb.print_exc()
         globals()[cache_key] = False
         return False
 
@@ -205,6 +211,41 @@ def make_cpu_tensor(cpu_layout, num_layers, total_blocks):
     return torch.zeros(tuple(layout.kv_shape), dtype=DTYPE, pin_memory=True)
 
 
+def cpu_layout_for_mode(cpu_layout, cpu_layout_tp, num_layers, num_blocks,
+                        num_heads, head_dim, tpb, is_mla, mode, num_gpus):
+    """Resolve CPU buffer size + kv/layer/block/tp strides for an MLA D2H mode.
+
+    Matches the authoritative PR #192 semantics (tp_transfer offset logic):
+      - sharded / rank0_only: CPU holds one rank's KV -> num_blocks, TP strides.
+      - all_write: each rank writes its full KV into its own slot at offset
+        i * num_blocks * cpu_block_stride, so the CPU buffer spans
+        total = num_gpus * num_blocks. kv/layer strides must be recomputed from
+        a layout with num_block=total (NOT the single-rank TP strides), which
+        naturally scales LAYERFIRST strides by num_gpus while leaving
+        BLOCKFIRST strides unchanged (block_stride already includes layers).
+    Returns (total_cpu_blocks, cpu_stride_kv, cpu_stride_layer,
+             cpu_stride_block, cpu_stride_tp).
+    """
+    if is_mla and mode == "all_write":
+        total_cpu_blocks = num_blocks * num_gpus
+        layout_for_strides = KVCacheLayout(
+            type=cpu_layout.type,
+            num_layer=num_layers, num_block=total_cpu_blocks,
+            tokens_per_block=tpb, num_head=num_heads,
+            head_size=head_dim, is_mla=is_mla)
+        cpu_stride_kv = layout_for_strides.get_kv_stride() * ES
+        cpu_stride_layer = layout_for_strides.get_layer_stride() * ES
+    else:
+        total_cpu_blocks = num_blocks
+        cpu_stride_kv = cpu_layout_tp.get_kv_stride() * ES
+        cpu_stride_layer = cpu_layout_tp.get_layer_stride() * ES
+    # block_stride never depends on num_block; tp_stride derived from it.
+    cpu_stride_block = cpu_layout.get_block_stride() * ES
+    cpu_stride_tp = cpu_stride_block // num_gpus
+    return (total_cpu_blocks, cpu_stride_kv, cpu_stride_layer,
+            cpu_stride_block, cpu_stride_tp)
+
+
 def fill_gpu(gpu_tensors, gpu_id, num_layers, num_blocks, tpb, heads, hd, kv_dim):
     """Fill GPU tensors with deterministic per-GPU pattern. K and V differ."""
     for layer in range(num_layers):
@@ -224,13 +265,24 @@ def expected_val(gpu_id, layer, block, token, hd, kv_dim_idx=0):
                     block * 1000 + token * 10 + hd) % 997) / 997.0)
 
 
-def make_tp_group(cpu_ptr, all_gpu, num_gpus, gpu_layout, num_layers):
+def make_tp_group(cpu_ptr, all_gpu, num_gpus, gpu_layout, num_layers,
+                  ce_segment_threshold=None,
+                  ce_use_pingpong=None,
+                  ce_path_opt=None):
     """Create TPTransferThreadGroup with strides from KVCacheLayout.
 
     Matches production worker.py:472 exactly — chunk_size does NOT include kv_dim.
     The C++ kernel iterates num_chunks = num_layers * kv_dim * num_blocks and
     copies chunk_size bytes per chunk, so kv_dim is a separate iteration axis.
+
+    CE config defaults from GLOBAL_CONFIG_FROM_ENV (same as production).
     """
+    if ce_segment_threshold is None:
+        ce_segment_threshold = GLOBAL_CONFIG_FROM_ENV.transfer_segment_threshold
+    if ce_use_pingpong is None:
+        ce_use_pingpong = GLOBAL_CONFIG_FROM_ENV.transfer_pingpong
+    if ce_path_opt is None:
+        ce_path_opt = GLOBAL_CONFIG_FROM_ENV.transfer_path_opt
     gpu_ptrs = []
     for g in range(num_gpus):
         for l in range(num_layers):
@@ -244,42 +296,139 @@ def make_tp_group(cpu_ptr, all_gpu, num_gpus, gpu_layout, num_layers):
         gpu_layer_strides_in_bytes=[gpu_layout.get_layer_stride() * ES] * num_gpus,
         gpu_chunk_sizes_in_bytes=[gpu_layout.get_chunk_size() * ES] * num_gpus,
         gpu_device_ids=list(range(num_gpus)),
+        # Pass all trailing defaulted params explicitly so pybind11 never has
+        # to synthesize a default (see pybind11-construct-debug).
         enable_nvcomp=False,
+        nvcomp_batch_size=0,
+        nvcomp_data_type=0,
+        ce_segment_threshold=ce_segment_threshold,
+        ce_use_pingpong=ce_use_pingpong,
+        ce_path_opt=ce_path_opt,
     )
 
 
-def make_layerwise_group(cpu_tensor, all_gpu, num_gpus, gpu_layout, num_layers,
+def make_layerwise_group(cpu_ptr_unused, all_gpu, num_gpus, gpu_layout, num_layers,
+                         ce_segment_threshold=None,
+                         ce_use_pingpong=None,
+                         ce_path_opt=None,
                          layer_eventfds_tensor=None):
-    """Create LayerwiseTransferGroup for H2D-only testing."""
+    """Create LayerwiseTransferGroup for H2D-only testing (no SSD).
+
+    Mirrors LayerwiseTransferWorker construction in layerwise.py. GPU chunk_size
+    does NOT include kv_dim (same as tp_group). SSD disabled via empty ssd_files.
+    eventfd disabled by default (empty layer_eventfds_tensor); pass a non-empty
+    tensor to exercise the notify-mode path (upstream #199).
+
+    CE config defaults from GLOBAL_CONFIG_FROM_ENV (same as production).
+    """
+    if ce_segment_threshold is None:
+        ce_segment_threshold = GLOBAL_CONFIG_FROM_ENV.transfer_segment_threshold
+    if ce_use_pingpong is None:
+        ce_use_pingpong = GLOBAL_CONFIG_FROM_ENV.transfer_pingpong
+    if ce_path_opt is None:
+        ce_path_opt = GLOBAL_CONFIG_FROM_ENV.transfer_path_opt
+    if layer_eventfds_tensor is None:
+        layer_eventfds_tensor = torch.empty(0, dtype=torch.int32)
     def strides_tensor(getter):
         return torch.tensor([getter() * ES] * num_gpus, dtype=torch.int64)
 
-    if layer_eventfds_tensor is None:
-        layer_eventfds_tensor = torch.empty(0, dtype=torch.int32)
-    ssd_files = {}
-    # C++ ctor takes non-const refs, so all args must be lvalues.
-    # Also pybind11's default-value filling for trailing indexer params is
-    # unreliable, so pass all 20 args explicitly (mirrors production layerwise.py).
-    indexer_gpu_blocks = []
-    indexer_cpu_blocks = torch.Tensor()
-    indexer_gpu_kv_strides = torch.Tensor()
-    indexer_gpu_block_strides = torch.Tensor()
-    indexer_gpu_layer_strides = torch.Tensor()
-    indexer_gpu_chunk_sizes = torch.Tensor()
-    indexer_ssd_files = {}
-
+    # NOTE: the C++ LayerwiseTransferGroup ctor has the indexer_* params
+    # (with torch::Tensor()/empty-container defaults) sitting BEFORE the
+    # non-defaulted ce_segment_threshold/ce_use_pingpong/ce_path_opt. When a
+    # caller omits the indexer_* args, pybind11 fails to synthesize their
+    # defaults and rejects the whole call ("incompatible constructor
+    # arguments"). Pass every trailing param explicitly (empty tensors / {})
+    # so pybind11 never has to fill a default. (See pybind11-construct-debug.)
+    empty_tensor = torch.Tensor()
     return LayerwiseTransferGroup(
-        num_gpus, all_gpu, cpu_tensor, ssd_files,
-        num_layers,
-        strides_tensor(gpu_layout.get_kv_stride),
-        strides_tensor(gpu_layout.get_block_stride),
-        strides_tensor(gpu_layout.get_layer_stride),
-        strides_tensor(gpu_layout.get_chunk_size),
-        0, 0, layer_eventfds_tensor, num_gpus,
-        indexer_gpu_blocks, indexer_cpu_blocks, indexer_gpu_kv_strides,
-        indexer_gpu_block_strides, indexer_gpu_layer_strides,
-        indexer_gpu_chunk_sizes, indexer_ssd_files,
+        num_gpus=num_gpus,
+        gpu_blocks=all_gpu,
+        cpu_blocks=cpu_ptr_unused,  # actual pinned CPU tensor
+        ssd_files={},
+        num_layers=num_layers,
+        gpu_kv_strides_tensor=strides_tensor(gpu_layout.get_kv_stride),
+        gpu_block_strides_tensor=strides_tensor(gpu_layout.get_block_stride),
+        gpu_layer_strides_tensor=strides_tensor(gpu_layout.get_layer_stride),
+        gpu_chunk_sizes_tensor=strides_tensor(gpu_layout.get_chunk_size),
+        iouring_entries=0,
+        iouring_flags=0,
+        layer_eventfds_tensor=layer_eventfds_tensor,
+        tp_size=num_gpus,
+        indexer_gpu_blocks=[],
+        indexer_cpu_blocks=empty_tensor,
+        indexer_gpu_kv_strides_tensor=empty_tensor,
+        indexer_gpu_block_strides_tensor=empty_tensor,
+        indexer_gpu_layer_strides_tensor=empty_tensor,
+        indexer_gpu_chunk_sizes_tensor=empty_tensor,
+        indexer_ssd_files={},
+        ce_segment_threshold=ce_segment_threshold,
+        ce_use_pingpong=ce_use_pingpong,
+        ce_path_opt=ce_path_opt,
     )
+
+
+def layerwise_h2d_readback(all_gpu, cpu_kv, num_gpus, gpu_layout, num_layers,
+                           ids, cpu_stride_kv, cpu_stride_layer,
+                           cpu_stride_block, cpu_stride_tp, chunk_size,
+                           is_mla, mode, ce_path_opt=None,
+                           ce_use_pingpong=None, ce_segment_threshold=None,
+                           notify_mode="hostfunc"):
+    """Run a single CE H2D via LayerwiseTransferGroup, reading `cpu_kv` back
+    into `all_gpu` with block-id list `ids`.
+
+    LayerwiseTransferGroup is H2D-only and CE-only; this wraps the fragile
+    full-argument layerwise_transfer() call (see pybind11-construct-debug:
+    every trailing optional param must be passed explicitly, otherwise
+    pybind11 fails to synthesize the torch::Tensor() defaults). Shared by the
+    CE-path layerwise test and the roundtrip layerwise twins.
+
+    notify_mode: "hostfunc" (default, uses CUDA hostfunc callback) or
+    "polling" (uses a CPU polling thread that queries cudaEventQuery per
+    batch).  Polling mode exercises the async GATHER_SCATTER/STAGED_SCATTER
+    ping-pong path (sync=false) that was previously deadlocked.
+    """
+    lw_group = make_layerwise_group(cpu_kv, all_gpu, num_gpus,
+                                    gpu_layout, num_layers,
+                                    ce_path_opt=ce_path_opt,
+                                    ce_use_pingpong=ce_use_pingpong,
+                                    ce_segment_threshold=ce_segment_threshold)
+    empty_ids = torch.empty(0, dtype=torch.int64).pin_memory()
+    empty_indexer = torch.Tensor()
+    lw_group.layerwise_transfer(
+        ssd_block_ids=empty_ids,
+        cpu_block_ids_d2h=empty_ids,
+        ssd_layer_stride_in_bytes=0,
+        ssd_kv_stride_in_bytes=0,
+        num_blocks_per_file=0, round_robin=0, num_threads_per_device=0,
+        gpu_block_id_tensor=ids, cpu_block_id_tensor=ids,
+        cpu_kv_stride_in_bytes=cpu_stride_kv,
+        cpu_layer_stride_in_bytes=cpu_stride_layer,
+        cpu_block_stride_in_bytes=cpu_stride_block,
+        cpu_chunk_size_in_bytes=chunk_size,
+        h2d_cpu_kv_stride_in_bytes=cpu_stride_kv,
+        h2d_cpu_layer_stride_in_bytes=cpu_stride_layer,
+        cpu_tp_stride_in_bytes=cpu_stride_tp,
+        transfer_cta_num=4, use_ce_transfer=True,
+        num_layers=num_layers, layer_granularity=num_layers,
+        is_mla=is_mla,
+        counter_id=0,
+        indexer_gpu_block_id_tensor=empty_indexer,
+        indexer_cpu_block_id_tensor=empty_indexer,
+        indexer_cpu_block_stride_in_bytes=0,
+        indexer_cpu_layer_stride_in_bytes=0,
+        indexer_h2d_cpu_kv_stride_in_bytes=0,
+        indexer_h2d_cpu_layer_stride_in_bytes=0,
+        indexer_ssd_block_ids=empty_indexer,
+        indexer_cpu_block_ids_d2h=empty_indexer,
+        indexer_ssd_layer_stride_in_bytes=0,
+        indexer_ssd_kv_stride_in_bytes=0,
+        indexer_cpu_chunk_size_in_bytes=0,
+        indexer_num_blocks_per_file=0,
+        mla_d2h_mode=mode,
+        notify_mode=notify_mode,
+    )
+    sync_all(num_gpus)
+    del lw_group
 
 
 def block_ids(n):
@@ -576,6 +725,155 @@ def test_layerwise_h2d_notify_modes(data_config, engine_name, use_ce, notify_mod
 
 
 # ---------------------------------------------------------------------------
+# Round-trip tests via LayerwiseTransferGroup H2D
+#
+# LayerwiseTransferGroup is H2D-only and CE-only (no cuda-kernel engine, no
+# independent D2H), so these twins prepare the CPU reference with a verified
+# TPTransferThreadGroup CE D2H, then read it back with layerwise H2D and check
+# correctness. Same size matrix / modes / layouts as the TP-group round-trips
+# above, so layerwise H2D is exercised across the full production shape space.
+# Uses contiguous block ids (identity) like the TP round-trips; the CE-path
+# tests separately sweep few_seg/scattered patterns for both groups.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("data_config", MHA_SIZES)
+@pytest.mark.parametrize("cpu_layout_name", CPU_LAYOUTS)
+def test_non_mla_roundtrip_layerwise(data_config, cpu_layout_name):
+    """Non-MLA: TP-group CE D2H prepares CPU, LayerwiseTransferGroup CE H2D
+    reads it back; verify each rank recovers its own data."""
+    skip_if_engine_unsupported(use_ce=True)
+    num_layers, num_blocks, tpb, num_heads, head_dim = data_config
+    num_gpus = NUM_GPUS
+    is_mla = False
+    mode = "sharded"  # ignored for non-MLA
+
+    gpu_layout, cpu_layout, cpu_layout_tp, kv_dim, heads_per_rank = make_layouts(
+        num_layers, num_blocks, tpb, num_heads, head_dim,
+        cpu_layout_name, is_mla, num_gpus)
+
+    all_gpu = [make_gpu_tensors(num_layers, num_blocks, tpb,
+                                heads_per_rank, head_dim, kv_dim, g)
+               for g in range(num_gpus)]
+    for g in range(num_gpus):
+        fill_gpu(all_gpu[g], g, num_layers, num_blocks, tpb,
+                 heads_per_rank, head_dim, kv_dim)
+    sync_all(num_gpus)
+
+    (total_blocks, cpu_stride_kv, cpu_stride_layer,
+     cpu_stride_block, cpu_stride_tp) = cpu_layout_for_mode(
+        cpu_layout, cpu_layout_tp, num_layers, num_blocks,
+        num_heads, head_dim, tpb, is_mla, mode, num_gpus)
+    cpu_kv = make_cpu_tensor(cpu_layout, num_layers, total_blocks)
+    ids = block_ids(num_blocks)
+    chunk_size = gpu_layout.get_chunk_size() * ES
+
+    # D2H prepare via TP-group (CE), verified correct elsewhere.
+    tp = make_tp_group(cpu_kv.data_ptr(), all_gpu, num_gpus,
+                       gpu_layout, num_layers)
+    tp.tp_group_transfer(
+        gpu_block_id_tensor=ids, cpu_block_id_tensor=ids,
+        cpu_kv_stride_in_bytes=cpu_stride_kv,
+        cpu_layer_stride_in_bytes=cpu_stride_layer,
+        cpu_block_stride_in_bytes=cpu_stride_block,
+        cpu_tp_stride_in_bytes=cpu_stride_tp,
+        transfer_num_cta=4, is_host_to_device=False, use_ce_transfer=True,
+        layer_id=0, layer_granularity=num_layers, is_mla=is_mla,
+        mla_d2h_mode=mode,
+    )
+    sync_all(num_gpus)
+    del tp
+
+    for g in range(num_gpus):
+        for l in range(num_layers):
+            all_gpu[g][l].zero_()
+    sync_all(num_gpus)
+
+    # H2D readback via layerwise (test target).
+    layerwise_h2d_readback(
+        all_gpu, cpu_kv, num_gpus, gpu_layout, num_layers, ids,
+        cpu_stride_kv, cpu_stride_layer, cpu_stride_block, cpu_stride_tp,
+        chunk_size, is_mla, mode)
+
+    for g in range(num_gpus):
+        for layer in [0, num_layers - 1]:
+            for block in [0, num_blocks - 1]:
+                for kv in range(kv_dim):
+                    for hd_idx in [0, head_dim - 1]:
+                        exp = expected_val(g, layer, block, 0, hd_idx, kv)
+                        act = all_gpu[g][layer][kv, block, 0, 0, hd_idx].item()
+                        assert abs(act - exp) < 1e-3, \
+                            "Non-MLA layerwise round-trip mismatch: " \
+                            "layout={} gpu={} layer={} block={} kv={} hd={}: " \
+                            "expected={:.6f} got={:.6f}".format(
+                                cpu_layout_name, g, layer, block, kv, hd_idx,
+                                exp, act)
+
+
+@pytest.mark.parametrize("data_config", MLA_SIZES)
+@pytest.mark.parametrize("cpu_layout_name", CPU_LAYOUTS)
+@pytest.mark.parametrize("mode", MLA_MODES)
+def test_mla_roundtrip_modes_layerwise(data_config, cpu_layout_name, mode):
+    """MLA: TP-group CE D2H prepares CPU, LayerwiseTransferGroup CE H2D reads
+    it back; verify all ranks recover GPU 0's data. Covers all D2H modes."""
+    skip_if_engine_unsupported(use_ce=True)
+    num_layers, num_blocks, tpb, num_heads, head_dim = data_config
+    assert num_heads == 1, "MLA_SIZES must only contain num_heads=1 configs"
+    num_gpus = NUM_GPUS
+    is_mla = True
+
+    gpu_layout, cpu_layout, cpu_layout_tp, kv_dim, heads_per_rank = make_layouts(
+        num_layers, num_blocks, tpb, num_heads, head_dim,
+        cpu_layout_name, is_mla, num_gpus)
+
+    all_gpu = [make_gpu_tensors(num_layers, num_blocks, tpb,
+                                heads_per_rank, head_dim, kv_dim, g)
+               for g in range(num_gpus)]
+    fill_gpu(all_gpu[0], 0, num_layers, num_blocks, tpb,
+             heads_per_rank, head_dim, kv_dim)
+    for g in range(1, num_gpus):
+        for l in range(num_layers):
+            all_gpu[g][l].copy_(all_gpu[0][l])
+    sync_all(num_gpus)
+
+    (total_blocks, cpu_stride_kv, cpu_stride_layer,
+     cpu_stride_block, cpu_stride_tp) = cpu_layout_for_mode(
+        cpu_layout, cpu_layout_tp, num_layers, num_blocks,
+        num_heads, head_dim, tpb, is_mla, mode, num_gpus)
+    cpu_kv = make_cpu_tensor(cpu_layout, num_layers, total_blocks)
+    ids = block_ids(num_blocks)
+    chunk_size = gpu_layout.get_chunk_size() * ES
+
+    tp = make_tp_group(cpu_kv.data_ptr(), all_gpu, num_gpus,
+                       gpu_layout, num_layers)
+    tp.tp_group_transfer(
+        gpu_block_id_tensor=ids, cpu_block_id_tensor=ids,
+        cpu_kv_stride_in_bytes=cpu_stride_kv,
+        cpu_layer_stride_in_bytes=cpu_stride_layer,
+        cpu_block_stride_in_bytes=cpu_stride_block,
+        cpu_tp_stride_in_bytes=cpu_stride_tp,
+        transfer_num_cta=4, is_host_to_device=False, use_ce_transfer=True,
+        layer_id=0, layer_granularity=num_layers, is_mla=is_mla,
+        mla_d2h_mode=mode,
+    )
+    sync_all(num_gpus)
+    del tp
+
+    for g in range(num_gpus):
+        for l in range(num_layers):
+            all_gpu[g][l].zero_()
+    sync_all(num_gpus)
+
+    layerwise_h2d_readback(
+        all_gpu, cpu_kv, num_gpus, gpu_layout, num_layers, ids,
+        cpu_stride_kv, cpu_stride_layer, cpu_stride_block, cpu_stride_tp,
+        chunk_size, is_mla, mode)
+
+    # All ranks should recover GPU 0's data (MLA replicates).
+    spot_check_gpu(all_gpu, 0, num_gpus, num_layers, num_blocks,
+                   tpb, head_dim, kv_dim, label="layerwise mode={}".format(mode))
+
+
+# ---------------------------------------------------------------------------
 # Invalid mode fallback test
 # ---------------------------------------------------------------------------
 
@@ -617,6 +915,474 @@ def test_invalid_mode_fallback():
 
     # Should behave like sharded — just verify no crash
     del tp
+
+
+# ---------------------------------------------------------------------------
+# CE adaptive strategy tests
+#
+# The C++ CE engine selects among five execution strategies (see the CEPath
+# taxonomy in csrc/ce_transfer.h). path_opt_enabled picks PER_BLOCK (baseline)
+# vs the four optimized strategies; choose_path() picks among the optimized
+# ones by block-id contiguity + CPU/GPU layout:
+#   PER_BLOCK        — one memcpy per block (baseline, path_opt=False)
+#   BULK_CONTIG      — single large memcpy (contiguous ids + dst phys contig)
+#   SEGMENTED_DIRECT — per-run memcpy, dst phys contig (LAYERFIRST), no staging
+#   STAGED_SCATTER   — staging buffer + CPU scatter (dst strided / BLOCKFIRST);
+#                      two GPU-side variants selected by src_phys_contig:
+#                        STAGED_CONTIG_RUN — GPU blocks contiguous (non-sharded)
+#                        STAGED_PER_BLOCK  — GPU blocks strided (sharded D2H)
+#   GATHER_SCATTER   — GPU index_select/index_copy_ (many segments > threshold)
+#
+# We trigger each strategy by constructing block-id *permutations* of [0..N-1]
+# so that every block is still transferred (round-trip correctness preserved):
+#   contiguous — identity permutation        → 1 segment
+#   few_seg    — interleaved 4-segment perm  → 4 segments
+#   scattered  — random permutation           → N segments (>8)
+#
+# Strategy is chosen automatically from strides; there is no force override.
+# Coverage of the four optimized strategies + the two STAGED_SCATTER variants
+# is asserted by test_ce_strategy_coverage below (via _expected_strategy).
+#
+# Both ce_path_opt (baseline vs optimized) and ce_use_pingpong (double-buffered
+# staging on/off) are per-construction CETransferConfig fields (bindings.cpp
+# sets cfg.path_opt_enabled / cfg.use_pingpong from the ctor args), NOT env-
+# cached statics -- so we sweep both as ordinary orthogonal parametrize
+# dimensions in-process.
+# ---------------------------------------------------------------------------
+
+# Combined (data_config, is_mla, mode) parametrization.
+#
+# The C++ transfer branches at the top level on is_mla:
+#   - is_mla == False (MHA): a single code path (heads sharded across TP,
+#     cpu_startoff = i * cpu_tp_stride). The mla_d2h_mode argument is IGNORED.
+#   - is_mla == True  (MLA): the mode selects sharded / all_write / rank0_only.
+#
+# So mode is only meaningful for MLA. We therefore emit exactly ONE combo per
+# non-MLA size (mode is a don't-care placeholder), and THREE combos per MLA
+# size. This avoids the previous mode x is_mla cross-product that produced
+# nonsensical all_write-mha / rank0_only-mha combos handled only via skip().
+#
+# Sizes cover the SAME production shape matrix as MLA_SIZES / MHA_SIZES (the
+# TP-group round-trips), so CE strategy selection is exercised across every
+# real config -- including large (ds3 / llama3-70b) and small (edge, 16head)
+# ones. "scattered" needs num_blocks > segment_threshold to form more segments
+# than the threshold; the tests skip scattered only when num_blocks <= the
+# swept threshold, so with threshold=2 even the small sizes run it.
+#
+# id suffix must be unique per size (CE_MODE_CONFIGS ids use it verbatim).
+_MLA_SIZES = [
+    ((4, 8, 16, 1, 512), "ds3-mini"),
+    ((32, 64, 16, 1, 512), "llama8b"),
+    ((61, 256, 16, 1, 512), "ds3"),
+    ((80, 512, 16, 1, 512), "llama70b"),
+    ((2, 4, 1, 1, 512), "edge"),
+]
+_MHA_SIZES = [
+    ((4, 8, 16, 8, 128), "mha-mini"),
+    ((32, 64, 16, 8, 128), "mha-llama8b"),
+    ((80, 256, 16, 8, 128), "mha-llama70b"),
+    ((2, 4, 1, 8, 128), "mha-edge"),
+    ((4, 4, 16, 16, 128), "mha-16head"),
+]
+CE_MODE_CONFIGS = (
+    [pytest.param(cfg, True, mode, id=f"mla_{mode}-{sid}")
+     for (cfg, sid) in _MLA_SIZES
+     for mode in ("sharded", "all_write", "rank0_only")]
+    + [pytest.param(cfg, False, "sharded", id=f"non_mla-{sid}")
+       for (cfg, sid) in _MHA_SIZES]
+)
+
+CE_PATTERNS = ["contiguous", "few_seg", "scattered"]
+
+# segment_threshold is swept as an orthogonal dimension. threshold=8 is the
+# production default; threshold=2 is small enough that "scattered" (~N segments)
+# exceeds it for every size with num_blocks > 2, so even the small sizes
+# (nb=4/8) exercise GATHER_SCATTER / STAGED_PER_BLOCK instead of skipping.
+# It also tests the threshold config itself. scattered still skips only when
+# num_blocks <= threshold (i.e. it cannot form more than `threshold` segments).
+CE_SEGMENT_THRESHOLDS = [8, 2]
+
+
+def make_block_id_pattern(pattern_name, num_blocks):
+    """Construct a block-id permutation that yields a specific segment count.
+
+    All patterns are permutations of range(num_blocks), so every block is
+    transferred exactly once — round-trip data integrity is preserved.
+
+    contiguous → [0,1,...,N-1]                      (1 segment)
+    few_seg    → [0..N/4-1, N/2..3N/4-1,            (4 segments)
+                   N/4..N/2-1, 3N/4..N-1]
+    scattered  → random permutation (fixed seed)    (N segments, >8)
+    """
+    if pattern_name == "contiguous":
+        ids = torch.arange(num_blocks, dtype=torch.int64)
+    elif pattern_name == "few_seg":
+        q = num_blocks // 4
+        base = torch.arange(num_blocks, dtype=torch.int64)
+        ids = torch.cat([base[0:q], base[2 * q:3 * q],
+                         base[q:2 * q], base[3 * q:4 * q]])
+    elif pattern_name == "scattered":
+        gen = torch.Generator().manual_seed(42)
+        ids = torch.randperm(num_blocks, generator=gen, dtype=torch.int64)
+    else:
+        raise ValueError("unknown pattern: {}".format(pattern_name))
+    return ids.pin_memory()
+
+
+def _expected_strategy(pattern_name, cpu_layout_name, is_mla, mode,
+                       is_host_to_device, num_blocks=64, threshold=8):
+    """Predict which CE strategy (and STAGED_SCATTER variant) auto-selection
+    should pick, mirroring csrc/ce_transfer.cu choose_path().
+
+    Returns (strategy, variant) where strategy is one of
+    BULK_CONTIG / SEGMENTED_DIRECT / STAGED_SCATTER / GATHER_SCATTER and
+    variant is STAGED_CONTIG_RUN / STAGED_PER_BLOCK for STAGED_SCATTER else "".
+
+    Key stride facts (see cpu_layout_for_mode / tp_transfer_thread_group.cpp):
+      dst_phys_contig  == (cpu_block_stride == chunk_size)  -> LAYERFIRST only.
+      src_phys_contig  == (gpu_block_stride == chunk_size).
+        Non-sharded (all_write / rank0_only / non-MLA) always contiguous.
+        sharded D2H shrinks chunk_size to a shard while gpu_block_stride stays
+        the full block -> NOT contiguous. sharded H2D uses the full chunk, so
+        it IS contiguous. Hence STAGED_PER_BLOCK arises only on the sharded
+        D2H leg; the H2D leg of the same case is STAGED_CONTIG_RUN.
+    segment_threshold decides the STAGED/GATHER crossover: with a small
+    threshold even few_seg (4 segments) can exceed it and route to
+    GATHER_SCATTER, exactly as choose_path() does.
+    """
+    dst_phys = (cpu_layout_name == "LAYERFIRST")
+    sharded_d2h = (is_mla and mode == "sharded" and not is_host_to_device)
+    src_phys = not sharded_d2h  # only sharded D2H breaks GPU-side contiguity
+
+    if pattern_name == "contiguous":
+        num_segments = 1
+    elif pattern_name == "few_seg":
+        num_segments = 4  # make_block_id_pattern builds exactly 4 runs
+    else:  # scattered: (near-)full permutation -> ~num_blocks segments
+        num_segments = num_blocks
+
+    # choose_path() replica -----------------------------------------------
+    # BULK_CONTIG needs only src_log && dst_log && dst_phys (choose_path does
+    # NOT check src_phys here); contiguous ids => fully logically contiguous.
+    if pattern_name == "contiguous" and dst_phys:
+        return ("BULK_CONTIG", "")
+    if not src_phys:
+        # dst strided -> staging (per-block variant); dst phys -> direct
+        if dst_phys:
+            return ("SEGMENTED_DIRECT", "")
+        return ("STAGED_SCATTER", "STAGED_PER_BLOCK")
+    if num_segments <= threshold:
+        if dst_phys:
+            return ("SEGMENTED_DIRECT", "")
+        return ("STAGED_SCATTER", "STAGED_CONTIG_RUN")
+    # many segments, src contiguous -> GATHER_SCATTER (unless dst strided +
+    # sharded which was handled above via !src_phys)
+    return ("GATHER_SCATTER", "")
+
+
+@pytest.mark.parametrize("data_config,is_mla,mode", CE_MODE_CONFIGS)
+@pytest.mark.parametrize("cpu_layout_name", CPU_LAYOUTS)
+@pytest.mark.parametrize("pattern", CE_PATTERNS)
+@pytest.mark.parametrize("use_pingpong", [False, True], ids=["pingpong_off", "pingpong_on"])
+@pytest.mark.parametrize("segment_threshold", CE_SEGMENT_THRESHOLDS,
+                         ids=lambda t: "thr{}".format(t))
+@pytest.mark.parametrize("path_opt", [False, True], ids=["baseline", "optimized"])
+def test_ce_paths_roundtrip(data_config, is_mla, cpu_layout_name, pattern,
+                            path_opt, use_pingpong, mode, segment_threshold):
+    """CE strategy round-trip correctness via block-id patterns.
+
+    Combos come from CE_MODE_CONFIGS: MLA sizes x {sharded, all_write,
+    rank0_only}, plus non-MLA sizes once (mode is a don't-care for MHA).
+    Each pattern triggers a different auto-selected CE strategy:
+      contiguous -> BULK_CONTIG (LF) / STAGED_SCATTER (BF)
+      few_seg    -> SEGMENTED_DIRECT (LF) / STAGED_SCATTER (BF)
+      scattered  -> GATHER_SCATTER (LF/BF non-sharded) /
+                    STAGED_SCATTER per-block (sharded D2H)
+    (STAGED_SCATTER picks STAGED_CONTIG_RUN vs STAGED_PER_BLOCK internally by
+    src_phys_contig; see _expected_strategy and test_ce_strategy_coverage.)
+
+    ping-pong (double-buffered staging) is orthogonal: it only affects the
+    staging strategies (STAGED_SCATTER / GATHER_SCATTER), but we sweep both
+    on/off across every pattern, layout, mode and path_opt to guarantee
+    correctness is independent of it.
+    """
+    skip_if_engine_unsupported(use_ce=True)
+    num_layers, num_blocks, tpb, num_heads, head_dim = data_config
+    if pattern == "scattered" and num_blocks <= segment_threshold:
+        pytest.skip("scattered needs num_blocks > segment_threshold ({}) "
+                    "to exceed it".format(segment_threshold))
+
+    num_gpus = NUM_GPUS
+    gpu_layout, cpu_layout, cpu_layout_tp, kv_dim, heads_per_rank = make_layouts(
+        num_layers, num_blocks, tpb, num_heads, head_dim,
+        cpu_layout_name, is_mla, num_gpus)
+
+    all_gpu = [make_gpu_tensors(num_layers, num_blocks, tpb,
+                               heads_per_rank, head_dim, kv_dim, g)
+               for g in range(num_gpus)]
+
+    if is_mla:
+        fill_gpu(all_gpu[0], 0, num_layers, num_blocks, tpb,
+                 heads_per_rank, head_dim, kv_dim)
+        for g in range(1, num_gpus):
+            for l in range(num_layers):
+                all_gpu[g][l].copy_(all_gpu[0][l])
+    else:
+        for g in range(num_gpus):
+            fill_gpu(all_gpu[g], g, num_layers, num_blocks, tpb,
+                     heads_per_rank, head_dim, kv_dim)
+    sync_all(num_gpus)
+
+    (total_cpu_blocks, cpu_stride_kv, cpu_stride_layer,
+     cpu_stride_block, cpu_stride_tp) = cpu_layout_for_mode(
+        cpu_layout, cpu_layout_tp, num_layers, num_blocks,
+        num_heads, head_dim, tpb, is_mla, mode, num_gpus)
+    cpu_kv = make_cpu_tensor(cpu_layout, num_layers, total_cpu_blocks)
+    tp = make_tp_group(cpu_kv.data_ptr(), all_gpu, num_gpus,
+                       gpu_layout, num_layers, ce_path_opt=path_opt,
+                       ce_use_pingpong=use_pingpong,
+                       ce_segment_threshold=segment_threshold)
+
+    ids = make_block_id_pattern(pattern, num_blocks)
+    gpu_block_ids = ids
+    cpu_block_ids = ids
+
+    # D2H
+    tp.tp_group_transfer(
+        gpu_block_id_tensor=gpu_block_ids, cpu_block_id_tensor=cpu_block_ids,
+        cpu_kv_stride_in_bytes=cpu_stride_kv,
+        cpu_layer_stride_in_bytes=cpu_stride_layer,
+        cpu_block_stride_in_bytes=cpu_stride_block,
+        cpu_tp_stride_in_bytes=cpu_stride_tp,
+        transfer_num_cta=4, is_host_to_device=False, use_ce_transfer=True,
+        layer_id=0, layer_granularity=num_layers, is_mla=is_mla,
+        mla_d2h_mode=mode,
+    )
+    sync_all(num_gpus)
+
+    # Clear GPUs
+    for g in range(num_gpus):
+        for l in range(num_layers):
+            all_gpu[g][l].zero_()
+    sync_all(num_gpus)
+
+    # H2D
+    tp.tp_group_transfer(
+        gpu_block_id_tensor=gpu_block_ids, cpu_block_id_tensor=cpu_block_ids,
+        cpu_kv_stride_in_bytes=cpu_stride_kv,
+        cpu_layer_stride_in_bytes=cpu_stride_layer,
+        cpu_block_stride_in_bytes=cpu_stride_block,
+        cpu_tp_stride_in_bytes=cpu_stride_tp,
+        transfer_num_cta=4, is_host_to_device=True, use_ce_transfer=True,
+        layer_id=0, layer_granularity=num_layers, is_mla=is_mla,
+        mla_d2h_mode=mode,
+    )
+    sync_all(num_gpus)
+
+    # Verify round-trip data integrity
+    expected_gpu = 0 if is_mla else None
+    for g in range(num_gpus):
+        src_g = expected_gpu if expected_gpu is not None else g
+        for layer in [0, num_layers // 2, num_layers - 1]:
+            for block in [0, num_blocks // 2, num_blocks - 1]:
+                for kv in range(kv_dim):
+                    for hd_idx in [0, head_dim - 1]:
+                        exp = expected_val(src_g, layer, block, 0, hd_idx, kv)
+                        act = all_gpu[g][layer][kv, block, 0, 0, hd_idx].item()
+                        assert abs(act - exp) < 1e-3, \
+                            "CE path round-trip mismatch: pattern={} layout={} " \
+                            "gpu={} layer={} block={} kv={} hd={}: " \
+                            "expected={:.6f} got={:.6f}".format(
+                                pattern, cpu_layout_name, g, layer, block,
+                                kv, hd_idx, exp, act)
+
+    del tp
+
+
+@pytest.mark.parametrize("data_config,is_mla,mode", CE_MODE_CONFIGS)
+@pytest.mark.parametrize("cpu_layout_name", CPU_LAYOUTS)
+@pytest.mark.parametrize("pattern", CE_PATTERNS)
+@pytest.mark.parametrize("use_pingpong", [False, True], ids=["pingpong_off", "pingpong_on"])
+@pytest.mark.parametrize("segment_threshold", CE_SEGMENT_THRESHOLDS,
+                         ids=lambda t: "thr{}".format(t))
+@pytest.mark.parametrize("path_opt", [False, True], ids=["baseline", "optimized"])
+@pytest.mark.parametrize("notify_mode", ["polling"], ids=["polling"])
+def test_ce_paths_layerwise_h2d(data_config, is_mla, cpu_layout_name, pattern,
+                                path_opt, use_pingpong, mode, segment_threshold,
+                                notify_mode):
+    """CE strategy correctness for LayerwiseTransferGroup H2D.
+
+    Uses TPTransferThreadGroup D2H (already verified correct) to prepare
+    CPU data, then LayerwiseTransferGroup H2D to read it back with the
+    same block-id pattern.  Verifies that the layerwise CE strategy produces
+    identical results to the TP-group CE strategy.
+
+    Combos come from CE_MODE_CONFIGS: MLA sizes x {sharded, all_write,
+    rank0_only} plus non-MLA sizes once (mode is a don't-care for MHA).
+
+    notify_mode="polling" exercises the async GATHER_SCATTER/STAGED_SCATTER
+    ping-pong path (sync=false), which was previously deadlocked by internal
+    cudaStreamSynchronize. hostfunc mode is already covered by the default
+    in other layerwise tests, so we only sweep polling here to avoid doubling
+    the test count.
+    """
+    skip_if_engine_unsupported(use_ce=True)
+    num_layers, num_blocks, tpb, num_heads, head_dim = data_config
+    if pattern == "scattered" and num_blocks <= segment_threshold:
+        pytest.skip("scattered needs num_blocks > segment_threshold ({}) "
+                    "to exceed it".format(segment_threshold))
+
+    num_gpus = NUM_GPUS
+    gpu_layout, cpu_layout, cpu_layout_tp, kv_dim, heads_per_rank = make_layouts(
+        num_layers, num_blocks, tpb, num_heads, head_dim,
+        cpu_layout_name, is_mla, num_gpus)
+
+    # Fill GPU with deterministic data
+    all_gpu = [make_gpu_tensors(num_layers, num_blocks, tpb,
+                               heads_per_rank, head_dim, kv_dim, g)
+               for g in range(num_gpus)]
+    if is_mla:
+        fill_gpu(all_gpu[0], 0, num_layers, num_blocks, tpb,
+                 heads_per_rank, head_dim, kv_dim)
+        for g in range(1, num_gpus):
+            for l in range(num_layers):
+                all_gpu[g][l].copy_(all_gpu[0][l])
+    else:
+        for g in range(num_gpus):
+            fill_gpu(all_gpu[g], g, num_layers, num_blocks, tpb,
+                     heads_per_rank, head_dim, kv_dim)
+    sync_all(num_gpus)
+
+    (total_blocks, cpu_stride_kv, cpu_stride_layer,
+     cpu_stride_block, cpu_stride_tp) = cpu_layout_for_mode(
+        cpu_layout, cpu_layout_tp, num_layers, num_blocks,
+        num_heads, head_dim, tpb, is_mla, mode, num_gpus)
+    cpu_kv = make_cpu_tensor(cpu_layout, num_layers, total_blocks)
+    ids = make_block_id_pattern(pattern, num_blocks)
+    chunk_size = gpu_layout.get_chunk_size() * ES
+
+    # Step 1: D2H via TPTransferThreadGroup (prepare CPU data)
+    tp = make_tp_group(cpu_kv.data_ptr(), all_gpu, num_gpus,
+                       gpu_layout, num_layers)
+    tp.tp_group_transfer(
+        gpu_block_id_tensor=ids, cpu_block_id_tensor=ids,
+        cpu_kv_stride_in_bytes=cpu_stride_kv,
+        cpu_layer_stride_in_bytes=cpu_stride_layer,
+        cpu_block_stride_in_bytes=cpu_stride_block,
+        cpu_tp_stride_in_bytes=cpu_stride_tp,
+        transfer_num_cta=4, is_host_to_device=False, use_ce_transfer=True,
+        layer_id=0, layer_granularity=num_layers, is_mla=is_mla,
+        mla_d2h_mode=mode,
+    )
+    sync_all(num_gpus)
+    del tp
+
+    # Clear GPUs
+    for g in range(num_gpus):
+        for l in range(num_layers):
+            all_gpu[g][l].zero_()
+    sync_all(num_gpus)
+
+    # Step 2: H2D via LayerwiseTransferGroup (test target). path_opt selects
+    # baseline (PER_BLOCK) vs optimized (BULK_CONTIG / SEGMENTED_DIRECT /
+    # STAGED_SCATTER / GATHER_SCATTER) on the H2D path;
+    # use_pingpong toggles double-buffered staging on the optimized paths.
+    # (Step 1 above intentionally keeps default config -- it only prepares the
+    # reference CPU data, the swept dims apply to this H2D test target.)
+    layerwise_h2d_readback(
+        all_gpu, cpu_kv, num_gpus, gpu_layout, num_layers, ids,
+        cpu_stride_kv, cpu_stride_layer, cpu_stride_block, cpu_stride_tp,
+        chunk_size, is_mla, mode,
+        ce_path_opt=path_opt, ce_use_pingpong=use_pingpong,
+        ce_segment_threshold=segment_threshold, notify_mode=notify_mode)
+
+    # Verify GPU data == original
+    expected_gpu = 0 if is_mla else None
+    for g in range(num_gpus):
+        src_g = expected_gpu if expected_gpu is not None else g
+        for layer in [0, num_layers // 2, num_layers - 1]:
+            for block in [0, num_blocks // 2, num_blocks - 1]:
+                for kv in range(kv_dim):
+                    for hd_idx in [0, head_dim - 1]:
+                        exp = expected_val(src_g, layer, block, 0, hd_idx, kv)
+                        act = all_gpu[g][layer][kv, block, 0, 0, hd_idx].item()
+                        assert abs(act - exp) < 1e-3, \
+                            "CE layerwise H2D mismatch: pattern={} layout={} " \
+                            "notify={} gpu={} layer={} block={} kv={} hd={}: " \
+                            "expected={:.6f} got={:.6f}".format(
+                                pattern, cpu_layout_name, notify_mode, g, layer,
+                                block, kv, hd_idx, exp, act)
+
+
+def _strategy_matrix():
+    """Enumerate (threshold, pattern, layout, is_mla, mode, direction, size) ->
+    (strategy, variant) over exactly the swept parametrize space, so this
+    matches what test_ce_paths_roundtrip / _layerwise_h2d actually exercise
+    (including the scattered-skip-when-num_blocks<=threshold rule).
+
+    Returns a list of (label, strategy, variant) rows.
+    """
+    rows = []
+    layouts = ["LAYERFIRST", "BLOCKFIRST"]
+    # (is_mla, mode) combos as produced by CE_MODE_CONFIGS.
+    mode_combos = [(True, "sharded"), (True, "all_write"),
+                   (True, "rank0_only"), (False, "sharded")]
+    # Representative block counts from the size matrix: a small one (skips
+    # scattered at threshold=8) and a large one.
+    block_counts = [4, 64]
+    for threshold in CE_SEGMENT_THRESHOLDS:
+        for num_blocks in block_counts:
+            for pattern in CE_PATTERNS:
+                # Mirror the runtime skip: scattered needs > threshold segments.
+                if pattern == "scattered" and num_blocks <= threshold:
+                    continue
+                for layout in layouts:
+                    for is_mla, mode in mode_combos:
+                        for is_h2d in (False, True):
+                            strat, variant = _expected_strategy(
+                                pattern, layout, is_mla, mode, is_h2d,
+                                num_blocks=num_blocks, threshold=threshold)
+                            tag = "mla_{}".format(mode) if is_mla else "non_mla"
+                            label = ("thr{:<2d} nb{:<3d} {:<10s} {:<10s} "
+                                     "{:<12s} {}").format(
+                                threshold, num_blocks, pattern, layout, tag,
+                                "h2d" if is_h2d else "d2h")
+                            rows.append((label, strat, variant))
+    return rows
+
+
+def test_ce_strategy_coverage():
+    """Assert the swept parametrize space covers every optimized strategy and
+    both STAGED_SCATTER variants, and print the selection matrix.
+
+    This is still an analytical mapping (mirrors choose_path); it does not
+    introspect the C++ choice at runtime — that would need the engine to
+    expose a path/variant counter. But it guarantees the test suite is not
+    silently skipping a whole strategy or the sharded per-block variant.
+    """
+    skip_if_engine_unsupported(use_ce=True)
+    rows = _strategy_matrix()
+
+    print("\n  CE strategy selection matrix "
+          "(pattern / layout / mode / dir -> strategy[:variant]):")
+    print("  " + "-" * 72)
+    for label, strat, variant in rows:
+        shown = strat + (":" + variant if variant else "")
+        print("  {}  ->  {}".format(label, shown))
+
+    strategies = {s for _, s, _ in rows}
+    variants = {v for _, _, v in rows if v}
+
+    for required in ("BULK_CONTIG", "SEGMENTED_DIRECT",
+                     "STAGED_SCATTER", "GATHER_SCATTER"):
+        assert required in strategies, \
+            "no swept case exercises strategy {} (covered: {})".format(
+                required, sorted(strategies))
+
+    for required in ("STAGED_CONTIG_RUN", "STAGED_PER_BLOCK"):
+        assert required in variants, \
+            "no swept case exercises STAGED_SCATTER variant {} " \
+            "(covered: {})".format(required, sorted(variants))
 
 
 if __name__ == "__main__":

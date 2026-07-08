@@ -437,6 +437,12 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
     transfer_num_cta_h2d=int(os.getenv('FLEXKV_TRANSFER_NUM_CTA_H2D', 4)),
     transfer_num_cta_d2h=int(os.getenv('FLEXKV_TRANSFER_NUM_CTA_D2H', 4)),
 
+    # CE adaptive path configuration (passed to C++ via CETransferConfig)
+    transfer_segment_threshold=int(os.getenv('FLEXKV_TRANSFER_SEGMENT_THRESHOLD', 8)),
+    transfer_pingpong=bool(int(os.getenv('FLEXKV_TRANSFER_PINGPONG', 1))),
+    # Path optimization: 0=baseline (per-block memcpy), 1=Path 0/1/2 auto-select
+    transfer_path_opt=bool(int(os.getenv('FLEXKV_TRANSFER_PATH_OPT', 1))),
+
     iouring_entries=int(os.getenv('FLEXKV_IOURING_ENTRIES', 512)),
     iouring_flags=int(os.getenv('FLEXKV_IOURING_FLAGS', 0)),
 
@@ -467,8 +473,12 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
     nvcomp_batch_size=int(os.getenv('FLEXKV_NVCOMP_BATCH_SIZE', '0')),  # 0 = auto
 
     # MLA D2H transfer mode (only effective when kv_heads=1)
-    # Available modes: "sharded" (default), "all_write", "rank0_only"
-    mla_d2h_mode=os.getenv('FLEXKV_MLA_D2H_MODE', 'sharded'),
+    # Available modes:
+    #   "auto"      (default): auto-select — "sharded" when CE is off, "rank0_only" when CE is on
+    #   "sharded"   Each GPU writes 1/N shard (requires chunk_size % num_gpus == 0)
+    #   "all_write"  Each GPU writes complete KV to its own region (N× CPU memory)
+    #   "rank0_only" Only rank 0 writes complete KV (best with CE for contiguous memcpy)
+    mla_d2h_mode=os.getenv('FLEXKV_MLA_D2H_MODE', 'auto'),
 
     # Layerwise notification mode
     # "hostfunc" (default): notify via cudaLaunchHostFunc callback

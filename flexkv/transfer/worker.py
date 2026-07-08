@@ -356,6 +356,14 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
         self.use_ce_transfer_h2d = use_ce_transfer_h2d
         self.use_ce_transfer_d2h = use_ce_transfer_d2h
 
+        # CE adaptive path config (from GLOBAL_CONFIG_FROM_ENV, same as
+        # TPTransferThreadGroup). GPUCPUTransferWorker is single-GPU (tp_size=1),
+        # so mla_d2h_mode is irrelevant — MLA sharding only applies in the
+        # multi-GPU tp_group_transfer / layerwise_transfer paths.
+        self.ce_path_opt = GLOBAL_CONFIG_FROM_ENV.transfer_path_opt
+        self.ce_use_pingpong = GLOBAL_CONFIG_FROM_ENV.transfer_pingpong
+        self.ce_segment_threshold = GLOBAL_CONFIG_FROM_ENV.transfer_segment_threshold
+
         self._compressor = compressor or NullCompressionStrategy()
         self._compressor.attach(self)
 
@@ -409,6 +417,10 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
             use_ce_transfer,
             self.is_mla,
             self.gpu_block_type_,
+            True,  # sync
+            self.ce_path_opt,
+            self.ce_use_pingpong,
+            self.ce_segment_threshold,
         )
 
     def launch_transfer(self, transfer_op: WorkerTransferOp) -> bool:
@@ -525,6 +537,9 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
             self.gpu_layer_strides_in_bytes,
             self.gpu_chunk_sizes_in_bytes,
             gpu_device_ids,
+            ce_segment_threshold=GLOBAL_CONFIG_FROM_ENV.transfer_segment_threshold,
+            ce_use_pingpong=GLOBAL_CONFIG_FROM_ENV.transfer_pingpong,
+            ce_path_opt=GLOBAL_CONFIG_FROM_ENV.transfer_path_opt,
         )
 
         self._compressor = compressor or NullCompressionStrategy()

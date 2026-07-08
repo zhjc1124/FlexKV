@@ -34,7 +34,9 @@ TPTransferThreadGroup::TPTransferThreadGroup(
     const std::vector<int64_t> &gpu_layer_strides_in_bytes,
     const std::vector<int64_t> &gpu_chunk_sizes_in_bytes,
     const std::vector<int64_t> &gpu_device_ids,
-    bool enable_nvcomp, int nvcomp_batch_size, int nvcomp_data_type) {
+    bool enable_nvcomp, int nvcomp_batch_size, int nvcomp_data_type,
+    CETransferConfig ce_config)
+    : ce_config_(ce_config) {
   const c10::cuda::CUDAGuard restore_device_on_exit(c10::cuda::current_device());
 
   num_gpus_ = num_gpus;
@@ -191,10 +193,18 @@ void TPTransferThreadGroup::tp_group_transfer(
 
   // Validate mla_d2h_mode parameter (only meaningful for MLA)
   std::string mode = mla_d2h_mode;
-  if (is_mla && mode != "sharded" && mode != "all_write" && mode != "rank0_only") {
-    fprintf(stderr, "[FlexKV] Warning: Invalid mla_d2h_mode='%s', using default 'sharded'\n",
+  if (is_mla && mode != "sharded" && mode != "all_write" && mode != "rank0_only"
+      && mode != "auto") {
+    fprintf(stderr, "[FlexKV] Warning: Invalid mla_d2h_mode='%s', using default 'auto'\n",
             mode.c_str());
-    mode = "sharded";
+    mode = "auto";
+  }
+  // Resolve "auto": sharded when CE is off, rank0_only when CE is on.
+  // (rank0_only gives contiguous GPU memory access pattern that the CE
+  //  multi-path strategy can exploit; sharded is better for kernel path
+  //  because each GPU writes a smaller shard, reducing per-GPU load.)
+  if (mode == "auto") {
+    mode = use_ce_transfer ? "rank0_only" : "sharded";
   }
 
   // In sharded D2H mode, chunk_size is divided by num_gpus_ and used as both
@@ -251,11 +261,10 @@ void TPTransferThreadGroup::tp_group_transfer(
               chunk_size = gpu_chunk_sizes_in_bytes_[i];
             }
           } else if (mode == "all_write") {
-            // Each rank's complete KV occupies num_blocks blocks on CPU
-            // ([GPU0][GPU1]...[GPUN]). Rank i's region starts at i * num_blocks
-            // blocks from the base. Use cpu_block_stride (not gpu_chunk_size)
-            // because BLOCKFIRST's block_stride includes all layers+kv_dims,
-            // while LAYERFIRST's block_stride == chunk_size (same result).
+            // Each rank writes complete KV to its own CPU region.
+            // Rank i's blocks start at i * num_blocks offset in block dimension.
+            // CPU strides (layer_stride, kv_stride) must account for total_blocks
+            // = num_gpus * num_blocks — handled by Python caller.
             cpu_startoff_inside_chunks = i * num_blocks * cpu_block_stride_in_bytes;
             gpu_startoff_inside_chunks = 0;
             chunk_size = gpu_chunk_sizes_in_bytes_[i];
@@ -282,7 +291,8 @@ void TPTransferThreadGroup::tp_group_transfer(
               cpu_block_ids, cpu_ptr, cpu_kv_stride_in_bytes,
               cpu_layer_stride_in_bytes, cpu_block_stride_in_bytes,
               cpu_startoff_inside_chunks, chunk_size, streams_[i],
-              transfer_num_cta, is_host_to_device, use_ce_transfer, is_mla);
+              transfer_num_cta, is_host_to_device, use_ce_transfer, is_mla,
+              gpu_block_strides_in_bytes_[i], true, ce_config_);
           break;
         case BackendType::TRTLLM:
           flexkv::transfer_kv_blocks<BackendType::TRTLLM>(
@@ -291,7 +301,8 @@ void TPTransferThreadGroup::tp_group_transfer(
               cpu_block_ids, cpu_ptr, cpu_kv_stride_in_bytes,
               cpu_layer_stride_in_bytes, cpu_block_stride_in_bytes,
               cpu_startoff_inside_chunks, chunk_size, streams_[i],
-              transfer_num_cta, is_host_to_device, use_ce_transfer, is_mla);
+              transfer_num_cta, is_host_to_device, use_ce_transfer, is_mla,
+              gpu_block_strides_in_bytes_[i], true, ce_config_);
           break;
         case BackendType::SGLANG:
           flexkv::transfer_kv_blocks<BackendType::SGLANG>(
@@ -300,7 +311,8 @@ void TPTransferThreadGroup::tp_group_transfer(
               cpu_block_ids, cpu_ptr, cpu_kv_stride_in_bytes,
               cpu_layer_stride_in_bytes, cpu_block_stride_in_bytes,
               cpu_startoff_inside_chunks, chunk_size, streams_[i],
-              transfer_num_cta, is_host_to_device, use_ce_transfer, is_mla);
+              transfer_num_cta, is_host_to_device, use_ce_transfer, is_mla,
+              gpu_block_strides_in_bytes_[i], true, ce_config_);
           break;
         }
 

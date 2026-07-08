@@ -18,6 +18,7 @@
 
 #include "gtensor_handler.cuh"
 #include "transfer.cuh"
+#include "ce_transfer.h"
 #include <atomic>
 #include <condition_variable>
 #include <cuda_runtime.h>
@@ -50,7 +51,8 @@ public:
                         const std::vector<int64_t> &gpu_device_ids,
                         bool enable_nvcomp = false,
                         int nvcomp_batch_size = 0,
-                        int nvcomp_data_type = 0);
+                        int nvcomp_data_type = 0,
+                        CETransferConfig ce_config = CETransferConfig{});
 
   ~TPTransferThreadGroup();
 
@@ -105,6 +107,9 @@ private:
   // Simplified: just one vector of handlers, runtime backend type selection
   BackendType backend_type_;
   std::vector<GTensorHandler> gpu_tensor_handlers_;
+
+  // CE transfer configuration (from GLOBAL_CONFIG_FROM_ENV)
+  CETransferConfig ce_config_;
 
   std::vector<std::thread> threads_;
   std::vector<cudaStream_t> streams_;

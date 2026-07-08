@@ -190,6 +190,10 @@ class TransferManager:
                         indexer_gpu_handles[worker_key] = []
                     indexer_gpu_handles[worker_key].append(
                         self.storage_engine.get_storage_handle(DeviceType.GPU, device_id, is_indexer=True))
+            # If no indexer GPU handles were found, treat as None so the
+            # TransferEngine doesn't create empty indexer workers.
+            if len(indexer_gpu_handles) == 0:
+                indexer_gpu_handles = None
         indexer_cpu_handle = (
             self.storage_engine.get_storage_handle(DeviceType.CPU, is_indexer=True)
             if self.storage_engine.has_storage_handle(DeviceType.CPU, is_indexer=True)
@@ -863,10 +867,10 @@ class TransferManagerInterProcessHandle(TransferManagerHandleBase):
     def shutdown(self) -> None:
         if self.process is not None:
             self.process.terminate()
-            self.process.join(timeout=5.0)
+            self.process.join(timeout=3.0)
             if self.process.is_alive():
                 self.process.kill()
-                self.process.join()
+                self.process.join(timeout=1.0)
 
         self.command_parent_conn.close()
         self.result_parent_conn.close()
