@@ -190,60 +190,10 @@ void *get_cached_device_buffer(size_t size) {
   return b.buf;
 }
 
-// Persistent ping-pong CUDA event pair (per current CUDA device, thread_local).
-//
-// WHY cached, not per-call: a per-call cudaEventCreate + cudaEventRecord +
-// cudaEventDestroy sequence DEADLOCKS the async/polling batch loop. The
-// LayerwiseTransferGroup submits ALL H2D batches (sync=false) and only THEN
-// cudaStreamSynchronize()s the stream. If a CE call records an event on that
-// stream and then cudaEventDestroy()s it before the stream has finished the
-// recorded work, cudaEventDestroy blocks the batch-loop thread -> the next
-// batch is never submitted -> the polling thread never fires all eventfds ->
-// SGLang read(eventfd) times out -> HANG. (This was the original production
-// deadlock that motivated guarding event creation behind `sync`, which in
-// turn left `pingpong_events == nullptr` and caused the STAGED_SCATTER
-// H2D NULL-deref crash.)
-//
-// Caching the pair once per device and reusing it removes the per-call
-// destroy entirely. The caller ALWAYS drains the stream (layerwise:
-// cudaStreamSynchronize after the batch loop; sync=true path: transfer.cu
-// end-of-call sync) before the events could be reused in a stale/incomplete
-// state, so the cached pair is safe for the process lifetime.
-//
-// `outstanding[s]` marks that staging-buffer slot s has a copy in flight on
-// the stream that the CPU must not overwrite yet. It lives in the cached
-// (process-lifetime) struct, so it correctly gates the CPU when a slot is
-// reused by a LATER batch — not just within one call. This is what closes
-// the async-H2D data-corruption race (the CPU gather overwriting a buffer
-// the in-flight cudaMemcpyAsync is still reading).
-struct PingPongEvents {
-  cudaEvent_t ev[2] = {nullptr, nullptr};
-  bool created = false;
-  bool outstanding[2] = {false, false};
-};
-
-// Returns the cached ping-pong event pair for the current device (creating it
-// on first use) and, via `out`, the owning struct so callers can read/reset
-// the `outstanding` flags. The events are NEVER destroyed per call — they
-// persist until thread/process exit. Safe under both call patterns:
-// LayerwiseTransferGroup (single thread, cudaSetDevice per GPU) and
-// TPTransferThreadGroup (one thread per GPU) — the cache is thread_local and
-// device-keyed, just like the staging-buffer caches above.
-cudaEvent_t *get_cached_pingpong_events(PingPongEvents *&out) {
-  int dev = 0;
-  cudaGetDevice(&dev);
-  thread_local std::unordered_map<int, PingPongEvents> cache;
-  PingPongEvents &e = cache[dev];
-  if (!e.created) {
-    TORCH_CHECK(cudaSuccess == cudaEventCreateWithFlags(&e.ev[0], cudaEventDisableTiming),
-                "cudaEventCreateWithFlags failed for cached ping-pong event[0]");
-    TORCH_CHECK(cudaSuccess == cudaEventCreateWithFlags(&e.ev[1], cudaEventDisableTiming),
-                "cudaEventCreateWithFlags failed for cached ping-pong event[1]");
-    e.created = true;
-  }
-  out = &e;
-  return e.ev;
-}
+// NOTE: ping-pong events are created/destroyed locally per call (not cached).
+// A cached event recorded on this call's stream would dangle once the caller
+// (LayerwiseTransferGroup) destroys that stream, causing the next call to
+// sync against a dead stream and abort.
 
 
 // ============================================================================
@@ -410,14 +360,16 @@ void ce_transfer_staged_scatter(
     void *host_bufs[2] = {
         host_base,
         need_pingpong ? (char *)host_base + layer_buf_size : nullptr};
-    // Persistent ping-pong events (cached per device, never destroyed per
-    // call — see get_cached_pingpong_events). `pingpong_events` is ALWAYS
-    // valid now; the `need_pingpong` flag (below) still decides whether we
-    // actually use the 2-buffer overlap machinery. Caching avoids the
-    // per-call cudaEventDestroy that deadlocked the async/polling batch loop,
-    // and `pp->outstanding[]` lets us gate the CPU across calls (see below).
-    PingPongEvents *pp = nullptr;
-    cudaEvent_t *pingpong_events = get_cached_pingpong_events(pp);
+    // Local (per-call) ping-pong events, NOT cached across calls: a cached
+    // event recorded on this call's stream would dangle once the caller
+    // (LayerwiseTransferGroup) destroys that stream, crashing a later call.
+    cudaEvent_t local_events[2] = {nullptr, nullptr};
+    cudaEvent_t *pingpong_events = nullptr;
+    if (need_pingpong) {
+      cudaEventCreateWithFlags(&local_events[0], cudaEventDisableTiming);
+      cudaEventCreateWithFlags(&local_events[1], cudaEventDisableTiming);
+      pingpong_events = local_events;
+    }
 
     const int64_t total_iters = (int64_t)num_layers * kv_dim;
     for (int64_t it = 0; it < total_iters; ++it) {
@@ -466,13 +418,9 @@ void ce_transfer_staged_scatter(
         }
         if (need_pingpong) {
           cudaEventRecord(pingpong_events[idx], stream);
-          pp->outstanding[idx] = true;
           // CPU scatter previous layer
           if (it >= 1) {
-            if (pp->outstanding[prev_idx]) {
-              cudaEventSynchronize(pingpong_events[prev_idx]);
-              pp->outstanding[prev_idx] = false;
-            }
+            cudaEventSynchronize(pingpong_events[prev_idx]);
             int pi = (int)((it - 1) / kv_dim);
             int pj = (int)((it - 1) % kv_dim);
             // scatter from host_bufs[prev_idx] to strided dst
@@ -512,6 +460,7 @@ void ce_transfer_staged_scatter(
           // Segment-level ping-pong: CPU gather of seg K+1 overlaps with
           // H2D of seg K. Mirrors SGLang hicache (p800 transfer.cu).
           // Each segment alternates between host_bufs[0] and host_bufs[1].
+          bool event_used[2] = {false, false};
           int seg_idx = 0;
           int64_t *cpu_base =
               cpu_ptr_int64 + (i + start_layer_id) * cpu_layer_stride_int64 +
@@ -520,19 +469,9 @@ void ce_transfer_staged_scatter(
             int sidx = seg_idx & 1;
             int64_t seg_size = (int64_t)seg.run_len * chunk_size_in_bytes;
 
-            // Wait for the previous use of this slot (2 segments ago, or a
-            // prior batch) to finish BEFORE the CPU overwrites it. The CUDA
-            // stream is in-order, but the CPU gather (host memcpy) is NOT
-            // covered by stream ordering, so we must gate on the slot's
-            // event. `pp->outstanding[sidx]` survives across calls, so this
-            // also closes the cross-batch staging-buffer reuse race (the
-            // real cause of the silent data corruption under polling).
-            // In async mode this blocks only until THIS slot's prior copy
-            // completes — never a full-stream sync — so it never deadlocks
-            // the batch loop.
-            if (pp->outstanding[sidx]) {
+            // Wait for previous use of this slot (2 segments ago).
+            if (event_used[sidx]) {
               cudaEventSynchronize(pingpong_events[sidx]);
-              pp->outstanding[sidx] = false;
             }
 
             // CPU gather: copy from strided CPU into staging slot.
@@ -573,40 +512,18 @@ void ce_transfer_staged_scatter(
             }
             FLEXKV_GPU_CPU_TRANSFER(true, seg_size);
             cudaEventRecord(pingpong_events[sidx], stream);
-            pp->outstanding[sidx] = true;
+            event_used[sidx] = true;
             seg_idx++;
           }
-          // Flush remaining in-flight segments. In sync=true mode, wait for
-          // both slots' last copies so this call returns fully complete.
-          // In sync=false (async/layerwise) mode, do NOT sync here — the
-          // batch loop's caller (LayerwiseTransferGroup) cudaStreamSynchronize
-          // after all batches. The `outstanding[]` flags stay set so the next
-          // batch gates on these copies before reusing the buffers.
-          if (sync) {
-            for (int s = 0; s < 2; ++s) {
-              if (pp->outstanding[s]) {
-                cudaEventSynchronize(pingpong_events[s]);
-                pp->outstanding[s] = false;
-              }
-            }
-          }
+          // Flush remaining in-flight segments.
+          if (event_used[0]) cudaEventSynchronize(pingpong_events[0]);
+          if (event_used[1]) cudaEventSynchronize(pingpong_events[1]);
         } else {
-          // No ping-pong: a single staging buffer (host_bufs[0]) reused every
-          // iteration. In sync=true mode we drain the stream between iters so
-          // the next CPU gather never races the in-flight H2D. In sync=false
-          // (async/polling) mode we must NOT block the batch loop, so we gate
-          // the CPU gather behind a cached event marking the previous
-          // iteration's H2D — it waits for ONLY that copy (not the whole
-          // stream), keeping correctness without deadlocking.
+          // No ping-pong: gather all segments into buf, then H2D all, then
+          // drain. `buf` is pinned to host_bufs[0] and reused every iteration.
           int64_t *cpu_base =
               cpu_ptr_int64 + (i + start_layer_id) * cpu_layer_stride_int64 +
               j * cpu_kv_stride_int64 + cpu_startoff_inside_chunks_int64;
-          // Gate the CPU gather behind the previous iteration's in-flight
-          // H2D (async mode only; sync mode drains via cudaStreamSynchronize).
-          if (!sync && pp->outstanding[0]) {
-            cudaEventSynchronize(pingpong_events[0]);
-            pp->outstanding[0] = false;
-          }
           int64_t off = 0;
           for (const auto &seg : analysis.segments) {
             for (int b = 0; b < seg.run_len; ++b) {
@@ -649,15 +566,10 @@ void ce_transfer_staged_scatter(
               }
             }
           }
-          // Mark this iteration's H2D in flight so the next iteration (or the
-          // next batch) gates the CPU before reusing `buf`. sync=false relies
-          // on the caller's cudaStreamSynchronize; sync=true also drains below.
-          if (sync) {
-            cudaStreamSynchronize(stream);
-          } else {
-            cudaEventRecord(pingpong_events[0], stream);
-            pp->outstanding[0] = true;
-          }
+          // The async H2D memcpy's above are still reading `buf` when the
+          // next iteration's CPU gather overwrites it. Drain the stream so
+          // `buf` is safe to overwrite next iteration.
+          cudaStreamSynchronize(stream);
         }
       }
     }
@@ -665,10 +577,7 @@ void ce_transfer_staged_scatter(
     if (!is_host_to_device && need_pingpong && total_iters >= 1) {
       int64_t last = total_iters - 1;
       int last_idx = (int)(last & 1);
-      if (pp->outstanding[last_idx]) {
-        cudaEventSynchronize(pingpong_events[last_idx]);
-        pp->outstanding[last_idx] = false;
-      }
+      cudaEventSynchronize(pingpong_events[last_idx]);
       int li = (int)(last / kv_dim);
       int lj = (int)(last % kv_dim);
       int64_t *cpu_base = cpu_ptr_int64 + (li + start_layer_id) * cpu_layer_stride_int64 +
@@ -684,11 +593,9 @@ void ce_transfer_staged_scatter(
         }
       }
     }
-    // NOTE: ping-pong events are cached (get_cached_pingpong_events) and
-    // intentionally NOT destroyed here. A per-call cudaEventDestroy blocks if
-    // the event was recorded on a stream the caller has not yet drained, which
-    // deadlocked the async/polling batch loop. The caller always drains the
-    // stream before the events could be reused in a stale state.
+    // Destroy per-call events before returning (see comment at creation).
+    if (local_events[0]) cudaEventDestroy(local_events[0]);
+    if (local_events[1]) cudaEventDestroy(local_events[1]);
   }
 }
 
@@ -744,11 +651,9 @@ void ce_transfer_gather_scatter(
 
   // Transfer block ids to GPU (for index_select / index_copy_).
   // Only needed when GPU blocks are non-contiguous (GATHER_SCATTER path).
-  // Use cached device buffers (not per-call cudaMalloc/cudaFree) so that
-  // in sync=false (async/layerwise polling) mode we can return WITHOUT
-  // draining the stream — the GPU may still be reading these buffers
-  // asynchronously. Per-call cudaFree would be a use-after-free; a cached
-  // buffer survives across calls and is reused next time.
+  // These are small (num_blocks * 8 bytes) and uploaded each call, so per-call
+  // alloc/free is acceptable. The large staging buffers (dev_buf, host_buf)
+  // use the cached path below.
   const size_t ids_bytes = (size_t)num_blocks * sizeof(int64_t);
   void *gpu_ids_raw = nullptr;
   at::Tensor gpu_ids_cuda;
@@ -756,14 +661,16 @@ void ce_transfer_gather_scatter(
   at::Tensor dst_ids_cuda;
   if (!analysis.gpu_log_contig) {
     // gpu_ids_cuda: for D2H index_select gather (GPU source non-contiguous)
-    gpu_ids_raw = get_cached_device_buffer(ids_bytes);
+    TORCH_CHECK(cudaSuccess == cudaMalloc(&gpu_ids_raw, ids_bytes),
+                "cudaMalloc failed for gpu_ids");
     cudaMemcpyAsync(gpu_ids_raw, gpu_block_ids, ids_bytes,
                     cudaMemcpyHostToDevice, stream);
     gpu_ids_cuda = at::from_blob(gpu_ids_raw, {num_blocks}, i64_cuda);
 
     // dst_ids_cuda: for H2D index_copy_ scatter (GPU dst non-contiguous)
     if (is_host_to_device) {
-      dst_ids_raw = get_cached_device_buffer(ids_bytes);
+      TORCH_CHECK(cudaSuccess == cudaMalloc(&dst_ids_raw, ids_bytes),
+                  "cudaMalloc failed for dst_ids");
       cudaMemcpyAsync(dst_ids_raw, gpu_block_ids, ids_bytes,
                       cudaMemcpyHostToDevice, stream);
       dst_ids_cuda = at::from_blob(dst_ids_raw, {num_blocks}, i64_cuda);
@@ -830,22 +737,25 @@ void ce_transfer_gather_scatter(
     }
   }
 
-  // Persistent ping-pong events (cached per device, never destroyed per call
-  // — see get_cached_pingpong_events). `pp_ev` is ALWAYS valid; `pingpong_events`
-  // is non-null only when we use the 2-buffer overlap machinery
-  // (need_pingpong_host). The `pp->outstanding[]` flags gate the CPU when a
-  // staging slot is reused — within a call and across batches — which closes
-  // the async-H2D data-corruption race (CPU gather overwriting a buffer the
-  // in-flight H2D/index_copy_ is still reading).
-  PingPongEvents *pp = nullptr;
-  cudaEvent_t *pp_ev = get_cached_pingpong_events(pp);
-  cudaEvent_t *pingpong_events = need_pingpong_host ? pp_ev : nullptr;
+  // Ping-pong events are created LOCALLY per call (not cached across calls).
+  // A cached (thread_local) event gets recorded on this call's stream, but the
+  // caller (LayerwiseTransferGroup) destroys that stream when it is torn down;
+  // a later call would then record/sync the cached event against a destroyed
+  // stream -> cudaErrorInvalidResourceHandle -> abort/segfault. This only bit
+  // the full-suite run (stale stream from a prior test), never a single test.
+  cudaEvent_t local_events[2] = {nullptr, nullptr};
+  cudaEvent_t *pingpong_events = nullptr;
+  if (need_pingpong_host) {
+    cudaEventCreateWithFlags(&local_events[0], cudaEventDisableTiming);
+    cudaEventCreateWithFlags(&local_events[1], cudaEventDisableTiming);
+    pingpong_events = local_events;
+  }
 
   const int64_t total_iters = (int64_t)num_layers * kv_dim;
   for (int64_t it = 0; it < total_iters; ++it) {
     int i = (int)(it / kv_dim);
     int j = (int)(it % kv_dim);
-    int idx = need_pingpong_host ? (int)(it & 1) : 0;
+    int idx = pingpong_events ? (int)(it & 1) : 0;
     int prev_idx = idx ^ 1;
 
     int64_t *gpu_layer_kv_base =
@@ -878,14 +788,10 @@ void ce_transfer_gather_scatter(
       FLEXKV_GPU_CPU_TRANSFER(false, buf_bytes);
 
       if (pingpong_events) {
-        cudaEventRecord(pp_ev[idx], stream);
-        pp->outstanding[idx] = true;
+        cudaEventRecord(pingpong_events[idx], stream);
         // Step 3: CPU scatter previous slot
         if (it >= 1) {
-          if (pp->outstanding[prev_idx]) {
-            cudaEventSynchronize(pp_ev[prev_idx]);
-            pp->outstanding[prev_idx] = false;
-          }
+          cudaEventSynchronize(pingpong_events[prev_idx]);
           int pi = (int)((it - 1) / kv_dim);
           int pj = (int)((it - 1) % kv_dim);
           int64_t *cpu_base = cpu_ptr_int64 + (pi + start_layer_id) * cpu_layer_stride_int64 +
@@ -913,23 +819,10 @@ void ce_transfer_gather_scatter(
       }
     } else {
       // ============ H2D ============
-      // GATE: wait for the previous use of this staging slot to finish before
-      // we overwrite it. Host staging (host_buf[idx]) is written by the CPU
-      // gather (Step 1) when CPU src is non-contiguous; device staging
-      // (dev_buf[idx]) is written by the GPU index_copy_ scatter (Step 3) when
-      // GPU dst is non-contiguous. Both are keyed by `idx` and reused every
-      // iteration AND across batches, so the prior use must complete first.
-      // `pp->outstanding[idx]` survives across calls, closing the cross-batch
-      // async-H2D data-corruption race. In async mode this blocks only until
-      // THIS slot's prior copy finishes (not a full-stream sync), so it never
-      // deadlocks the batch loop.
-      if (need_host_buf || need_dev_buf) {
-        if (pp->outstanding[idx]) {
-          cudaEventSynchronize(pp_ev[idx]);
-          pp->outstanding[idx] = false;
-        }
-      }
-
+      // In H2D: actual src = CPU, actual dst = GPU. The CEAnalysis naming is
+      // direction-agnostic (gpu_* = GPU side, cpu_* = CPU side), so no mental
+      // swap is needed — just use the correct side's flags.
+      //
       // Step 1: CPU gather (if CPU src non-contig)
       const void *h2d_src;
       if (analysis.cpu_log_contig && analysis.cpu_phys_contig) {
@@ -940,6 +833,12 @@ void ce_transfer_gather_scatter(
                   cpu_block_ids[0] * cpu_block_stride_int64 +
                   cpu_startoff_inside_chunks_int64;
       } else {
+        // Before reusing host_buf[idx], wait for the H2D copy that last used
+        // this same ping-pong slot (it-2) to finish. it>=2 guards against
+        // synchronizing an event that was never recorded (it==1, idx=1).
+        if (pingpong_events && it >= 2) {
+          cudaEventSynchronize(pingpong_events[idx]);
+        }
         // gather into staging
         int64_t *cpu_base = cpu_ptr_int64 +
             (i + start_layer_id) * cpu_layer_stride_int64 +
@@ -974,26 +873,32 @@ void ce_transfer_gather_scatter(
         dst_view.index_copy_(0, dst_ids_cuda, dev_buf[idx]);
       }
 
-      // Mark this slot's copy in flight so the next reuse (iteration or
-      // batch) gates on it. The event covers the full H2D + index_copy_
-      // chain. In sync mode the caller (transfer.cu end-of-call sync) drains
-      // the stream; in async mode the LayerwiseTransferGroup drains after all
-      // batches — so the event is always complete before the slot is reused.
-      if (need_host_buf || need_dev_buf) {
-        cudaEventRecord(pp_ev[idx], stream);
-        pp->outstanding[idx] = true;
+      // Record AFTER the scatter so the ping-pong event covers the full
+      // H2D + index_copy_ chain. Otherwise the next iteration reusing
+      // dev_buf[idx]/host_buf[idx] (guarded by cudaEventSynchronize on this
+      // event) could overwrite the buffer while the scatter still reads it.
+      if (pingpong_events) {
+        cudaEventRecord(pingpong_events[idx], stream);
+      } else if (need_host_buf || need_dev_buf) {
+        // No ping-pong: idx is pinned to 0, so host_buf[0]/dev_buf[0] are
+        // reused every iteration. The async H2D memcpy (reading host_buf[0])
+        // and the index_copy_ scatter (reading dev_buf[0]) are still in flight
+        // on `stream` when the NEXT iteration's CPU gather memcpy's fresh data
+        // into host_buf[0] / the gather issues into dev_buf[0]. Without a
+        // barrier the next iteration stomps the staging buffer mid-copy,
+        // corrupting the transfer (observed as cross-layer/cross-kv data mixups
+        // under optimized + pingpong_off). Drain the stream so the staging buffers
+        // are safe to overwrite before the next iteration touches them.
+        cudaStreamSynchronize(stream);
       }
     }
   }
 
-  // Drain last D2H scatter (CPU must finish before returning).
-  if (!is_host_to_device && need_pingpong_host && total_iters >= 1) {
+  // Drain last D2H scatter
+  if (!is_host_to_device && pingpong_events && total_iters >= 1) {
     int64_t last = total_iters - 1;
     int last_idx = (int)(last & 1);
-    if (pp->outstanding[last_idx]) {
-      cudaEventSynchronize(pp_ev[last_idx]);
-      pp->outstanding[last_idx] = false;
-    }
+    cudaEventSynchronize(pingpong_events[last_idx]);
     int li = (int)(last / kv_dim);
     int lj = (int)(last % kv_dim);
     int64_t *cpu_base = cpu_ptr_int64 + (li + start_layer_id) * cpu_layer_stride_int64 +
@@ -1007,34 +912,46 @@ void ce_transfer_gather_scatter(
     }
   }
 
-  // Drain the stream before returning ONLY in sync=true mode. In async mode
-  // (sync=false, polling) the caller (layerwise.cpp) cudaStreamSynchronize's
-  // after all batches are submitted — so we must NOT block here. All per-call
-  // GPU resources (gpu_ids, dst_ids, dev_buf, host_buf) are cached and stream
-  // ordering guarantees the previous call's async ops complete before the next
-  // call's on the same stream; the `pp->outstanding[]` flags gate the CPU so
-  // the staging buffers are never overwritten while an in-flight copy reads
-  // them.
-  if (sync) {
-    cudaStreamSynchronize(stream);
+  // Drain last H2D
+  if (is_host_to_device && pingpong_events && total_iters >= 1) {
+    int64_t last = total_iters - 1;
+    int last_idx = (int)(last & 1);
+    cudaEventSynchronize(pingpong_events[last_idx]);
   }
 
-  // NOTE: ping-pong events are cached (get_cached_pingpong_events) and
-  // intentionally NOT destroyed here. A per-call cudaEventDestroy blocks if
-  // the event was recorded on a stream the caller has not yet drained, which
-  // deadlocked the async/polling batch loop. The caller always drains the
-  // stream before the events could be reused in a stale state.
+  // Drain the stream before returning. The staging buffers (dev_buf,
+  // host_buf) are cached and survive across calls, but the per-call
+  // id tensors (gpu_ids_raw, dst_ids_raw) and ping-pong events are
+  // freed on return — any in-flight async op referencing them would
+  // read/write freed memory. In sync=true mode this is mandatory.
+  // In sync=false mode (async/layerwise), ping-pong should have already
+  // drained the last iteration via event sync, but we still need to
+  // drain before freeing gpu_ids_raw/dst_ids_raw.
+  if (sync || !pingpong_events) {
+    cudaStreamSynchronize(stream);
+  } else {
+    // Async mode with ping-pong: drain only the last event, not the full
+    // stream. The last iteration's event covers H2D + index_copy_.
+    int64_t last = total_iters - 1;
+    int last_idx = (int)(last & 1);
+    cudaEventSynchronize(pingpong_events[last_idx]);
+  }
+
+  // Destroy the per-call ping-pong events. They must not outlive this call:
+  // the caller may destroy `stream` afterwards, so keeping the events cached
+  // would leave them referencing a dead stream on the next call.
+  if (local_events[0]) cudaEventDestroy(local_events[0]);
+  if (local_events[1]) cudaEventDestroy(local_events[1]);
 
   // Release the from_blob views. The large staging buffers (dev_buf, host_buf)
-  // are cached and freed by RAII on thread exit. The id tensors
-  // (gpu_ids_raw, dst_ids_raw) are also cached (get_cached_device_buffer),
-  // so we just reset the views — no cudaFree, no drain needed.
-  // In sync=false mode the GPU may still be reading these buffers
-  // asynchronously; since they are cached (not per-call freed), this is safe.
+  // are cached and freed by RAII on thread exit. The small id tensors
+  // (gpu_ids_raw, dst_ids_raw) are per-call alloc/free.
   gpu_ids_cuda.reset();
   dst_ids_cuda.reset();
   dev_buf[0].reset();
   dev_buf[1].reset();
+  if (gpu_ids_raw) cudaFree(gpu_ids_raw);
+  if (dst_ids_raw) cudaFree(dst_ids_raw);
 }
 
 // ---- Explicit template instantiations ----
