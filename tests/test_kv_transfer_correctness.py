@@ -372,7 +372,7 @@ def layerwise_h2d_readback(all_gpu, cpu_kv, num_gpus, gpu_layout, num_layers,
                            cpu_stride_block, cpu_stride_tp, chunk_size,
                            is_mla, mode, ce_path_opt=None,
                            ce_use_pingpong=None, ce_segment_threshold=None,
-                           notify_mode="hostfunc"):
+                           notify_mode="hostfunc", layer_granularity=None):
     """Run a single CE H2D via LayerwiseTransferGroup, reading `cpu_kv` back
     into `all_gpu` with block-id list `ids`.
 
@@ -409,7 +409,7 @@ def layerwise_h2d_readback(all_gpu, cpu_kv, num_gpus, gpu_layout, num_layers,
         h2d_cpu_layer_stride_in_bytes=cpu_stride_layer,
         cpu_tp_stride_in_bytes=cpu_stride_tp,
         transfer_cta_num=4, use_ce_transfer=True,
-        num_layers=num_layers, layer_granularity=num_layers,
+        num_layers=num_layers, layer_granularity=num_layers if layer_granularity is None else layer_granularity,
         is_mla=is_mla,
         counter_id=0,
         indexer_gpu_block_id_tensor=empty_indexer,
@@ -1207,9 +1207,10 @@ def test_ce_paths_roundtrip(data_config, is_mla, cpu_layout_name, pattern,
                          ids=lambda t: "thr{}".format(t))
 @pytest.mark.parametrize("path_opt", [False, True], ids=["baseline", "optimized"])
 @pytest.mark.parametrize("notify_mode", ["polling"], ids=["polling"])
+@pytest.mark.parametrize("layer_granularity", [1, None], ids=["lg1", "lg_all"])
 def test_ce_paths_layerwise_h2d(data_config, is_mla, cpu_layout_name, pattern,
                                 path_opt, use_pingpong, mode, segment_threshold,
-                                notify_mode):
+                                notify_mode, layer_granularity):
     """CE strategy correctness for LayerwiseTransferGroup H2D.
 
     Uses TPTransferThreadGroup D2H (already verified correct) to prepare
@@ -1294,7 +1295,8 @@ def test_ce_paths_layerwise_h2d(data_config, is_mla, cpu_layout_name, pattern,
         cpu_stride_kv, cpu_stride_layer, cpu_stride_block, cpu_stride_tp,
         chunk_size, is_mla, mode,
         ce_path_opt=path_opt, ce_use_pingpong=use_pingpong,
-        ce_segment_threshold=segment_threshold, notify_mode=notify_mode)
+        ce_segment_threshold=segment_threshold, notify_mode=notify_mode,
+        layer_granularity=layer_granularity)
 
     # Verify GPU data == original
     expected_gpu = 0 if is_mla else None
