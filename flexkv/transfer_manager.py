@@ -181,15 +181,26 @@ class TransferManager:
         )
 
         indexer_gpu_handles: Optional[Dict[WorkerKey, List]] = None
+        # Only build indexer_gpu_handles when BOTH indexer CPU storage AND at
+        # least one indexer GPU handle exist. If indexer CPU exists but no
+        # indexer GPU (e.g. model has no indexer weights), leaving
+        # indexer_gpu_handles=None prevents TransferEngine from creating empty
+        # indexer worker dicts that would later raise
+        # "No INDEXER_D2H worker found matching dp_client_id=0".
         if self.storage_engine.has_storage_handle(DeviceType.CPU, is_indexer=True):
-            indexer_gpu_handles = {}
-            for device_id in sorted(self.all_gpu_blocks.keys()):
-                if self.storage_engine.has_storage_handle(DeviceType.GPU, device_id, is_indexer=True):
-                    worker_key = self.gpu_worker_key_mapping[device_id]
-                    if worker_key not in indexer_gpu_handles:
-                        indexer_gpu_handles[worker_key] = []
-                    indexer_gpu_handles[worker_key].append(
-                        self.storage_engine.get_storage_handle(DeviceType.GPU, device_id, is_indexer=True))
+            has_indexer_gpu = any(
+                self.storage_engine.has_storage_handle(DeviceType.GPU, device_id, is_indexer=True)
+                for device_id in sorted(self.all_gpu_blocks.keys())
+            )
+            if has_indexer_gpu:
+                indexer_gpu_handles = {}
+                for device_id in sorted(self.all_gpu_blocks.keys()):
+                    if self.storage_engine.has_storage_handle(DeviceType.GPU, device_id, is_indexer=True):
+                        worker_key = self.gpu_worker_key_mapping[device_id]
+                        if worker_key not in indexer_gpu_handles:
+                            indexer_gpu_handles[worker_key] = []
+                        indexer_gpu_handles[worker_key].append(
+                            self.storage_engine.get_storage_handle(DeviceType.GPU, device_id, is_indexer=True))
         indexer_cpu_handle = (
             self.storage_engine.get_storage_handle(DeviceType.CPU, is_indexer=True)
             if self.storage_engine.has_storage_handle(DeviceType.CPU, is_indexer=True)
