@@ -390,7 +390,12 @@ void ce_transfer_staged_scatter(
   {
     // ---- staging buffer + CPU scatter/gather ----
     size_t layer_buf_size = (size_t)num_blocks * chunk_size_in_bytes;
-    bool need_pingpong = use_pingpong && (!is_host_to_device || !sync);
+    // Ping-pong only helps D2H (CPU scatter overlaps with GPU D2H memcpy).
+    // H2D's CPU gather is too fast to benefit from overlap.
+    // Also disable for STAGED_PER_BLOCK (both sides non-contig) — per-block
+    // granularity makes event overhead dominate at large num_blocks.
+    bool is_per_block = !analysis.gpu_phys_contig && !analysis.cpu_phys_contig;
+    bool need_pingpong = use_pingpong && !is_host_to_device && !is_per_block;
 
     void *host_base = get_cached_hugepage_buffer(need_pingpong ? layer_buf_size * 2
                                                          : layer_buf_size);
@@ -732,7 +737,7 @@ void ce_transfer_gather_scatter(
   void *dev_raw[2] = {nullptr, nullptr};
   at::Tensor dev_buf[2];
   if (need_dev_buf) {
-    bool need_two = use_pingpong && (!is_host_to_device || !sync);  // D2H or async H2D
+    bool need_two = use_pingpong && !is_host_to_device;  // D2H only — H2D pingpong has no benefit
     size_t dev_alloc = need_two ? buf_bytes * 2 : buf_bytes;
     void *dev_base = get_cached_device_buffer(dev_alloc, 2);  // slot=2: dev_buf (independent from gpu_ids/dst_ids)
     dev_raw[0] = dev_base;
@@ -750,10 +755,9 @@ void ce_transfer_gather_scatter(
       !is_host_to_device ||  // D2H: always stage then scatter
       (is_host_to_device && !analysis.cpu_log_contig);  // H2D: CPU gather needed
 
-  // Ping-pong: D2H always (CPU scatter overlap); H2D only in async mode
-  // (sync=false) where per-iteration stream sync would deadlock the caller.
-  // In sync=true mode, H2D ping-pong is disabled (event overhead > overlap gain).
-  bool need_pingpong_host = need_host_buf && use_pingpong && (!is_host_to_device || !sync);
+  // Ping-pong: D2H only — CPU scatter overlaps with GPU D2H memcpy.
+  // H2D's CPU gather is too fast to benefit from overlap.
+  bool need_pingpong_host = need_host_buf && use_pingpong && !is_host_to_device;
 
   void *host_buf[2] = {nullptr, nullptr};
   if (need_host_buf) {
