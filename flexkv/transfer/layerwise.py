@@ -486,6 +486,9 @@ class LayerwiseTransferWorker(TransferWorkerBase):
         cpu_block_ids_d2h = dst_block_ids_disk2h if dst_block_ids_disk2h is not None \
             else torch.empty(0, dtype=torch.int64)
 
+        import sys
+        print(f"[LWDBG-PY] _transfer_impl start: is_mla={self.is_mla} num_h2d_blocks={len(dst_block_ids_h2d)} kv_dim={self.kv_dim}", file=sys.stderr, flush=True)
+
         # Prepare indexer block_ids for fused transfer
         indexer_gpu_block_id_tensor = torch.Tensor()
         indexer_cpu_block_id_tensor = torch.Tensor()
@@ -539,6 +542,7 @@ class LayerwiseTransferWorker(TransferWorkerBase):
             self.mla_d2h_mode,  # Pass MLA D2H mode to C++
             self.layerwise_notify_mode,  # Pass notification mode to C++
         )
+        print(f"[LWDBG-PY] _transfer_impl done: is_mla={self.is_mla}", file=sys.stderr, flush=True)
 
     def launch_transfer(self, transfer_op: WorkerLayerwiseTransferOp) -> bool:
         src_block_ids_h2d = torch.from_numpy(transfer_op.src_block_ids_h2d).to(dtype=torch.int64).pin_memory()
