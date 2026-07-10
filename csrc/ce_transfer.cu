@@ -190,10 +190,41 @@ void *get_cached_device_buffer(size_t size) {
   return b.buf;
 }
 
-// NOTE: ping-pong events are created/destroyed locally per call (not cached).
-// A cached event recorded on this call's stream would dangle once the caller
-// (LayerwiseTransferGroup) destroys that stream, causing the next call to
-// sync against a dead stream and abort.
+// Cached CUDA event pair (per device, thread_local).
+// Events are created once on first use and NEVER destroyed per call.
+// This avoids:
+// 1. Per-call cudaEventCreate/Destroy overhead (~0.01ms each, adds up over
+//    num_layers * kv_dim iterations).
+// 2. cudaEventDestroy blocking when the stream hasn't been drained yet
+//    (sync=false / polling mode). A cached event is just reused — the old
+//    record is overwritten by the next cudaEventRecord.
+//
+// Safety: within each call, all events are sync'd (cudaEventSynchronize)
+// before the staging buffers they guard are reused. At function return,
+// the last event is sync'd (for pingpong_on) or the stream is sync'd
+// (for pingpong_off / sync=true). So all GPU work is complete before the
+// cached events are reused in the next call.
+struct CachedEventPair {
+  cudaEvent_t ev[2] = {nullptr, nullptr};
+  bool created = false;
+};
+
+cudaEvent_t *get_cached_event_pair(bool need, bool &created) {
+  if (!need) return nullptr;
+  thread_local std::unordered_map<int, CachedEventPair> cache;
+  int dev = 0;
+  cudaGetDevice(&dev);
+  CachedEventPair &e = cache[dev];
+  if (!e.created) {
+    TORCH_CHECK(cudaSuccess == cudaEventCreateWithFlags(&e.ev[0], cudaEventDisableTiming),
+                "cudaEventCreateWithFlags failed for cached event[0]");
+    TORCH_CHECK(cudaSuccess == cudaEventCreateWithFlags(&e.ev[1], cudaEventDisableTiming),
+                "cudaEventCreateWithFlags failed for cached event[1]");
+    e.created = true;
+  }
+  created = true;
+  return e.ev;
+}
 
 
 // ============================================================================
@@ -360,16 +391,9 @@ void ce_transfer_staged_scatter(
     void *host_bufs[2] = {
         host_base,
         need_pingpong ? (char *)host_base + layer_buf_size : nullptr};
-    // Local (per-call) ping-pong events, NOT cached across calls: a cached
-    // event recorded on this call's stream would dangle once the caller
-    // (LayerwiseTransferGroup) destroys that stream, crashing a later call.
-    cudaEvent_t local_events[2] = {nullptr, nullptr};
-    cudaEvent_t *pingpong_events = nullptr;
-    if (need_pingpong) {
-      cudaEventCreateWithFlags(&local_events[0], cudaEventDisableTiming);
-      cudaEventCreateWithFlags(&local_events[1], cudaEventDisableTiming);
-      pingpong_events = local_events;
-    }
+    // Cached ping-pong events (per device, thread_local — see get_cached_event_pair).
+    bool events_created = false;
+    cudaEvent_t *pingpong_events = get_cached_event_pair(need_pingpong, events_created);
 
     const int64_t total_iters = (int64_t)num_layers * kv_dim;
     for (int64_t it = 0; it < total_iters; ++it) {
@@ -593,9 +617,10 @@ void ce_transfer_staged_scatter(
         }
       }
     }
-    // Destroy per-call events before returning (see comment at creation).
-    if (local_events[0]) cudaEventDestroy(local_events[0]);
-    if (local_events[1]) cudaEventDestroy(local_events[1]);
+    // NOTE: ping-pong events are cached (get_cached_event_pair) and NOT
+    // destroyed here. All GPU work has been sync'd within the loop (via
+    // per-slot cudaEventSynchronize) and at the end (via final flush or
+    // cudaStreamSynchronize), so the events are safe to reuse in the next call.
   }
 }
 
@@ -651,26 +676,25 @@ void ce_transfer_gather_scatter(
 
   // Transfer block ids to GPU (for index_select / index_copy_).
   // Only needed when GPU blocks are non-contiguous (GATHER_SCATTER path).
-  // These are small (num_blocks * 8 bytes) and uploaded each call, so per-call
-  // alloc/free is acceptable. The large staging buffers (dev_buf, host_buf)
-  // use the cached path below.
+  // Transfer block ids to GPU (for index_select / index_copy_).
+  // Use cached device buffers (not per-call cudaMalloc/cudaFree) so that
+  // in sync=false (async/layerwise polling) mode we can return WITHOUT
+  // draining the stream — the GPU may still be reading these buffers
+  // asynchronously. Per-call cudaFree would be a use-after-free; a cached
+  // buffer survives across calls and is reused next time.
   const size_t ids_bytes = (size_t)num_blocks * sizeof(int64_t);
   void *gpu_ids_raw = nullptr;
   at::Tensor gpu_ids_cuda;
   void *dst_ids_raw = nullptr;
   at::Tensor dst_ids_cuda;
   if (!analysis.gpu_log_contig) {
-    // gpu_ids_cuda: for D2H index_select gather (GPU source non-contiguous)
-    TORCH_CHECK(cudaSuccess == cudaMalloc(&gpu_ids_raw, ids_bytes),
-                "cudaMalloc failed for gpu_ids");
+    gpu_ids_raw = get_cached_device_buffer(ids_bytes);
     cudaMemcpyAsync(gpu_ids_raw, gpu_block_ids, ids_bytes,
                     cudaMemcpyHostToDevice, stream);
     gpu_ids_cuda = at::from_blob(gpu_ids_raw, {num_blocks}, i64_cuda);
 
-    // dst_ids_cuda: for H2D index_copy_ scatter (GPU dst non-contiguous)
     if (is_host_to_device) {
-      TORCH_CHECK(cudaSuccess == cudaMalloc(&dst_ids_raw, ids_bytes),
-                  "cudaMalloc failed for dst_ids");
+      dst_ids_raw = get_cached_device_buffer(ids_bytes);
       cudaMemcpyAsync(dst_ids_raw, gpu_block_ids, ids_bytes,
                       cudaMemcpyHostToDevice, stream);
       dst_ids_cuda = at::from_blob(dst_ids_raw, {num_blocks}, i64_cuda);
@@ -737,19 +761,9 @@ void ce_transfer_gather_scatter(
     }
   }
 
-  // Ping-pong events are created LOCALLY per call (not cached across calls).
-  // A cached (thread_local) event gets recorded on this call's stream, but the
-  // caller (LayerwiseTransferGroup) destroys that stream when it is torn down;
-  // a later call would then record/sync the cached event against a destroyed
-  // stream -> cudaErrorInvalidResourceHandle -> abort/segfault. This only bit
-  // the full-suite run (stale stream from a prior test), never a single test.
-  cudaEvent_t local_events[2] = {nullptr, nullptr};
-  cudaEvent_t *pingpong_events = nullptr;
-  if (need_pingpong_host) {
-    cudaEventCreateWithFlags(&local_events[0], cudaEventDisableTiming);
-    cudaEventCreateWithFlags(&local_events[1], cudaEventDisableTiming);
-    pingpong_events = local_events;
-  }
+  // Cached ping-pong events (per device, thread_local — see get_cached_event_pair).
+  bool events_created = false;
+  cudaEvent_t *pingpong_events = get_cached_event_pair(need_pingpong_host, events_created);
 
   const int64_t total_iters = (int64_t)num_layers * kv_dim;
   for (int64_t it = 0; it < total_iters; ++it) {
@@ -937,21 +951,16 @@ void ce_transfer_gather_scatter(
     cudaEventSynchronize(pingpong_events[last_idx]);
   }
 
-  // Destroy the per-call ping-pong events. They must not outlive this call:
-  // the caller may destroy `stream` afterwards, so keeping the events cached
-  // would leave them referencing a dead stream on the next call.
-  if (local_events[0]) cudaEventDestroy(local_events[0]);
-  if (local_events[1]) cudaEventDestroy(local_events[1]);
+  // NOTE: ping-pong events are cached (get_cached_event_pair) and NOT
+  // destroyed here. All GPU work has been sync'd within the loop (via
+  // per-slot cudaEventSynchronize) and at the end (via final drain).
 
-  // Release the from_blob views. The large staging buffers (dev_buf, host_buf)
-  // are cached and freed by RAII on thread exit. The small id tensors
-  // (gpu_ids_raw, dst_ids_raw) are per-call alloc/free.
+  // Release the from_blob views. The underlying buffers (dev_buf, host_buf,
+  // gpu_ids_raw, dst_ids_raw) are all cached and survive across calls.
   gpu_ids_cuda.reset();
   dst_ids_cuda.reset();
   dev_buf[0].reset();
   dev_buf[1].reset();
-  if (gpu_ids_raw) cudaFree(gpu_ids_raw);
-  if (dst_ids_raw) cudaFree(dst_ids_raw);
 }
 
 // ---- Explicit template instantiations ----
