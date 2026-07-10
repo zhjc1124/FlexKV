@@ -180,7 +180,7 @@ void *get_cached_hugepage_buffer(size_t size) {
 // — using the same buffer would cause the second cudaMemcpyAsync to clobber
 // the first). Default slot=0; callers that need a second independent buffer
 // pass slot=1.
-void *get_cached_device_buffer(size_t size, int slot = 0) {
+void *get_cached_device_buffer(size_t size, int slot) {
   int dev = 0;
   cudaGetDevice(&dev);
   thread_local std::unordered_map<int, std::array<DeviceStagingBuf, 2>> cache;
