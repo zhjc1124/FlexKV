@@ -394,8 +394,10 @@ void ce_transfer_staged_scatter(
     // H2D's CPU gather is too fast to benefit from overlap.
     // Also disable for STAGED_PER_BLOCK (both sides non-contig) — per-block
     // granularity makes event overhead dominate at large num_blocks.
+    // Also require sync=true — in async/polling mode, cudaEventSynchronize
+    // would block the batch loop.
     bool is_per_block = !analysis.gpu_phys_contig && !analysis.cpu_phys_contig;
-    bool need_pingpong = use_pingpong && !is_host_to_device && !is_per_block;
+    bool need_pingpong = use_pingpong && !is_host_to_device && sync && !is_per_block;
 
     void *host_base = get_cached_hugepage_buffer(need_pingpong ? layer_buf_size * 2
                                                          : layer_buf_size);
@@ -737,7 +739,7 @@ void ce_transfer_gather_scatter(
   void *dev_raw[2] = {nullptr, nullptr};
   at::Tensor dev_buf[2];
   if (need_dev_buf) {
-    bool need_two = use_pingpong && !is_host_to_device;  // D2H only — H2D pingpong has no benefit
+    bool need_two = use_pingpong && !is_host_to_device && sync;  // D2H + sync only
     size_t dev_alloc = need_two ? buf_bytes * 2 : buf_bytes;
     void *dev_base = get_cached_device_buffer(dev_alloc, 2);  // slot=2: dev_buf (independent from gpu_ids/dst_ids)
     dev_raw[0] = dev_base;
@@ -755,9 +757,10 @@ void ce_transfer_gather_scatter(
       !is_host_to_device ||  // D2H: always stage then scatter
       (is_host_to_device && !analysis.cpu_log_contig);  // H2D: CPU gather needed
 
-  // Ping-pong: D2H only — CPU scatter overlaps with GPU D2H memcpy.
-  // H2D's CPU gather is too fast to benefit from overlap.
-  bool need_pingpong_host = need_host_buf && use_pingpong && !is_host_to_device;
+  // Ping-pong: D2H + sync=true only — CPU scatter overlaps with GPU D2H.
+  // H2D has no benefit (CPU gather too fast). sync=false (async/polling)
+  // would block batch loop with cudaEventSynchronize.
+  bool need_pingpong_host = need_host_buf && use_pingpong && !is_host_to_device && sync;
 
   void *host_buf[2] = {nullptr, nullptr};
   if (need_host_buf) {
