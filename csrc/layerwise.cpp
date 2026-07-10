@@ -309,6 +309,19 @@ LayerwiseTransferGroup::~LayerwiseTransferGroup() {
     if (poll_thread_.joinable()) {
       poll_thread_.join();
     }
+    // Sync all GPU streams before destroying them — the async polling path
+    // returns without cudaStreamSynchronize, so there may be pending GPU work.
+    for (int i = 0; i < num_gpus_; ++i) {
+      cudaSetDevice(gpu_device_ids_[i]);
+      cudaStreamSynchronize(streams_[i]);
+    }
+    // Destroy poll batch events (deferred from layerwise_transfer)
+    for (int b = 0; b < (int)poll_batches_.size(); ++b) {
+      for (int g = 0; g < num_gpus_; ++g) {
+        cudaSetDevice(gpu_device_ids_[g]);
+        cudaEventDestroy(poll_batches_[b].per_gpu_events[g]);
+      }
+    }
   }
 
   for (int i = 0; i < num_gpus_; i++) {
@@ -401,6 +414,10 @@ void LayerwiseTransferGroup::layerwise_transfer(
   // GLOBAL_CONFIG_FROM_ENV.layerwise_notify_mode on the Python side).
   notify_mode_ = (notify_mode == "polling") ? NotifyMode::POLLING
                                             : NotifyMode::HOSTFUNC;
+
+  fprintf(stderr, "[LWDBG] layerwise_transfer enter: notify=%s is_mla=%d num_layers=%d layer_gran=%d\n",
+          notify_mode.c_str(), (int)is_mla, num_layers, layer_granularity);
+  fflush(stderr);
 
   // Set current counter ID for eventfd notification
   current_counter_id_ = counter_id;
@@ -563,6 +580,11 @@ void LayerwiseTransferGroup::layerwise_transfer(
     int layers_this_batch =
         std::min(layer_granularity, num_layers - start_layer);
 
+    if (batch_idx == 0) {
+      fprintf(stderr, "[LWDBG] batch loop start: num_batches=%d num_blocks=%d\n", num_batches, num_blocks);
+      fflush(stderr);
+    }
+
     batch_start_layers[batch_idx] = start_layer;
     batch_layers_count[batch_idx] = layers_this_batch;
 
@@ -694,6 +716,10 @@ void LayerwiseTransferGroup::layerwise_transfer(
         cudaSetDevice(gpu_device_ids_[i]);
         cudaEventRecord(poll_batches_[batch_idx].per_gpu_events[i], streams_[i]);
       }
+      if (batch_idx == 0 || batch_idx == num_batches - 1) {
+        fprintf(stderr, "[LWDBG] batch %d/%d events recorded\n", batch_idx, num_batches - 1);
+        fflush(stderr);
+      }
     } else {
       // NVTX: current range ends in callback, next range starts in callback
       bool is_last_batch = (batch_idx == num_batches - 1);
@@ -707,7 +733,14 @@ void LayerwiseTransferGroup::layerwise_transfer(
     batch_idx++;
   }
 
-  // POLLING mode: clean up any lingering thread, then start polling + sync.
+  // POLLING mode: start polling thread and return immediately (no sync).
+  // The polling thread queries cudaEventQuery and writes eventfds as each
+  // batch completes, enabling overlap with SGLang's compute. The main thread
+  // must NOT cudaStreamSynchronize here — that would block the worker process
+  // and deadlock SGLang which is waiting on eventfd notifications to advance.
+  // Stream sync happens lazily: in the destructor (poll thread join + stream
+  // sync) or at the start of the next layerwise_transfer call (join previous
+  // poll thread first).
   if (notify_mode_ == NotifyMode::POLLING) {
     // Defensive cleanup: stop any lingering polling thread from a prior call.
     poll_stop_.store(true, std::memory_order_release);
@@ -720,31 +753,9 @@ void LayerwiseTransferGroup::layerwise_transfer(
     poll_next_batch_.store(0, std::memory_order_release);
     poll_thread_ = std::thread(&LayerwiseTransferGroup::event_polling_loop, this);
 
-    // Block until all GPU work is complete. The polling thread will have
-    // fired all eventfds by the time sync returns.
-    for (int i = 0; i < num_gpus_; ++i) {
-      cudaSetDevice(gpu_device_ids_[i]);
-      cudaError_t err = cudaStreamSynchronize(streams_[i]);
-      if (err != cudaSuccess) {
-        poll_stop_.store(true, std::memory_order_release);
-        if (poll_thread_.joinable()) poll_thread_.join();
-        throw std::runtime_error("layerwise_transfer failed on GPU " +
-                                 std::to_string(i) + ": " +
-                                 cudaGetErrorString(err));
-      }
-    }
-    poll_stop_.store(true, std::memory_order_release);
-    if (poll_thread_.joinable()) {
-      poll_thread_.join();
-    }
-
-    // Destroy poll batch events
-    for (int b = 0; b < (int)poll_batches_.size(); ++b) {
-      for (int g = 0; g < num_gpus_; ++g) {
-        cudaSetDevice(gpu_device_ids_[g]);
-        cudaEventDestroy(poll_batches_[b].per_gpu_events[g]);
-      }
-    }
+    // Return immediately — do NOT cudaStreamSynchronize.
+    // The polling thread will fire eventfds as GPU batches complete,
+    // letting SGLang overlap compute with the remaining H2D transfers.
   } else {
     for (int i = 0; i < num_gpus_; ++i) {
       cudaError_t err = cudaStreamSynchronize(streams_[i]);
