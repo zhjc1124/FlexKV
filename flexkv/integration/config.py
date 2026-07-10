@@ -101,21 +101,21 @@ class FlexKVConfig:
             return
 
         try:
+            # DSA/NSA models require BOTH qk_rope_head_dim AND index_head_dim.
+            # qk_rope_head_dim alone (e.g. DeepSeek-V2-Lite MLA+RoPE) is NOT
+            # a sparse-attention model and must not trigger indexer creation.
             qk_rope_head_dim = getattr(hf_config, 'qk_rope_head_dim', None)
+            index_head_dim = getattr(hf_config, 'index_head_dim', None)
             if qk_rope_head_dim is None or qk_rope_head_dim <= 0:
                 return
+            if index_head_dim is None or index_head_dim <= 0:
+                return
 
-            index_head_dim = getattr(hf_config, 'index_head_dim', None)
-            if index_head_dim is not None and index_head_dim > 0:
-                quant_block_size = 128
-                head_size = self.cache_config.tokens_per_block * (
-                    index_head_dim + index_head_dim // quant_block_size * 4
-                )
-            else:
-                head_size = qk_rope_head_dim
-
-            if indexer_head_size is not None and indexer_head_size > 0:
-                head_size = indexer_head_size
+            # DSA/NSA model confirmed — both fields present.
+            quant_block_size = 128
+            head_size = self.cache_config.tokens_per_block * (
+                index_head_dim + index_head_dim // quant_block_size * 4
+            )
 
             dtype = indexer_dtype if indexer_dtype is not None else torch.uint8
 
