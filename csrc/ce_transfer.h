@@ -130,7 +130,7 @@ CEPath choose_path(const CEAnalysis &a, const CETransferConfig &ce_config,
 // ============================================================================
 
 void *get_cached_hugepage_buffer(size_t size);
-void *get_cached_device_buffer(size_t size);
+void *get_cached_device_buffer(size_t size, int slot = 0);
 
 // ============================================================================
 // PER_BLOCK (baseline): one memcpy per block, no merging / no staging.
