@@ -471,12 +471,7 @@ class TransferEngine:
                 self._worker_map[TransferType.PEERSSD2H] = self.cpu_remote_cpu_worker
 
         # Initialize indexer workers
-        # Only when indexer GPU handles are present (non-empty). Some models
-        # (e.g. DeepSeek-V2-Lite DSA) have indexer CPU storage but no indexer
-        # GPU storage — indexer_gpu_handles would be {} (not None), which
-        # would create empty worker dicts and set _has_indexer=True, causing
-        # "No INDEXER_D2H worker found" errors at fan-out time.
-        if (self._indexer_gpu_handles
+        if (self._indexer_gpu_handles is not None
                 and self._indexer_cpu_handle is not None):
             self._indexer_finished_ops_queue = self.mp_ctx.Queue()
             self._indexer_worker_map: Dict[TransferType, Union[WorkerHandle, Dict[WorkerKey, WorkerHandle]]] = {}

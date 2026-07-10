@@ -101,9 +101,6 @@ class FlexKVConfig:
             return
 
         try:
-            # DSA/NSA models require BOTH qk_rope_head_dim AND index_head_dim.
-            # qk_rope_head_dim alone (e.g. DeepSeek-V2-Lite MLA+RoPE) is NOT
-            # a sparse-attention model and must not trigger indexer creation.
             qk_rope_head_dim = getattr(hf_config, 'qk_rope_head_dim', None)
             index_head_dim = getattr(hf_config, 'index_head_dim', None)
             if qk_rope_head_dim is None or qk_rope_head_dim <= 0:
@@ -111,7 +108,6 @@ class FlexKVConfig:
             if index_head_dim is None or index_head_dim <= 0:
                 return
 
-            # DSA/NSA model confirmed — both fields present.
             quant_block_size = 128
             head_size = self.cache_config.tokens_per_block * (
                 index_head_dim + index_head_dim // quant_block_size * 4
