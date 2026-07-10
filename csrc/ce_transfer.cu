@@ -183,7 +183,7 @@ void *get_cached_hugepage_buffer(size_t size) {
 void *get_cached_device_buffer(size_t size, int slot) {
   int dev = 0;
   cudaGetDevice(&dev);
-  thread_local std::unordered_map<int, std::array<DeviceStagingBuf, 2>> cache;
+  thread_local std::unordered_map<int, std::array<DeviceStagingBuf, 3>> cache;
   DeviceStagingBuf &b = cache[dev][slot];
   if (size > b.size) {
     if (b.buf) {
@@ -734,7 +734,7 @@ void ce_transfer_gather_scatter(
   if (need_dev_buf) {
     bool need_two = use_pingpong && (!is_host_to_device || !sync);  // D2H or async H2D
     size_t dev_alloc = need_two ? buf_bytes * 2 : buf_bytes;
-    void *dev_base = get_cached_device_buffer(dev_alloc);
+    void *dev_base = get_cached_device_buffer(dev_alloc, 2);  // slot=2: dev_buf (independent from gpu_ids/dst_ids)
     dev_raw[0] = dev_base;
     dev_raw[1] = need_two ? (char *)dev_base + buf_bytes : dev_base;
     dev_buf[0] = at::from_blob(dev_raw[0], {num_blocks, elems_per_block},
