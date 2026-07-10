@@ -174,11 +174,17 @@ void *get_cached_hugepage_buffer(size_t size) {
 // Get a cached device buffer of at least `size` bytes on the current device.
 // Avoids per-call cudaMalloc/cudaFree overhead (nsys showed ~930ms of 2.6s total
 // API time was spent in alloc/free of dev_buf, gpu_ids, dst_ids).
-void *get_cached_device_buffer(size_t size) {
+//
+// `slot` allows callers to request independent buffers that must not alias
+// (e.g. gpu_ids and dst_ids in GATHER_SCATTER are both alive simultaneously
+// — using the same buffer would cause the second cudaMemcpyAsync to clobber
+// the first). Default slot=0; callers that need a second independent buffer
+// pass slot=1.
+void *get_cached_device_buffer(size_t size, int slot = 0) {
   int dev = 0;
   cudaGetDevice(&dev);
-  thread_local std::unordered_map<int, DeviceStagingBuf> cache;
-  DeviceStagingBuf &b = cache[dev];
+  thread_local std::unordered_map<int, std::array<DeviceStagingBuf, 2>> cache;
+  DeviceStagingBuf &b = cache[dev][slot];
   if (size > b.size) {
     if (b.buf) {
       cudaFree(b.buf);
@@ -694,7 +700,7 @@ void ce_transfer_gather_scatter(
     gpu_ids_cuda = at::from_blob(gpu_ids_raw, {num_blocks}, i64_cuda);
 
     if (is_host_to_device) {
-      dst_ids_raw = get_cached_device_buffer(ids_bytes);
+      dst_ids_raw = get_cached_device_buffer(ids_bytes, 1);  // slot=1: independent from gpu_ids
       cudaMemcpyAsync(dst_ids_raw, gpu_block_ids, ids_bytes,
                       cudaMemcpyHostToDevice, stream);
       dst_ids_cuda = at::from_blob(dst_ids_raw, {num_blocks}, i64_cuda);
