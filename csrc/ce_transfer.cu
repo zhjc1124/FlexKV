@@ -772,6 +772,30 @@ void ce_transfer_gather_scatter(
   cudaEvent_t *pingpong_events = get_cached_event_pair(need_pingpong_host, events_created);
 
   const int64_t total_iters = (int64_t)num_layers * kv_dim;
+
+  // Lambda: scatter from contiguous staging buffer to strided CPU dst,
+  // merging consecutive cpu_block_ids into a single memcpy (mirrors SGLang).
+  auto scatter_to_cpu = [&](const void *staging_buf, int layer_idx, int kv_idx) {
+    int64_t *cpu_base = cpu_ptr_int64 + (layer_idx + start_layer_id) * cpu_layer_stride_int64 +
+        kv_idx * cpu_kv_stride_int64 + cpu_startoff_inside_chunks_int64;
+    int64_t k = 0;
+    while (k < num_blocks) {
+      // Find a run of consecutive cpu_block_ids.
+      int64_t run_start = k;
+      while (k + 1 < num_blocks &&
+             cpu_block_ids[k + 1] == cpu_block_ids[k] + 1) {
+        ++k;
+      }
+      int64_t run_len = k - run_start + 1;
+      int64_t cb = cpu_block_ids[run_start];
+      int64_t run_bytes = run_len * chunk_size_in_bytes;
+      memcpy(cpu_base + cb * cpu_block_stride_int64,
+             (const char *)staging_buf + (int64_t)run_start * chunk_size_in_bytes,
+             run_bytes);
+      ++k;
+    }
+  };
+
   for (int64_t it = 0; it < total_iters; ++it) {
     int i = (int)(it / kv_dim);
     int j = (int)(it % kv_dim);
@@ -814,28 +838,12 @@ void ce_transfer_gather_scatter(
           cudaEventSynchronize(pingpong_events[prev_idx]);
           int pi = (int)((it - 1) / kv_dim);
           int pj = (int)((it - 1) % kv_dim);
-          int64_t *cpu_base = cpu_ptr_int64 + (pi + start_layer_id) * cpu_layer_stride_int64 +
-              pj * cpu_kv_stride_int64 + cpu_startoff_inside_chunks_int64;
-          for (int k = 0; k < num_blocks; ++k) {
-            int64_t cb = cpu_block_ids[k];
-            memcpy(cpu_base + cb * cpu_block_stride_int64,
-                   (char *)host_buf[prev_idx] +
-                       (int64_t)k * chunk_size_in_bytes,
-                   chunk_size_in_bytes);
-          }
+          scatter_to_cpu(host_buf[prev_idx], pi, pj);
         }
       } else if (need_host_buf) {
         cudaStreamSynchronize(stream);
         // scatter current
-        int64_t *cpu_base = cpu_ptr_int64 + (i + start_layer_id) * cpu_layer_stride_int64 +
-            j * cpu_kv_stride_int64 + cpu_startoff_inside_chunks_int64;
-        for (int k = 0; k < num_blocks; ++k) {
-          int64_t cb = cpu_block_ids[k];
-          memcpy(cpu_base + cb * cpu_block_stride_int64,
-                 (char *)host_buf[idx] +
-                     (int64_t)k * chunk_size_in_bytes,
-                 chunk_size_in_bytes);
-        }
+        scatter_to_cpu(host_buf[idx], i, j);
       }
     } else {
       // ============ H2D ============
@@ -921,15 +929,7 @@ void ce_transfer_gather_scatter(
     cudaEventSynchronize(pingpong_events[last_idx]);
     int li = (int)(last / kv_dim);
     int lj = (int)(last % kv_dim);
-    int64_t *cpu_base = cpu_ptr_int64 + (li + start_layer_id) * cpu_layer_stride_int64 +
-        lj * cpu_kv_stride_int64 + cpu_startoff_inside_chunks_int64;
-    for (int k = 0; k < num_blocks; ++k) {
-      int64_t cb = cpu_block_ids[k];
-      memcpy(cpu_base + cb * cpu_block_stride_int64,
-             (char *)host_buf[last_idx] +
-                 (int64_t)k * chunk_size_in_bytes,
-             chunk_size_in_bytes);
-    }
+    scatter_to_cpu(host_buf[last_idx], li, lj);
   }
 
   // Drain last H2D
