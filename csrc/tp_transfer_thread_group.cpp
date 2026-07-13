@@ -195,7 +195,7 @@ void TPTransferThreadGroup::tp_group_transfer(
   // Validate mla_d2h_mode parameter (only meaningful for MLA)
   std::string mode = mla_d2h_mode;
   if (is_mla && mode != "sharded" && mode != "all_write" && mode != "rank0_only"
-      && mode != "round_robin" && mode != "auto") {
+      && mode != "round_robin" && mode != "rank_rr" && mode != "auto") {
     fprintf(stderr, "[FlexKV] Warning: Invalid mla_d2h_mode='%s', using default 'auto'\n",
             mode.c_str());
     mode = "auto";
@@ -225,10 +225,18 @@ void TPTransferThreadGroup::tp_group_transfer(
     }
   }
 
+  // rank_rr: resolve the designated rank for this D2H call from the internal
+  // round-robin counter, then treat identically to rank0_only.
+  int eff_designated_rank = designated_rank;
+  if (is_mla && !is_host_to_device && mode == "rank_rr") {
+    eff_designated_rank = rr_counter_;
+    rr_counter_ = (rr_counter_ + 1) % num_gpus_;
+  }
+
   for (int i = 0; i < num_gpus_; ++i) {
-    // For rank0_only mode in D2H: only the designated rank performs transfer
-    if (is_mla && !is_host_to_device && mode == "rank0_only"
-        && i != designated_rank) {
+    // For rank0_only / rank_rr mode in D2H: only the designated rank performs transfer
+    if (is_mla && !is_host_to_device && (mode == "rank0_only" || mode == "rank_rr")
+        && i != eff_designated_rank) {
       // Skip D2H transfer for non-designated GPUs
       futures.emplace_back(enqueue_for_gpu(i, [i]() {
         // Empty task - non-designated GPUs do nothing in rank0_only D2H mode
@@ -284,8 +292,9 @@ void TPTransferThreadGroup::tp_group_transfer(
             cpu_startoff_inside_chunks = i * num_blocks * cpu_block_stride_in_bytes;
             gpu_startoff_inside_chunks = 0;
             chunk_size = gpu_chunk_sizes_in_bytes_[i];
-          } else if (mode == "rank0_only") {
+          } else if (mode == "rank0_only" || mode == "rank_rr") {
             // D2H: only designated rank writes (others handled by outer continue)
+            //      rank_rr auto-rotates the designated rank each call.
             // H2D: all GPUs read from offset 0
             cpu_startoff_inside_chunks = 0;
             gpu_startoff_inside_chunks = 0;

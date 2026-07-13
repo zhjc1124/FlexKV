@@ -120,6 +120,9 @@ private:
   std::vector<std::condition_variable> cvs_;
   std::atomic<bool> stop_pool_;
 
+  // rank_rr mode: request-level round-robin counter, incremented each D2H call.
+  int rr_counter_ = 0;
+
 #ifdef FLEXKV_ENABLE_NVCOMP
   std::unique_ptr<NvcompTPState> nvcomp_state_;
 #endif

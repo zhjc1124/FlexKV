@@ -100,6 +100,7 @@ STRATEGIES = [
     ("MLA-all_write", True, "all_write"),
     ("MLA-rank0_only", True, "rank0_only"),
     ("MLA-round_robin", True, "round_robin"),
+    ("MLA-rank_rr",    True, "rank_rr"),
 ]
 
 # CE optimization config, as two cumulative levels. Only meaningful for the
