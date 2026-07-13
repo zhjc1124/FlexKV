@@ -710,25 +710,36 @@ void ce_transfer_gather_scatter(
 
   const int64_t total_iters = (int64_t)num_layers * kv_dim;
 
-  // Lambda: scatter from contiguous staging buffer to strided CPU dst,
-  // merging consecutive cpu_block_ids into a single memcpy (mirrors SGLang).
+  // Lambda: scatter from contiguous staging buffer to strided CPU dst.
+  // When cpu_phys_contig (LAYERFIRST), consecutive cpu_block_ids are also
+  // physically adjacent, so we merge them into a single memcpy. When
+  // !cpu_phys_contig (BLOCKFIRST), consecutive block_ids have a stride gap
+  // between them, so each block must be scattered individually.
   auto scatter_to_cpu = [&](const void *staging_buf, int layer_idx, int kv_idx) {
     int64_t *cpu_base = cpu_ptr_int64 + (layer_idx + start_layer_id) * cpu_layer_stride_int64 +
         kv_idx * cpu_kv_stride_int64 + cpu_startoff_inside_chunks_int64;
     int64_t k = 0;
     while (k < num_blocks) {
-      // Find a run of consecutive cpu_block_ids.
       int64_t run_start = k;
-      while (k + 1 < num_blocks &&
-             cpu_block_ids[k + 1] == cpu_block_ids[k] + 1) {
-        ++k;
+      if (analysis.cpu_phys_contig) {
+        // LAYERFIRST: consecutive block_ids are physically adjacent — merge.
+        while (k + 1 < num_blocks &&
+               cpu_block_ids[k + 1] == cpu_block_ids[k] + 1) {
+          ++k;
+        }
+        int64_t run_len = k - run_start + 1;
+        int64_t cb = cpu_block_ids[run_start];
+        int64_t run_bytes = run_len * chunk_size_in_bytes;
+        memcpy(cpu_base + cb * cpu_block_stride_int64,
+               (const char *)staging_buf + (int64_t)run_start * chunk_size_in_bytes,
+               run_bytes);
+      } else {
+        // BLOCKFIRST: each block is at a strided position — scatter individually.
+        int64_t cb = cpu_block_ids[k];
+        memcpy(cpu_base + cb * cpu_block_stride_int64,
+               (const char *)staging_buf + (int64_t)k * chunk_size_in_bytes,
+               chunk_size_in_bytes);
       }
-      int64_t run_len = k - run_start + 1;
-      int64_t cb = cpu_block_ids[run_start];
-      int64_t run_bytes = run_len * chunk_size_in_bytes;
-      memcpy(cpu_base + cb * cpu_block_stride_int64,
-             (const char *)staging_buf + (int64_t)run_start * chunk_size_in_bytes,
-             run_bytes);
       ++k;
     }
   };
