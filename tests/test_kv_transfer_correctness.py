@@ -268,7 +268,8 @@ def expected_val(gpu_id, layer, block, token, hd, kv_dim_idx=0):
 def make_tp_group(cpu_ptr, all_gpu, num_gpus, gpu_layout, num_layers,
                   ce_segment_threshold=None,
                   ce_path_opt=None,
-                  ce_sharded_memcpy2d=None):
+                  ce_sharded_memcpy2d=None,
+                  ce_is_blockfirst=None):
     """Create TPTransferThreadGroup with strides from KVCacheLayout.
 
     Matches production worker.py:472 exactly — chunk_size does NOT include kv_dim.
@@ -283,6 +284,8 @@ def make_tp_group(cpu_ptr, all_gpu, num_gpus, gpu_layout, num_layers,
         ce_path_opt = GLOBAL_CONFIG_FROM_ENV.transfer_path_opt
     if ce_sharded_memcpy2d is None:
         ce_sharded_memcpy2d = GLOBAL_CONFIG_FROM_ENV.sharded_mla_d2h_memcpy2d
+    if ce_is_blockfirst is None:
+        ce_is_blockfirst = (GLOBAL_CONFIG_FROM_ENV.cpu_layout_type == KVCacheLayoutType.BLOCKFIRST)
     gpu_ptrs = []
     for g in range(num_gpus):
         for l in range(num_layers):
@@ -304,6 +307,7 @@ def make_tp_group(cpu_ptr, all_gpu, num_gpus, gpu_layout, num_layers,
         ce_segment_threshold=ce_segment_threshold,
         ce_path_opt=ce_path_opt,
         ce_sharded_memcpy2d=ce_sharded_memcpy2d,
+        ce_is_blockfirst=ce_is_blockfirst,
     )
 
 
@@ -311,6 +315,7 @@ def make_layerwise_group(cpu_ptr_unused, all_gpu, num_gpus, gpu_layout, num_laye
                          ce_segment_threshold=None,
                          ce_path_opt=None,
                          ce_sharded_memcpy2d=None,
+                         ce_is_blockfirst=None,
                          layer_eventfds_tensor=None):
     """Create LayerwiseTransferGroup for H2D-only testing (no SSD).
 
@@ -327,6 +332,8 @@ def make_layerwise_group(cpu_ptr_unused, all_gpu, num_gpus, gpu_layout, num_laye
         ce_path_opt = GLOBAL_CONFIG_FROM_ENV.transfer_path_opt
     if ce_sharded_memcpy2d is None:
         ce_sharded_memcpy2d = GLOBAL_CONFIG_FROM_ENV.sharded_mla_d2h_memcpy2d
+    if ce_is_blockfirst is None:
+        ce_is_blockfirst = (GLOBAL_CONFIG_FROM_ENV.cpu_layout_type == KVCacheLayoutType.BLOCKFIRST)
     if layer_eventfds_tensor is None:
         layer_eventfds_tensor = torch.empty(0, dtype=torch.int32)
     def strides_tensor(getter):
@@ -364,6 +371,7 @@ def make_layerwise_group(cpu_ptr_unused, all_gpu, num_gpus, gpu_layout, num_laye
         ce_segment_threshold=ce_segment_threshold,
         ce_path_opt=ce_path_opt,
         ce_sharded_memcpy2d=ce_sharded_memcpy2d,
+        ce_is_blockfirst=ce_is_blockfirst,
     )
 
 
@@ -372,7 +380,8 @@ def layerwise_h2d_readback(all_gpu, cpu_kv, num_gpus, gpu_layout, num_layers,
                            cpu_stride_block, cpu_stride_tp, chunk_size,
                            is_mla, mode, ce_path_opt=None,
                            ce_segment_threshold=None,
-                           notify_mode="hostfunc", layer_granularity=None):
+                           notify_mode="hostfunc", layer_granularity=None,
+                           ce_is_blockfirst=None):
     """Run a single CE H2D via LayerwiseTransferGroup, reading `cpu_kv` back
     into `all_gpu` with block-id list `ids`.
 
@@ -390,7 +399,8 @@ def layerwise_h2d_readback(all_gpu, cpu_kv, num_gpus, gpu_layout, num_layers,
     lw_group = make_layerwise_group(cpu_kv, all_gpu, num_gpus,
                                     gpu_layout, num_layers,
                                     ce_path_opt=ce_path_opt,
-                                    ce_segment_threshold=ce_segment_threshold)
+                                    ce_segment_threshold=ce_segment_threshold,
+                                    ce_is_blockfirst=ce_is_blockfirst)
     empty_ids = torch.empty(0, dtype=torch.int64).pin_memory()
     empty_indexer = torch.Tensor()
     lw_group.layerwise_transfer(
@@ -493,7 +503,8 @@ def test_non_mla_roundtrip(data_config, cpu_layout_name, engine_name, use_ce):
 
     cpu_kv = make_cpu_tensor(cpu_layout, num_layers, num_blocks)
 
-    tp = make_tp_group(cpu_kv.data_ptr(), all_gpu, num_gpus, gpu_layout, num_layers)
+    tp = make_tp_group(cpu_kv.data_ptr(), all_gpu, num_gpus, gpu_layout, num_layers,
+                       ce_is_blockfirst=(cpu_layout_name == "BLOCKFIRST"))
     gpu_block_ids = block_ids(num_blocks)
     cpu_block_ids = block_ids(num_blocks)
 
@@ -598,7 +609,8 @@ def test_mla_roundtrip_modes(data_config, cpu_layout_name, engine_name, use_ce, 
     cpu_stride_block = cpu_layout.get_block_stride() * ES
     cpu_stride_tp = cpu_stride_block // num_gpus
 
-    tp = make_tp_group(cpu_kv.data_ptr(), all_gpu, num_gpus, gpu_layout, num_layers)
+    tp = make_tp_group(cpu_kv.data_ptr(), all_gpu, num_gpus, gpu_layout, num_layers,
+                       ce_is_blockfirst=(cpu_layout_name == "BLOCKFIRST"))
     gpu_block_ids = block_ids(num_blocks)
     cpu_block_ids = block_ids(num_blocks)
 
@@ -681,7 +693,8 @@ def test_layerwise_h2d_notify_modes(data_config, engine_name, use_ce, notify_mod
     cpu_stride_tp = cpu_stride_block // num_gpus
 
     # D2H via TP group to populate CPU
-    tp = make_tp_group(cpu_kv.data_ptr(), all_gpu, num_gpus, gpu_layout, num_layers)
+    tp = make_tp_group(cpu_kv.data_ptr(), all_gpu, num_gpus, gpu_layout, num_layers,
+                       ce_is_blockfirst=(cpu_layout_name == "BLOCKFIRST"))
     gpu_block_ids = block_ids(num_blocks)
     cpu_block_ids = block_ids(num_blocks)
     tp.tp_group_transfer(
@@ -703,7 +716,8 @@ def test_layerwise_h2d_notify_modes(data_config, engine_name, use_ce, notify_mod
     sync_all(num_gpus)
 
     # H2D via layerwise with the requested notify mode
-    lw = make_layerwise_group(cpu_kv, all_gpu, num_gpus, gpu_layout, num_layers)
+    lw = make_layerwise_group(cpu_kv, all_gpu, num_gpus, gpu_layout, num_layers,
+                                ce_is_blockfirst=True)
     lw.layerwise_transfer(
         torch.empty(0, dtype=torch.int64), torch.empty(0, dtype=torch.int64),
         0, 0, 0, 0, 0,
@@ -768,7 +782,8 @@ def test_non_mla_roundtrip_layerwise(data_config, cpu_layout_name):
 
     # D2H prepare via TP-group (CE), verified correct elsewhere.
     tp = make_tp_group(cpu_kv.data_ptr(), all_gpu, num_gpus,
-                       gpu_layout, num_layers)
+                       gpu_layout, num_layers,
+                       ce_is_blockfirst=(cpu_layout_name == "BLOCKFIRST"))
     tp.tp_group_transfer(
         gpu_block_id_tensor=ids, cpu_block_id_tensor=ids,
         cpu_kv_stride_in_bytes=cpu_stride_kv,
@@ -843,7 +858,8 @@ def test_mla_roundtrip_modes_layerwise(data_config, cpu_layout_name, mode):
     chunk_size = gpu_layout.get_chunk_size() * ES
 
     tp = make_tp_group(cpu_kv.data_ptr(), all_gpu, num_gpus,
-                       gpu_layout, num_layers)
+                       gpu_layout, num_layers,
+                       ce_is_blockfirst=(cpu_layout_name == "BLOCKFIRST"))
     tp.tp_group_transfer(
         gpu_block_id_tensor=ids, cpu_block_id_tensor=ids,
         cpu_kv_stride_in_bytes=cpu_stride_kv,
@@ -895,7 +911,8 @@ def test_invalid_mode_fallback():
     sync_all(num_gpus)
 
     cpu_kv = make_cpu_tensor(cpu_layout, num_layers, num_blocks)
-    tp = make_tp_group(cpu_kv.data_ptr(), all_gpu, num_gpus, gpu_layout, num_layers)
+    tp = make_tp_group(cpu_kv.data_ptr(), all_gpu, num_gpus, gpu_layout, num_layers,
+                       ce_is_blockfirst=False)
 
     gpu_block_ids = block_ids(num_blocks)
     cpu_block_ids = block_ids(num_blocks)
@@ -1132,7 +1149,8 @@ def test_ce_paths_roundtrip(data_config, is_mla, cpu_layout_name, pattern,
     cpu_kv = make_cpu_tensor(cpu_layout, num_layers, total_cpu_blocks)
     tp = make_tp_group(cpu_kv.data_ptr(), all_gpu, num_gpus,
                        gpu_layout, num_layers, ce_path_opt=path_opt,
-                       ce_segment_threshold=segment_threshold)
+                       ce_segment_threshold=segment_threshold,
+                       ce_is_blockfirst=(cpu_layout_name == "BLOCKFIRST"))
 
     ids = make_block_id_pattern(pattern, num_blocks)
     gpu_block_ids = ids
@@ -1254,7 +1272,8 @@ def test_ce_paths_layerwise_h2d(data_config, is_mla, cpu_layout_name, pattern,
 
     # Step 1: D2H via TPTransferThreadGroup (prepare CPU data)
     tp = make_tp_group(cpu_kv.data_ptr(), all_gpu, num_gpus,
-                       gpu_layout, num_layers)
+                       gpu_layout, num_layers,
+                       ce_is_blockfirst=(cpu_layout_name == "BLOCKFIRST"))
     tp.tp_group_transfer(
         gpu_block_id_tensor=ids, cpu_block_id_tensor=ids,
         cpu_kv_stride_in_bytes=cpu_stride_kv,
@@ -1285,7 +1304,8 @@ def test_ce_paths_layerwise_h2d(data_config, is_mla, cpu_layout_name, pattern,
         chunk_size, is_mla, mode,
         ce_path_opt=path_opt,
         ce_segment_threshold=segment_threshold, notify_mode=notify_mode,
-        layer_granularity=layer_granularity)
+        layer_granularity=layer_granularity,
+                           ce_is_blockfirst=(cpu_layout_name == "BLOCKFIRST"))
 
     # Verify GPU data == original
     expected_gpu = 0 if is_mla else None

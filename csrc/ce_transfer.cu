@@ -55,19 +55,13 @@ namespace flexkv {
 CEAnalysis analyze_ce_transfer(
     const int64_t *gpu_block_ids, const int64_t *cpu_block_ids,
     int num_blocks, int64_t cpu_block_stride_in_bytes,
-    int64_t chunk_size_in_bytes, int64_t gpu_block_stride_in_bytes,
-    int64_t cpu_layer_stride_in_bytes) {
+    int64_t chunk_size_in_bytes, int64_t gpu_block_stride_in_bytes) {
   CEAnalysis a;
   a.gpu_log_contig = true;
   a.cpu_log_contig = true;
   a.cpu_phys_contig = (cpu_block_stride_in_bytes == chunk_size_in_bytes);
   a.gpu_phys_contig = (gpu_block_stride_in_bytes == 0 ||
                        gpu_block_stride_in_bytes == chunk_size_in_bytes);
-  // BLOCKFIRST: layer stride < block stride (layers are inner dimension).
-  // LAYERFIRST: layer stride > block stride (blocks are inner dimension).
-  // When cpu_layer_stride_in_bytes == 0 (not provided), default to false.
-  a.is_blockfirst = (cpu_layer_stride_in_bytes > 0 &&
-                     cpu_layer_stride_in_bytes < cpu_block_stride_in_bytes);
   a.num_segments = 0;
 
   if (num_blocks == 0) return a;
@@ -114,14 +108,15 @@ CEPath choose_path(const CEAnalysis &a, const CETransferConfig &ce_config,
   // D2D transpose + 3-path cudaMemcpyAsync.
   // Note: !cpu_phys_contig alone is NOT sufficient — non-MLA LAYERFIRST also
   // has !cpu_phys_contig (per-rank chunk < cpu_block_stride which includes all
-  // heads). Only select BF_D2D_TRANSPOSE for actual BLOCKFIRST layouts.
-  if (!a.cpu_phys_contig && a.is_blockfirst) {
+  // heads). Use ce_config.is_blockfirst (from FLEXKV_CPU_LAYOUT env var) to
+  // select BF_D2D_TRANSPOSE only for actual BLOCKFIRST layouts.
+  if (!a.cpu_phys_contig && ce_config.is_blockfirst) {
     return CEPath::BF_D2D_TRANSPOSE;
   }
   // LAYERFIRST + gpu_phys_contig: few segments -> SEGMENTED_DIRECT;
   // many segments -> GATHER_SCATTER.
-  // BLOCKFIRST + gpu_phys_contig (non-MLA): STAGED_SCATTER (fallback when
-  // BF_D2D_TRANSPOSE not applicable, e.g. LAYERFIRST non-MLA).
+  // LAYERFIRST non-MLA (!cpu_phys_contig && !is_blockfirst): STAGED_SCATTER
+  // (strided is head-dimension, not layer-dimension; D2D transpose can't help).
   if (a.num_segments <= ce_config.segment_threshold) {
     return a.cpu_phys_contig ? CEPath::SEGMENTED_DIRECT
                              : CEPath::STAGED_SCATTER;

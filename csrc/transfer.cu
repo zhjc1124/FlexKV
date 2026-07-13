@@ -134,7 +134,7 @@ void transfer_kv_blocks(
     CEAnalysis analysis = analyze_ce_transfer(
         gpu_block_ids, cpu_block_ids, num_blocks,
         cpu_block_stride_in_bytes, chunk_size_in_bytes,
-        gpu_block_stride_in_bytes, cpu_layer_stride_in_bytes);
+        gpu_block_stride_in_bytes);
 
     // path_opt_enabled: PER_BLOCK baseline when off; otherwise choose_path()
     // picks one of the four optimized strategies (see CEPath in ce_transfer.h).

@@ -541,6 +541,7 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
             ce_segment_threshold=GLOBAL_CONFIG_FROM_ENV.transfer_segment_threshold,
             ce_path_opt=GLOBAL_CONFIG_FROM_ENV.transfer_path_opt,
             ce_sharded_memcpy2d=GLOBAL_CONFIG_FROM_ENV.sharded_mla_d2h_memcpy2d,
+            ce_is_blockfirst=(cpu_kv_layout.type == KVCacheLayoutType.BLOCKFIRST),
         )
 
         self._compressor = compressor or NullCompressionStrategy()

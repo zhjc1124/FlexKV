@@ -41,6 +41,12 @@ struct CETransferConfig {
   // (works on all platforms, ~130ms on P800). Set to 1 on NVIDIA via
   // FLEXKV_ENABLE_SHARDED_MLA_D2H_MEMCPY2D=1.
   bool sharded_mla_d2h_memcpy2d = false;
+  // is_blockfirst: CPU KV cache layout is BLOCKFIRST (vs LAYERFIRST).
+  // Set from FLEXKV_CPU_LAYOUT env var via worker.py/layerwise.py.
+  // choose_path uses this to select BF_D2D_TRANSPOSE only for actual
+  // BLOCKFIRST layouts (not LAYERFIRST non-MLA where !cpu_phys_contig
+  // is also true due to per-rank chunk_size < cpu_block_stride).
+  bool is_blockfirst = false;
 };
 
 // ============================================================================
@@ -112,7 +118,6 @@ struct CEAnalysis {
   bool cpu_log_contig;   // cpu_block_ids[k+1] == cpu_block_ids[k]+1
   bool cpu_phys_contig;  // cpu_block_stride == chunk_size (LAYERFIRST + non-sharded)
   bool gpu_phys_contig;  // gpu_block_stride == chunk_size (non-sharded D2H)
-  bool is_blockfirst;    // cpu_layer_stride < cpu_block_stride (BLOCKFIRST layout)
   int num_segments;
   std::vector<CESegment> segments;
 };
@@ -124,8 +129,7 @@ struct CEAnalysis {
 CEAnalysis analyze_ce_transfer(
     const int64_t *gpu_block_ids, const int64_t *cpu_block_ids,
     int num_blocks, int64_t cpu_block_stride_in_bytes,
-    int64_t chunk_size_in_bytes, int64_t gpu_block_stride_in_bytes,
-    int64_t cpu_layer_stride_in_bytes = 0);
+    int64_t chunk_size_in_bytes, int64_t gpu_block_stride_in_bytes);
 
 CEPath choose_path(const CEAnalysis &a, const CETransferConfig &ce_config,
                    int64_t chunk_size_in_bytes = 0);
