@@ -1268,8 +1268,11 @@ def test_ce_paths_layerwise_h2d(data_config, is_mla, cpu_layout_name, pattern,
     the test count.
     """
     skip_if_engine_unsupported(use_ce=True)
-    if enable_memcpy2d:
-        pytest.skip("memcpy2d only affects D2H, not H2D")
+    # memcpy2d now applies to H2D as well (symmetric to D2H): when the
+    # selected path is STAGED_SCATTER and enable_memcpy2d=True, H2D goes
+    # through the cudaMemcpy2DAsync branch. Other paths
+    # (BF_D2D_TRANSPOSE/BULK_CONTIG/SEGMENTED_DIRECT/GATHER_SCATTER) do not
+    # consult enable_memcpy2d, so their behavior is unchanged.
     num_layers, num_blocks, tpb, num_heads, head_dim = data_config
     if pattern == "scattered" and num_blocks <= segment_threshold:
         pytest.skip("scattered needs num_blocks > segment_threshold ({}) "

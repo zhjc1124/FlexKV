@@ -503,39 +503,50 @@ void ce_transfer_staged_scatter(
     cudaStream_t stream, bool is_host_to_device,
     const CEAnalysis &analysis, const CETransferConfig &ce_config) {
 
-  // ---- memcpy2d branch (D2H only, NVIDIA-specific optimization) ----
-  // When enable_memcpy2d=TRUE and D2H, use cudaMemcpy2DAsync per segment to
-  // do strided D2H directly to CPU positions, bypassing the staging buffer +
-  // sync + CPU scatter. Fast on NVIDIA (DMA engine handles 2D), extremely
-  // slow on P800/Kunlunxin. Default off (FLEXKV_ENABLE_MEMCPY2D=0).
-  if (ce_config.enable_memcpy2d && !is_host_to_device) {
+  // ---- memcpy2d branch (bidirectional, NVIDIA-specific optimization) ----
+  // When enable_memcpy2d=TRUE, use cudaMemcpy2DAsync per segment to do a
+  // strided GPU<->CPU transfer directly, bypassing the staging buffer +
+  // sync + CPU scatter/gather. Fast on NVIDIA (DMA engine handles 2D),
+  // extremely slow on P800/Kunlunxin. Default off (FLEXKV_ENABLE_MEMCPY2D=0).
+  // Direction (is_host_to_device) selects src/dst/pitch/kind:
+  //   D2H: GPU src (contiguous within segment) -> CPU dst (strided)
+  //   H2D: CPU src (strided) -> GPU dst (contiguous within segment)
+  if (ce_config.enable_memcpy2d) {
+    cudaMemcpyKind kind = is_host_to_device ? cudaMemcpyHostToDevice
+                                            : cudaMemcpyDeviceToHost;
     const int64_t total_iters = (int64_t)num_layers * kv_dim;
     for (int64_t it = 0; it < total_iters; ++it) {
       int i = (int)(it / kv_dim);
       int j = (int)(it % kv_dim);
       for (const auto &seg : analysis.segments) {
-        // GPU source: ptr_at for the first block in this segment.
-        // Within a segment, gpu_block_ids are contiguous (step=1), so we
-        // can compute the GPU block stride from the pointer difference.
+        // GPU pointer: ptr_at for the first block in this segment. Within a
+        // segment gpu_block_ids are contiguous (step=1), so the GPU block
+        // stride (pitch) is the pointer diff of two adjacent blocks.
         int64_t *gpu_ptr_first = ptr_at<Type>(gpu_tensor_handler,
                                               i + start_layer_id, j,
                                               gpu_block_ids[seg.start_k]);
         int64_t *gpu_ptr_next = ptr_at<Type>(gpu_tensor_handler,
                                              i + start_layer_id, j,
                                              gpu_block_ids[seg.start_k] + 1);
-        size_t spitch = (size_t)((char *)gpu_ptr_next - (char *)gpu_ptr_first);
-        void *src = (char *)gpu_ptr_first +
+        size_t gpu_pitch = (size_t)((char *)gpu_ptr_next - (char *)gpu_ptr_first);
+        void *gpu_ptr = (char *)gpu_ptr_first +
             gpu_startoff_inside_chunks_int64 * sizeof(int64_t);
-        // CPU dest: first block in segment, at strided position.
+        // CPU pointer: strided, first block in segment.
         int64_t *cpu_base = cpu_ptr_int64 +
             (i + start_layer_id) * cpu_layer_stride_int64 +
             j * cpu_kv_stride_int64 + cpu_startoff_inside_chunks_int64;
-        void *dst = cpu_base + cpu_block_ids[seg.start_k] * cpu_block_stride_int64;
-        size_t dpitch = (size_t)cpu_block_stride_int64 * sizeof(int64_t);
+        void *cpu_ptr = cpu_base + cpu_block_ids[seg.start_k] * cpu_block_stride_int64;
+        size_t cpu_pitch = (size_t)cpu_block_stride_int64 * sizeof(int64_t);
+
+        // Select src/dst/pitch by direction.
+        void *dst = is_host_to_device ? gpu_ptr : cpu_ptr;
+        void *src = is_host_to_device ? cpu_ptr : gpu_ptr;
+        size_t dpitch = is_host_to_device ? gpu_pitch : cpu_pitch;
+        size_t spitch = is_host_to_device ? cpu_pitch : gpu_pitch;
+
         cudaMemcpy2DAsync(dst, dpitch, src, spitch,
-                          chunk_size_in_bytes, seg.run_len,
-                          cudaMemcpyDeviceToHost, stream);
-        FLEXKV_GPU_CPU_TRANSFER(false, chunk_size_in_bytes * seg.run_len);
+                          chunk_size_in_bytes, seg.run_len, kind, stream);
+        FLEXKV_GPU_CPU_TRANSFER(is_host_to_device, chunk_size_in_bytes * seg.run_len);
       }
     }
     cudaStreamSynchronize(stream);
