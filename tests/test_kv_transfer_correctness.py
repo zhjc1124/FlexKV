@@ -267,7 +267,8 @@ def expected_val(gpu_id, layer, block, token, hd, kv_dim_idx=0):
 
 def make_tp_group(cpu_ptr, all_gpu, num_gpus, gpu_layout, num_layers,
                   ce_segment_threshold=None,
-                  ce_path_opt=None):
+                  ce_path_opt=None,
+                  ce_sharded_memcpy2d=None):
     """Create TPTransferThreadGroup with strides from KVCacheLayout.
 
     Matches production worker.py:472 exactly — chunk_size does NOT include kv_dim.
@@ -280,6 +281,8 @@ def make_tp_group(cpu_ptr, all_gpu, num_gpus, gpu_layout, num_layers,
         ce_segment_threshold = GLOBAL_CONFIG_FROM_ENV.transfer_segment_threshold
     if ce_path_opt is None:
         ce_path_opt = GLOBAL_CONFIG_FROM_ENV.transfer_path_opt
+    if ce_sharded_memcpy2d is None:
+        ce_sharded_memcpy2d = GLOBAL_CONFIG_FROM_ENV.sharded_mla_d2h_memcpy2d
     gpu_ptrs = []
     for g in range(num_gpus):
         for l in range(num_layers):
@@ -300,12 +303,14 @@ def make_tp_group(cpu_ptr, all_gpu, num_gpus, gpu_layout, num_layers,
         nvcomp_data_type=0,
         ce_segment_threshold=ce_segment_threshold,
         ce_path_opt=ce_path_opt,
+        ce_sharded_memcpy2d=ce_sharded_memcpy2d,
     )
 
 
 def make_layerwise_group(cpu_ptr_unused, all_gpu, num_gpus, gpu_layout, num_layers,
                          ce_segment_threshold=None,
                          ce_path_opt=None,
+                         ce_sharded_memcpy2d=None,
                          layer_eventfds_tensor=None):
     """Create LayerwiseTransferGroup for H2D-only testing (no SSD).
 
@@ -320,6 +325,8 @@ def make_layerwise_group(cpu_ptr_unused, all_gpu, num_gpus, gpu_layout, num_laye
         ce_segment_threshold = GLOBAL_CONFIG_FROM_ENV.transfer_segment_threshold
     if ce_path_opt is None:
         ce_path_opt = GLOBAL_CONFIG_FROM_ENV.transfer_path_opt
+    if ce_sharded_memcpy2d is None:
+        ce_sharded_memcpy2d = GLOBAL_CONFIG_FROM_ENV.sharded_mla_d2h_memcpy2d
     if layer_eventfds_tensor is None:
         layer_eventfds_tensor = torch.empty(0, dtype=torch.int32)
     def strides_tensor(getter):
@@ -356,6 +363,7 @@ def make_layerwise_group(cpu_ptr_unused, all_gpu, num_gpus, gpu_layout, num_laye
         indexer_ssd_files={},
         ce_segment_threshold=ce_segment_threshold,
         ce_path_opt=ce_path_opt,
+        ce_sharded_memcpy2d=ce_sharded_memcpy2d,
     )
 
 

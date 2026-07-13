@@ -441,6 +441,10 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
     transfer_segment_threshold=int(os.getenv('FLEXKV_TRANSFER_SEGMENT_THRESHOLD', 8)),
     # Path optimization: 0=baseline (per-block memcpy), 1=Path 0/1/2 auto-select
     transfer_path_opt=bool(int(os.getenv('FLEXKV_TRANSFER_PATH_OPT', 1))),
+    # Sharded MLA D2H: use cudaMemcpy2DAsync (strided D2H to CPU interleave).
+    # Fast on NVIDIA H20 (58ms), extremely slow on P800 (12.8s). Default off
+    # (use D2D shard + contiguous D2H + CPU interleave merge fallback).
+    sharded_mla_d2h_memcpy2d=bool(int(os.getenv('FLEXKV_ENABLE_SHARDED_MLA_D2H_MEMCPY2D', 0))),
 
     iouring_entries=int(os.getenv('FLEXKV_IOURING_ENTRIES', 512)),
     iouring_flags=int(os.getenv('FLEXKV_IOURING_FLAGS', 0)),

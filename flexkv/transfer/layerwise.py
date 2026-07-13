@@ -317,7 +317,8 @@ class LayerwiseTransferWorker(TransferWorkerBase):
             self.indexer_gpu_layer_strides_tensor, self.indexer_gpu_chunk_sizes_tensor,
             self.indexer_ssd_files,
             ce_segment_threshold=GLOBAL_CONFIG_FROM_ENV.transfer_segment_threshold,
-            ce_path_opt=GLOBAL_CONFIG_FROM_ENV.transfer_path_opt)
+            ce_path_opt=GLOBAL_CONFIG_FROM_ENV.transfer_path_opt,
+            ce_sharded_memcpy2d=GLOBAL_CONFIG_FROM_ENV.sharded_mla_d2h_memcpy2d)
         flexkv_logger.info(f"[LayerwiseWorker] __init__ completed successfully, worker_id={worker_id}")
 
     def _receive_eventfds_from_sglang(self, tp_group_size: int,

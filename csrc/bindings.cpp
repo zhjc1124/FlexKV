@@ -57,7 +57,8 @@ void transfer_kv_blocks_binding(
     bool use_ce_transfer = false, bool is_mla = false, int gpu_block_type = 0,
     bool sync = true,
     bool ce_path_opt = false,
-    int ce_segment_threshold = 8, int ce_force_path = -1) {
+    int ce_segment_threshold = 8, int ce_force_path = -1,
+    bool ce_sharded_memcpy2d = false) {
   int num_blocks = gpu_block_id_tensor.numel();
 
   int64_t *gpu_block_ids =
@@ -88,6 +89,7 @@ void transfer_kv_blocks_binding(
   ce_config.path_opt_enabled = ce_path_opt;
   ce_config.segment_threshold = ce_segment_threshold;
   ce_config.force_path = ce_force_path;
+  ce_config.sharded_mla_d2h_memcpy2d = ce_sharded_memcpy2d;
 
   // Create GTensorHandler
   flexkv::GTensorHandler handler(
@@ -429,7 +431,8 @@ PYBIND11_MODULE(c_ext, m) {
         py::arg("use_ce_transfer") = false, py::arg("is_mla") = false,
         py::arg("gpu_block_type") = 0, py::arg("sync") = true,
         py::arg("ce_path_opt") = false,
-        py::arg("ce_segment_threshold") = 8, py::arg("ce_force_path") = -1);
+        py::arg("ce_segment_threshold") = 8, py::arg("ce_force_path") = -1,
+        py::arg("ce_sharded_memcpy2d") = false);
   m.def("transfer_kv_blocks_ssd", &transfer_kv_blocks_ssd_binding,
         "Transfer KV blocks between SSD and CPU memory", py::arg("ioctx"),
         py::arg("cpu_layer_id_list"), py::arg("cpu_tensor_ptr"),
@@ -460,11 +463,13 @@ PYBIND11_MODULE(c_ext, m) {
                        std::map<int, std::vector<std::string>> indexer_ssd_files,
                        int64_t ce_segment_threshold,
                        bool ce_path_opt,
-                       int ce_force_path) {
+                       int ce_force_path,
+                       bool ce_sharded_memcpy2d) {
             flexkv::CETransferConfig cfg;
             cfg.segment_threshold = ce_segment_threshold;
             cfg.path_opt_enabled = ce_path_opt;
             cfg.force_path = ce_force_path;
+            cfg.sharded_mla_d2h_memcpy2d = ce_sharded_memcpy2d;
              return new flexkv::LayerwiseTransferGroup(
                  num_gpus, gpu_blocks, cpu_blocks, ssd_files, num_layers,
                  gpu_kv_strides_tensor, gpu_block_strides_tensor,
@@ -492,7 +497,8 @@ PYBIND11_MODULE(c_ext, m) {
            py::arg("indexer_ssd_files") = std::map<int, std::vector<std::string>>{},
            py::arg("ce_segment_threshold") = 8,
            py::arg("ce_path_opt") = true,
-           py::arg("ce_force_path") = -1)
+           py::arg("ce_force_path") = -1,
+           py::arg("ce_sharded_memcpy2d") = false)
       .def("layerwise_transfer",
            &flexkv::LayerwiseTransferGroup::layerwise_transfer,
            py::arg("ssd_block_ids"), py::arg("cpu_block_ids_d2h"),
@@ -579,11 +585,13 @@ PYBIND11_MODULE(c_ext, m) {
                        int nvcomp_data_type,
                        int64_t ce_segment_threshold,
                        bool ce_path_opt,
-                       int ce_force_path) {
+                       int ce_force_path,
+                       bool ce_sharded_memcpy2d) {
             flexkv::CETransferConfig cfg;
             cfg.segment_threshold = ce_segment_threshold;
             cfg.path_opt_enabled = ce_path_opt;
             cfg.force_path = ce_force_path;
+            cfg.sharded_mla_d2h_memcpy2d = ce_sharded_memcpy2d;
              return new flexkv::TPTransferThreadGroup(
                  num_gpus, gpu_block_ptrs_flat, num_tensors_per_gpu,
                  cpu_blocks_ptr, num_layers, gpu_kv_strides_in_bytes,
@@ -603,7 +611,8 @@ PYBIND11_MODULE(c_ext, m) {
            py::arg("nvcomp_data_type") = 0,
            py::arg("ce_segment_threshold") = 8,
            py::arg("ce_path_opt") = true,
-           py::arg("ce_force_path") = -1)
+           py::arg("ce_force_path") = -1,
+           py::arg("ce_sharded_memcpy2d") = false)
       .def("tp_group_transfer",
            &flexkv::TPTransferThreadGroup::tp_group_transfer,
            py::arg("gpu_block_id_tensor"), py::arg("cpu_block_id_tensor"),

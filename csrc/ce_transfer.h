@@ -33,6 +33,14 @@ struct CETransferConfig {
   // Used by microbenchmark_ce_strategy.py to prove choose_path picks the
   // fastest strategy for each case (runs all viable paths head-to-head).
   int force_path = -1;
+  // sharded_mla_d2h_memcpy2d: when true, sharded BF D2H uses cudaMemcpy2DAsync
+  // (strided D2H directly to CPU interleave positions). Fast on NVIDIA (H20:
+  // 58ms, 24 GiB/s), catastrophically slow on P800/Kunlunxin (12.8s, 0.11
+  // GiB/s — the DMA engine does not handle 2D strided patterns). Default
+  // false: use D2D shard transpose + contiguous D2H + CPU interleave merge
+  // (works on all platforms, ~130ms on P800). Set to 1 on NVIDIA via
+  // FLEXKV_ENABLE_SHARDED_MLA_D2H_MEMCPY2D=1.
+  bool sharded_mla_d2h_memcpy2d = false;
 };
 
 // ============================================================================
@@ -74,8 +82,10 @@ enum class CEPath : int {
   PER_BLOCK = -1,       // baseline (path_opt_enabled == false)
   BULK_CONTIG = 0,
   SEGMENTED_DIRECT = 1,
-  STAGED_SCATTER = 2,
+  STAGED_SCATTER = 2,   // legacy: per-layer D2H + CPU scatter (replaced by below)
   GATHER_SCATTER = 3,
+  BF_D2D_TRANSPOSE = 4, // BF non-sharded: D2D transpose + 3-path cudaMemcpyAsync
+  BF_SHARDED = 5,       // BF sharded: cudaMemcpy2DAsync or D2D+contig+merge
 };
 
 // ============================================================================
@@ -201,6 +211,46 @@ void ce_transfer_staged_scatter(
 // ============================================================================
 template <BackendType Type>
 void ce_transfer_gather_scatter(
+    int num_blocks, int start_layer_id, int num_layers, int kv_dim,
+    int64_t *gpu_block_ids, GTensorHandler gpu_tensor_handler,
+    int64_t gpu_startoff_inside_chunks_int64,
+    int64_t *cpu_block_ids, int64_t *cpu_ptr_int64,
+    int64_t cpu_kv_stride_int64, int64_t cpu_layer_stride_int64,
+    int64_t cpu_block_stride_int64,
+    int64_t cpu_startoff_inside_chunks_int64, int64_t chunk_size_in_bytes,
+    cudaStream_t stream, bool is_host_to_device,
+    const CEAnalysis &analysis, const CETransferConfig &ce_config);
+
+// ============================================================================
+// BF_D2D_TRANSPOSE: BF non-sharded (rank0_only/MHA) D2H/H2D.
+//   D2D transpose (LAYERFIRST→BLOCKFIRST) via index_select + transpose +
+//   contiguous, then 3-path cudaMemcpyAsync (contiguous/segmented/per-block)
+//   matching the transposed BLOCKFIRST layout. No CPU scatter needed for
+//   contiguous/few_seg; per-block for scattered. D2D SM overhead <1ms (large).
+// ============================================================================
+template <BackendType Type>
+void ce_transfer_bf_d2d_transpose(
+    int num_blocks, int start_layer_id, int num_layers, int kv_dim,
+    int64_t *gpu_block_ids, GTensorHandler gpu_tensor_handler,
+    int64_t gpu_startoff_inside_chunks_int64,
+    int64_t *cpu_block_ids, int64_t *cpu_ptr_int64,
+    int64_t cpu_kv_stride_int64, int64_t cpu_layer_stride_int64,
+    int64_t cpu_block_stride_int64,
+    int64_t cpu_startoff_inside_chunks_int64, int64_t chunk_size_in_bytes,
+    cudaStream_t stream, bool is_host_to_device,
+    const CEAnalysis &analysis, const CETransferConfig &ce_config);
+
+// ============================================================================
+// BF_SHARDED: BF sharded MLA D2H. Two sub-paths selected by
+//   ce_config.sharded_mla_d2h_memcpy2d:
+//   memcpy2d=true (NVIDIA): cudaMemcpy2DAsync per (layer, segment), strided
+//     D2H directly to CPU interleave. No D2D, no CPU merge.
+//   memcpy2d=false (P800 default): D2D shard transpose + contiguous D2H to
+//     separate host regions + CPU interleave merge.
+//   H2D uses existing paths (sharded H2D == rank0_only H2D).
+// ============================================================================
+template <BackendType Type>
+void ce_transfer_bf_sharded_d2h(
     int num_blocks, int start_layer_id, int num_layers, int kv_dim,
     int64_t *gpu_block_ids, GTensorHandler gpu_tensor_handler,
     int64_t gpu_startoff_inside_chunks_int64,

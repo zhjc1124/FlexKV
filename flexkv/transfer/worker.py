@@ -362,6 +362,7 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
         # multi-GPU tp_group_transfer / layerwise_transfer paths.
         self.ce_path_opt = GLOBAL_CONFIG_FROM_ENV.transfer_path_opt
         self.ce_segment_threshold = GLOBAL_CONFIG_FROM_ENV.transfer_segment_threshold
+        self.ce_sharded_memcpy2d = GLOBAL_CONFIG_FROM_ENV.sharded_mla_d2h_memcpy2d
 
         self._compressor = compressor or NullCompressionStrategy()
         self._compressor.attach(self)
@@ -419,6 +420,8 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
             True,  # sync
             self.ce_path_opt,
             self.ce_segment_threshold,
+            -1,  # ce_force_path
+            self.ce_sharded_memcpy2d,
         )
 
     def launch_transfer(self, transfer_op: WorkerTransferOp) -> bool:
@@ -537,6 +540,7 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
             gpu_device_ids,
             ce_segment_threshold=GLOBAL_CONFIG_FROM_ENV.transfer_segment_threshold,
             ce_path_opt=GLOBAL_CONFIG_FROM_ENV.transfer_path_opt,
+            ce_sharded_memcpy2d=GLOBAL_CONFIG_FROM_ENV.sharded_mla_d2h_memcpy2d,
         )
 
         self._compressor = compressor or NullCompressionStrategy()
