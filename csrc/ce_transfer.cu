@@ -900,6 +900,8 @@ void ce_transfer_gather_scatter(
 //   D2D transpose (LAYERFIRST→BLOCKFIRST) via index_select + transpose +
 //   contiguous, then 3-path cudaMemcpyAsync matching the transposed BLOCKFIRST
 //   layout. No CPU scatter for contiguous/few_seg; per-block for scattered.
+//   For kv_dim > 1 (MHA), falls back to STAGED_SCATTER (the transpose layout
+//   doesn't match CPU's kv_dim interleaving).
 // ============================================================================
 
 template <BackendType Type>
@@ -913,11 +915,25 @@ void ce_transfer_bf_d2d_transpose(
     int64_t cpu_startoff_inside_chunks_int64, int64_t chunk_size_in_bytes,
     cudaStream_t stream, bool is_host_to_device,
     const CEAnalysis &analysis, const CETransferConfig &ce_config) {
+  // For kv_dim > 1 or H2D, fall back to STAGED_SCATTER (correct but slower).
+  // D2D transpose is only optimized for D2H with kv_dim == 1 (MLA case).
+  if (kv_dim != 1 || is_host_to_device) {
+    ce_transfer_staged_scatter<Type>(
+        num_blocks, start_layer_id, num_layers, kv_dim,
+        gpu_block_ids, gpu_tensor_handler, gpu_startoff_inside_chunks_int64,
+        cpu_block_ids, cpu_ptr_int64, cpu_kv_stride_int64,
+        cpu_layer_stride_int64, cpu_block_stride_int64,
+        cpu_startoff_inside_chunks_int64, chunk_size_in_bytes,
+        stream, is_host_to_device, analysis, ce_config);
+    return;
+  }
+
+  // ============ D2H, kv_dim == 1 (MLA) ============
   TORCH_CHECK(chunk_size_in_bytes % sizeof(int64_t) == 0,
               "BF_D2D_TRANSPOSE requires chunk_size % 8 == 0");
   const int64_t elems_per_block = chunk_size_in_bytes / sizeof(int64_t);
   const size_t buf_bytes = (size_t)num_blocks * (size_t)chunk_size_in_bytes;
-  // Total bytes for all layers: num_layers * num_blocks * chunk_size
+  // Total device staging: [num_blocks, num_layers, elems_per_block] (BLOCKFIRST)
   const size_t total_dev_bytes = buf_bytes * (size_t)num_layers;
 
   // Bind ATen to our cuda stream
@@ -945,172 +961,46 @@ void ce_transfer_bf_d2d_transpose(
     gpu_ids_cuda = at::from_blob(gpu_ids_raw, {num_blocks}, i64_cuda);
   }
 
-  // Device staging buffer for the transposed data.
-  // Layout: [num_blocks, num_layers, elems_per_block] (BLOCKFIRST, contiguous)
-  // Use raw cudaMalloc via get_cached_device_buffer + from_blob (avoid
-  // ATen record_stream issues, same as GATHER_SCATTER).
+  // Device staging buffer: [num_blocks, num_layers, elems_per_block] contiguous
   void *dev_staging = get_cached_device_buffer(total_dev_bytes, 2);
-  // View as [num_blocks, num_layers, elems_per_block] for D2H source
   at::Tensor dev_staging_view = at::from_blob(
       dev_staging, {num_blocks, num_layers, elems_per_block}, i64_cuda);
 
-  // Host staging buffer (for H2D gather from CPU, and for D2H when scattered)
-  void *host_staging = get_cached_hugepage_buffer(buf_bytes);
-
-  const int64_t total_iters = (int64_t)num_layers * kv_dim;
-
-  if (!is_host_to_device) {
-    // ============ D2H ============
-    // Step 1: D2D transpose for all (layer, kv_dim)
-    for (int64_t it = 0; it < total_iters; ++it) {
-      int i = (int)(it / kv_dim);
-      int j = (int)(it % kv_dim);
-      int64_t *gpu_layer_kv_base =
-          ptr_at<Type>(gpu_tensor_handler, i + start_layer_id, j, 0);
-
-      at::Tensor src_view = at::from_blob(
-          gpu_layer_kv_base, {max_gpu_id + 1, elems_per_block}, i64_cuda);
-      // Offset by gpu_startoff
-      // (gpu_startoff is in int64 elements within each block)
-      at::Tensor gathered;
-      if (analysis.gpu_log_contig) {
-        // Blocks are contiguous — slice directly
-        gathered = src_view.narrow(0, gpu_block_ids[0], num_blocks)
-                       .clone();
-      } else {
-        gathered = at::index_select(src_view, 0, gpu_ids_cuda);
-      }
-      // gathered: [num_blocks, elems_per_block] (one layer)
-      // Write into dev_staging_view[:, i*kv_dim+j, :] = gathered
-      dev_staging_view.select(1, it).copy_(gathered);
+  // Step 1: D2D transpose — gather each layer's blocks into staging
+  for (int i = 0; i < num_layers; ++i) {
+    int64_t *gpu_layer_kv_base =
+        ptr_at<Type>(gpu_tensor_handler, i + start_layer_id, 0, 0);
+    at::Tensor src_view = at::from_blob(
+        gpu_layer_kv_base, {max_gpu_id + 1, elems_per_block}, i64_cuda);
+    at::Tensor gathered;
+    if (analysis.gpu_log_contig) {
+      gathered = src_view.narrow(0, gpu_block_ids[0], num_blocks).clone();
+    } else {
+      gathered = at::index_select(src_view, 0, gpu_ids_cuda);
     }
-
-    // Step 2: D2H from dev_staging to CPU (3-path based on segments)
-    // dev_staging is [num_blocks, num_layers, elems_per_block] contiguous.
-    // CPU is BLOCKFIRST: [num_blocks, num_layers, full_chunk] — same layout!
-    // block_stride_in_bytes = cpu_block_stride_int64 * sizeof(int64_t)
-    int64_t block_bytes = num_layers * chunk_size_in_bytes;  // per block, all layers
-    for (const auto &seg : analysis.segments) {
-      int64_t seg_start_block = cpu_block_ids[seg.start_k];
-      int64_t seg_bytes = (int64_t)seg.run_len * block_bytes;
-      int64_t *cpu_dst = cpu_ptr_int64 +
-          (seg_start_block * cpu_block_stride_int64) +
-          cpu_startoff_inside_chunks_int64;
-      // For kv_dim > 1, we need to handle each kv_dim separately.
-      // But dev_staging_view is [num_blocks, total_layers(=num_layers*kv_dim), elems].
-      // Actually total_iters = num_layers * kv_dim, and we wrote to dim 1 = it.
-      // So dev_staging_view has shape [num_blocks, total_iters, elems_per_block].
-      // CPU layout: cpu_kv_stride separates kv dims.
-      // For simplicity, if kv_dim == 1 (common MLA case), one shot:
-      if (kv_dim == 1) {
-        void *src = (char *)dev_staging +
-            (int64_t)seg.start_k * num_layers * chunk_size_in_bytes;
-        cudaMemcpyAsync(cpu_dst, src, seg_bytes,
-                        cudaMemcpyDeviceToHost, stream);
-        FLEXKV_GPU_CPU_TRANSFER(false, seg_bytes);
-      } else {
-        // Per kv_dim: each kv has its own CPU stride
-        for (int j = 0; j < kv_dim; ++j) {
-          for (int b = 0; b < seg.run_len; ++b) {
-            int64_t cb = cpu_block_ids[seg.start_k + b];
-            int64_t *dst = cpu_ptr_int64 +
-                (i + start_layer_id) * cpu_layer_stride_int64 +
-                j * cpu_kv_stride_int64 +
-                cb * cpu_block_stride_int64 +
-                cpu_startoff_inside_chunks_int64;
-            // Wait — this is wrong for the batched approach. Let me simplify:
-            // For kv_dim > 1, fall back to per-layer per-kv per-segment.
-            // This is rare (MHA with kv_dim=2). Just do per-block.
-            break;
-          }
-          break;
-        }
-        // Fallback: per-block D2H for kv_dim > 1
-        for (int b = 0; b < seg.run_len; ++b) {
-          for (int64_t it = 0; it < total_iters; ++it) {
-            int i = (int)(it / kv_dim);
-            int j = (int)(it % kv_dim);
-            int64_t cb = cpu_block_ids[seg.start_k + b];
-            int64_t *cpu_dst = cpu_ptr_int64 +
-                (i + start_layer_id) * cpu_layer_stride_int64 +
-                j * cpu_kv_stride_int64 +
-                cb * cpu_block_stride_int64 +
-                cpu_startoff_inside_chunks_int64;
-            void *src = (char *)dev_staging +
-                ((int64_t)(seg.start_k + b) * total_iters + it) * chunk_size_in_bytes;
-            cudaMemcpyAsync(cpu_dst, src, chunk_size_in_bytes,
-                            cudaMemcpyDeviceToHost, stream);
-            FLEXKV_GPU_CPU_TRANSFER(false, chunk_size_in_bytes);
-          }
-        }
-      }
-    }
-    cudaStreamSynchronize(stream);
-
-  } else {
-    // ============ H2D ============
-    // Step 1: H2D from CPU to dev_staging (3-path)
-    for (int64_t it = 0; it < total_iters; ++it) {
-      int i = (int)(it / kv_dim);
-      int j = (int)(it % kv_dim);
-      int64_t *gpu_layer_kv_base =
-          ptr_at<Type>(gpu_tensor_handler, i + start_layer_id, j, 0);
-
-      // Gather CPU data into host_staging (per layer/kv)
-      for (int k = 0; k < num_blocks; ++k) {
-        int64_t cb = cpu_block_ids[k];
-        int64_t *cpu_src = cpu_ptr_int64 +
-            (i + start_layer_id) * cpu_layer_stride_int64 +
-            j * cpu_kv_stride_int64 +
-            cb * cpu_block_stride_int64 +
-            cpu_startoff_inside_chunks_int64;
-        memcpy((char *)host_staging + (int64_t)k * chunk_size_in_bytes,
-               cpu_src, chunk_size_in_bytes);
-      }
-      // H2D to dev_staging[:, it, :]
-      void *dst = (char *)dev_staging +
-          (int64_t)it * num_blocks * chunk_size_in_bytes;
-      // Wait, dev_staging_view is [num_blocks, total_iters, elems]. The
-      // memory layout is: block k, iter t → offset = (k * total_iters + t) * elems * 8
-      // But we want to write one iter's worth: all blocks for iter t.
-      // That's not contiguous in dev_staging! We need a different layout.
-      // Let me reconsider: for H2D, we should write [total_iters, num_blocks, elems]
-      // so each iter's blocks are contiguous. Then transpose to [num_blocks, total_iters, elems].
-      // Actually, let's just do per-layer H2D + index_copy_ to GPU directly.
-      // This is simpler and correct.
-
-      // Per-layer approach: H2D to host_staging → H2D to GPU directly
-      // (skip the D2D transpose for H2D — just gather CPU + H2D + index_copy_)
-      at::Tensor host_tensor = at::from_blob(
-          host_staging, {num_blocks, elems_per_block},
-          at::TensorOptions().dtype(at::kLong));
-      // H2D: copy host_staging to a device buffer
-      void *dev_tmp = get_cached_device_buffer(buf_bytes, 0);  // slot=0
-      cudaMemcpyAsync(dev_tmp, host_staging, buf_bytes,
-                      cudaMemcpyHostToDevice, stream);
-      at::Tensor dev_tmp_view = at::from_blob(
-          dev_tmp, {num_blocks, elems_per_block}, i64_cuda);
-      // Scatter to GPU final positions
-      at::Tensor dst_view = at::from_blob(
-          gpu_layer_kv_base, {max_gpu_id + 1, elems_per_block}, i64_cuda);
-      if (analysis.gpu_log_contig) {
-        // Direct copy to contiguous GPU position
-        at::Tensor dst_slice = dst_view.narrow(0, gpu_block_ids[0], num_blocks);
-        dst_slice.copy_(dev_tmp_view);
-      } else {
-        if (!gpu_ids_cuda.defined()) {
-          // Need to transfer ids (should have been done above, but for H2D
-          // the code path might skip it)
-          gpu_ids_raw = get_cached_device_buffer(ids_bytes);
-          cudaMemcpyAsync(gpu_ids_raw, gpu_block_ids, ids_bytes,
-                          cudaMemcpyHostToDevice, stream);
-          gpu_ids_cuda = at::from_blob(gpu_ids_raw, {num_blocks}, i64_cuda);
-        }
-        dst_view.index_copy_(0, gpu_ids_cuda, dev_tmp_view);
-      }
-      cudaStreamSynchronize(stream);
-    }
+    // Write gathered [num_blocks, elems] into staging[:, i, :]
+    dev_staging_view.select(1, i).copy_(gathered);
   }
+
+  // Step 2: D2H from dev_staging to CPU BLOCKFIRST (3-path by segments)
+  // dev_staging is [num_blocks, num_layers, elems] = [num_blocks, num_layers, full_chunk]
+  // CPU BLOCKFIRST: block_stride = num_layers * full_chunk, layer_stride = full_chunk
+  // Consecutive blocks in staging are at stride = num_layers * chunk_size = block_stride
+  // → same layout! Contiguous D2H per segment works.
+  int64_t block_bytes = (int64_t)num_layers * chunk_size_in_bytes;
+  for (const auto &seg : analysis.segments) {
+    int64_t seg_start_block = cpu_block_ids[seg.start_k];
+    int64_t seg_bytes = (int64_t)seg.run_len * block_bytes;
+    int64_t *cpu_dst = cpu_ptr_int64 +
+        (seg_start_block * cpu_block_stride_int64) +
+        cpu_startoff_inside_chunks_int64;
+    void *src = (char *)dev_staging +
+        (int64_t)seg.start_k * num_layers * chunk_size_in_bytes;
+    cudaMemcpyAsync(cpu_dst, src, seg_bytes,
+                    cudaMemcpyDeviceToHost, stream);
+    FLEXKV_GPU_CPU_TRANSFER(false, seg_bytes);
+  }
+  cudaStreamSynchronize(stream);
 
   // Release from_blob views (underlying buffers are cached)
   gpu_ids_cuda.reset();
