@@ -112,6 +112,7 @@ struct CEAnalysis {
   bool cpu_log_contig;   // cpu_block_ids[k+1] == cpu_block_ids[k]+1
   bool cpu_phys_contig;  // cpu_block_stride == chunk_size (LAYERFIRST + non-sharded)
   bool gpu_phys_contig;  // gpu_block_stride == chunk_size (non-sharded D2H)
+  bool is_blockfirst;    // cpu_layer_stride < cpu_block_stride (BLOCKFIRST layout)
   int num_segments;
   std::vector<CESegment> segments;
 };
@@ -123,7 +124,8 @@ struct CEAnalysis {
 CEAnalysis analyze_ce_transfer(
     const int64_t *gpu_block_ids, const int64_t *cpu_block_ids,
     int num_blocks, int64_t cpu_block_stride_in_bytes,
-    int64_t chunk_size_in_bytes, int64_t gpu_block_stride_in_bytes);
+    int64_t chunk_size_in_bytes, int64_t gpu_block_stride_in_bytes,
+    int64_t cpu_layer_stride_in_bytes = 0);
 
 CEPath choose_path(const CEAnalysis &a, const CETransferConfig &ce_config,
                    int64_t chunk_size_in_bytes = 0);

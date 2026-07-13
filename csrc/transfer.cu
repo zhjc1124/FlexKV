@@ -134,7 +134,7 @@ void transfer_kv_blocks(
     CEAnalysis analysis = analyze_ce_transfer(
         gpu_block_ids, cpu_block_ids, num_blocks,
         cpu_block_stride_in_bytes, chunk_size_in_bytes,
-        gpu_block_stride_in_bytes);
+        gpu_block_stride_in_bytes, cpu_layer_stride_in_bytes);
 
     // path_opt_enabled: PER_BLOCK baseline when off; otherwise choose_path()
     // picks one of the four optimized strategies (see CEPath in ce_transfer.h).
@@ -150,8 +150,8 @@ void transfer_kv_blocks(
       // force_path: test/benchmark override (production never sets it).
       CEPath path;
       if (ce_config.force_path >= 0) {
-        TORCH_CHECK(ce_config.force_path <= 3,
-                    "force_path out of range [0,3]: ", ce_config.force_path);
+        TORCH_CHECK(ce_config.force_path <= 5,
+                    "force_path out of range [0,5]: ", ce_config.force_path);
         path = static_cast<CEPath>(ce_config.force_path);
       } else {
         path = choose_path(analysis, ce_config, chunk_size_in_bytes);
