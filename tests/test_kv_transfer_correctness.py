@@ -139,6 +139,8 @@ ENGINES = [
 
 MLA_MODES = ["sharded", "all_write", "rank0_only"]
 
+CE_MEMCPY2D_CONFIGS = [False, True]
+
 
 # ---------------------------------------------------------------------------
 # Helpers (matching production code in worker.py / layerwise.py)
@@ -389,7 +391,8 @@ def layerwise_h2d_readback(all_gpu, cpu_kv, num_gpus, gpu_layout, num_layers,
                            is_mla, mode, ce_path_opt=None,
                            ce_segment_threshold=None,
                            notify_mode="hostfunc", layer_granularity=None,
-                           ce_is_blockfirst=None):
+                           ce_is_blockfirst=None,
+                           enable_memcpy2d=None):
     """Run a single CE H2D via LayerwiseTransferGroup, reading `cpu_kv` back
     into `all_gpu` with block-id list `ids`.
 
@@ -408,7 +411,8 @@ def layerwise_h2d_readback(all_gpu, cpu_kv, num_gpus, gpu_layout, num_layers,
                                     gpu_layout, num_layers,
                                     ce_path_opt=ce_path_opt,
                                     ce_segment_threshold=ce_segment_threshold,
-                                    ce_is_blockfirst=ce_is_blockfirst)
+                                    ce_is_blockfirst=ce_is_blockfirst,
+                                    ce_enable_memcpy2d=enable_memcpy2d)
     empty_ids = torch.empty(0, dtype=torch.int64).pin_memory()
     empty_indexer = torch.Tensor()
     lw_group.layerwise_transfer(
@@ -485,7 +489,8 @@ def spot_check_gpu(all_gpu, expected_gpu_id, num_gpus, num_layers, num_blocks,
 @pytest.mark.parametrize("data_config", MHA_SIZES)
 @pytest.mark.parametrize("cpu_layout_name", CPU_LAYOUTS)
 @pytest.mark.parametrize("engine_name,use_ce", ENGINES)
-def test_non_mla_roundtrip(data_config, cpu_layout_name, engine_name, use_ce):
+@pytest.mark.parametrize("enable_memcpy2d", CE_MEMCPY2D_CONFIGS, ids=["no_memcpy2d", "memcpy2d"])
+def test_non_mla_roundtrip(data_config, cpu_layout_name, engine_name, use_ce, enable_memcpy2d):
     """Non-MLA round-trip: D2H -> clear GPU -> H2D -> verify per-rank data.
 
     Non-MLA does NOT use mla_d2h_mode — the C++ else-branch uses
@@ -512,7 +517,8 @@ def test_non_mla_roundtrip(data_config, cpu_layout_name, engine_name, use_ce):
     cpu_kv = make_cpu_tensor(cpu_layout, num_layers, num_blocks)
 
     tp = make_tp_group(cpu_kv.data_ptr(), all_gpu, num_gpus, gpu_layout, num_layers,
-                       ce_is_blockfirst=(cpu_layout_name == "BLOCKFIRST"))
+                       ce_is_blockfirst=(cpu_layout_name == "BLOCKFIRST"),
+                       ce_enable_memcpy2d=enable_memcpy2d)
     gpu_block_ids = block_ids(num_blocks)
     cpu_block_ids = block_ids(num_blocks)
 
@@ -572,7 +578,8 @@ def test_non_mla_roundtrip(data_config, cpu_layout_name, engine_name, use_ce):
 @pytest.mark.parametrize("cpu_layout_name", CPU_LAYOUTS)
 @pytest.mark.parametrize("engine_name,use_ce", ENGINES)
 @pytest.mark.parametrize("mode", MLA_MODES)
-def test_mla_roundtrip_modes(data_config, cpu_layout_name, engine_name, use_ce, mode):
+@pytest.mark.parametrize("enable_memcpy2d", CE_MEMCPY2D_CONFIGS, ids=["no_memcpy2d", "memcpy2d"])
+def test_mla_roundtrip_modes(data_config, cpu_layout_name, engine_name, use_ce, mode, enable_memcpy2d):
     """MLA round-trip with each D2H mode. Verifies K and V."""
     skip_if_engine_unsupported(use_ce)
     num_layers, num_blocks, tpb, num_heads, head_dim = data_config
@@ -618,7 +625,8 @@ def test_mla_roundtrip_modes(data_config, cpu_layout_name, engine_name, use_ce, 
     cpu_stride_tp = cpu_stride_block // num_gpus
 
     tp = make_tp_group(cpu_kv.data_ptr(), all_gpu, num_gpus, gpu_layout, num_layers,
-                       ce_is_blockfirst=(cpu_layout_name == "BLOCKFIRST"))
+                       ce_is_blockfirst=(cpu_layout_name == "BLOCKFIRST"),
+                       ce_enable_memcpy2d=enable_memcpy2d)
     gpu_block_ids = block_ids(num_blocks)
     cpu_block_ids = block_ids(num_blocks)
 
@@ -702,7 +710,8 @@ def test_layerwise_h2d_notify_modes(data_config, engine_name, use_ce, notify_mod
 
     # D2H via TP group to populate CPU
     tp = make_tp_group(cpu_kv.data_ptr(), all_gpu, num_gpus, gpu_layout, num_layers,
-                       ce_is_blockfirst=(cpu_layout_name == "BLOCKFIRST"))
+                       ce_is_blockfirst=True,
+                       ce_is_mla=True)
     gpu_block_ids = block_ids(num_blocks)
     cpu_block_ids = block_ids(num_blocks)
     tp.tp_group_transfer(
@@ -725,7 +734,8 @@ def test_layerwise_h2d_notify_modes(data_config, engine_name, use_ce, notify_mod
 
     # H2D via layerwise with the requested notify mode
     lw = make_layerwise_group(cpu_kv, all_gpu, num_gpus, gpu_layout, num_layers,
-                                ce_is_blockfirst=True)
+                                ce_is_blockfirst=True,
+                                ce_is_mla=True)
     lw.layerwise_transfer(
         torch.empty(0, dtype=torch.int64), torch.empty(0, dtype=torch.int64),
         0, 0, 0, 0, 0,
@@ -1025,6 +1035,12 @@ CE_PATTERNS = ["contiguous", "few_seg", "scattered"]
 # num_blocks <= threshold (i.e. it cannot form more than `threshold` segments).
 CE_SEGMENT_THRESHOLDS = [8, 2]
 
+# enable_memcpy2d is swept as an orthogonal dimension. When True and the path
+# is STAGED_SCATTER and direction is D2H, the C++ engine uses cudaMemcpy2DAsync
+# instead of staging+scatter. It has no effect on H2D or non-STAGED_SCATTER
+# paths (the C++ check is `if (ce_config.enable_memcpy2d && !is_host_to_device)`).
+# CE_MEMCPY2D_CONFIGS defined near top of file (before first use).
+
 
 def make_block_id_pattern(pattern_name, num_blocks):
     """Construct a block-id permutation that yields a specific segment count.
@@ -1114,8 +1130,9 @@ def _expected_strategy(pattern_name, cpu_layout_name, is_mla, mode,
 @pytest.mark.parametrize("segment_threshold", CE_SEGMENT_THRESHOLDS,
                          ids=lambda t: "thr{}".format(t))
 @pytest.mark.parametrize("path_opt", [False, True], ids=["baseline", "optimized"])
+@pytest.mark.parametrize("enable_memcpy2d", CE_MEMCPY2D_CONFIGS, ids=["no_memcpy2d", "memcpy2d"])
 def test_ce_paths_roundtrip(data_config, is_mla, cpu_layout_name, pattern,
-                            path_opt, mode, segment_threshold):
+                            path_opt, mode, segment_threshold, enable_memcpy2d):
     """CE strategy round-trip correctness via block-id patterns.
 
     Combos come from CE_MODE_CONFIGS: MLA sizes x {sharded, all_write,
@@ -1163,7 +1180,8 @@ def test_ce_paths_roundtrip(data_config, is_mla, cpu_layout_name, pattern,
     tp = make_tp_group(cpu_kv.data_ptr(), all_gpu, num_gpus,
                        gpu_layout, num_layers, ce_path_opt=path_opt,
                        ce_segment_threshold=segment_threshold,
-                       ce_is_blockfirst=(cpu_layout_name == "BLOCKFIRST"))
+                       ce_is_blockfirst=(cpu_layout_name == "BLOCKFIRST"),
+                       ce_enable_memcpy2d=enable_memcpy2d)
 
     ids = make_block_id_pattern(pattern, num_blocks)
     gpu_block_ids = ids
@@ -1229,9 +1247,10 @@ def test_ce_paths_roundtrip(data_config, is_mla, cpu_layout_name, pattern,
 @pytest.mark.parametrize("path_opt", [False, True], ids=["baseline", "optimized"])
 @pytest.mark.parametrize("notify_mode", ["polling"], ids=["polling"])
 @pytest.mark.parametrize("layer_granularity", [1, None], ids=["lg1", "lg_all"])
+@pytest.mark.parametrize("enable_memcpy2d", CE_MEMCPY2D_CONFIGS, ids=["no_memcpy2d", "memcpy2d"])
 def test_ce_paths_layerwise_h2d(data_config, is_mla, cpu_layout_name, pattern,
                                 path_opt, mode, segment_threshold,
-                                notify_mode, layer_granularity):
+                                notify_mode, layer_granularity, enable_memcpy2d):
     """CE strategy correctness for LayerwiseTransferGroup H2D.
 
     Uses TPTransferThreadGroup D2H (already verified correct) to prepare
@@ -1249,6 +1268,8 @@ def test_ce_paths_layerwise_h2d(data_config, is_mla, cpu_layout_name, pattern,
     the test count.
     """
     skip_if_engine_unsupported(use_ce=True)
+    if enable_memcpy2d:
+        pytest.skip("memcpy2d only affects D2H, not H2D")
     num_layers, num_blocks, tpb, num_heads, head_dim = data_config
     if pattern == "scattered" and num_blocks <= segment_threshold:
         pytest.skip("scattered needs num_blocks > segment_threshold ({}) "
@@ -1286,7 +1307,8 @@ def test_ce_paths_layerwise_h2d(data_config, is_mla, cpu_layout_name, pattern,
     # Step 1: D2H via TPTransferThreadGroup (prepare CPU data)
     tp = make_tp_group(cpu_kv.data_ptr(), all_gpu, num_gpus,
                        gpu_layout, num_layers,
-                       ce_is_blockfirst=(cpu_layout_name == "BLOCKFIRST"))
+                       ce_is_blockfirst=(cpu_layout_name == "BLOCKFIRST"),
+                       ce_enable_memcpy2d=enable_memcpy2d)
     tp.tp_group_transfer(
         gpu_block_id_tensor=ids, cpu_block_id_tensor=ids,
         cpu_kv_stride_in_bytes=cpu_stride_kv,
@@ -1318,7 +1340,8 @@ def test_ce_paths_layerwise_h2d(data_config, is_mla, cpu_layout_name, pattern,
         ce_path_opt=path_opt,
         ce_segment_threshold=segment_threshold, notify_mode=notify_mode,
         layer_granularity=layer_granularity,
-                           ce_is_blockfirst=(cpu_layout_name == "BLOCKFIRST"))
+        ce_is_blockfirst=(cpu_layout_name == "BLOCKFIRST"),
+        enable_memcpy2d=enable_memcpy2d)
 
     # Verify GPU data == original
     expected_gpu = 0 if is_mla else None
