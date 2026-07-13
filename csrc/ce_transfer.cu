@@ -1095,17 +1095,49 @@ void ce_transfer_bf_d2d_transpose(
     // kv_dim, chunk] because total_iters interleaves kv within layers.
     // block_stride in staging = total_iters * chunk_size = cpu_block_stride.
     int64_t block_bytes = total_iters * chunk_size_in_bytes;
-    for (const auto &seg : analysis.segments) {
-      int64_t seg_start_block = cpu_block_ids[seg.start_k];
-      int64_t seg_bytes = (int64_t)seg.run_len * block_bytes;
-      int64_t *cpu_dst = cpu_ptr_int64 +
-          (seg_start_block * cpu_block_stride_int64) +
-          cpu_startoff_inside_chunks_int64;
-      void *src = (char *)dev_staging +
-          (int64_t)seg.start_k * total_iters * chunk_size_in_bytes;
-      cudaMemcpyAsync(cpu_dst, src, seg_bytes,
-                      cudaMemcpyDeviceToHost, stream);
-      FLEXKV_GPU_CPU_TRANSFER(false, seg_bytes);
+    // When all layers are transferred at once (total_iters = num_layers*kv_dim
+    // and block_bytes == cpu_block_stride), a contiguous per-segment copy of
+    // num_blocks*block_bytes is layout-correct. But layerwise_transfer calls
+    // this with num_layers=1 per batch, so block_bytes != cpu_block_stride and
+    // a contiguous copy would cross block/layer boundaries — and it omits the
+    // start_layer_id offset, always touching layer 0. Detect the full-block
+    // case to keep the fast path; otherwise scatter per-block per-(layer,kv).
+    bool full_block = (block_bytes == cpu_block_stride_int64 * sizeof(int64_t));
+    if (full_block) {
+      for (const auto &seg : analysis.segments) {
+        int64_t seg_start_block = cpu_block_ids[seg.start_k];
+        int64_t seg_bytes = (int64_t)seg.run_len * block_bytes;
+        int64_t *cpu_dst = cpu_ptr_int64 +
+            (seg_start_block * cpu_block_stride_int64) +
+            cpu_startoff_inside_chunks_int64;
+        void *src = (char *)dev_staging +
+            (int64_t)seg.start_k * total_iters * chunk_size_in_bytes;
+        cudaMemcpyAsync(cpu_dst, src, seg_bytes,
+                        cudaMemcpyDeviceToHost, stream);
+        FLEXKV_GPU_CPU_TRANSFER(false, seg_bytes);
+      }
+    } else {
+      // Per-layer batch: block_bytes != cpu_block_stride. Scatter from staging
+      // [num_blocks, total_iters, elems] to CPU [block, layer, kv, chunk] with
+      // explicit block/layer/kv offsets (mirrors scatter_to_cpu).
+      for (int b = 0; b < num_blocks; ++b) {
+        int64_t cb = cpu_block_ids[b];
+        for (int64_t it = 0; it < total_iters; ++it) {
+          int li = (int)(it / kv_dim);
+          int kj = (int)(it % kv_dim);
+          int64_t *cpu_dst = cpu_ptr_int64 +
+              cb * cpu_block_stride_int64 +
+              (li + start_layer_id) * cpu_layer_stride_int64 +
+              kj * cpu_kv_stride_int64 +
+              cpu_startoff_inside_chunks_int64;
+          void *src = (char *)dev_staging +
+              (int64_t)b * total_iters * chunk_size_in_bytes +
+              it * chunk_size_in_bytes;
+          cudaMemcpyAsync(cpu_dst, src, chunk_size_in_bytes,
+                          cudaMemcpyDeviceToHost, stream);
+          FLEXKV_GPU_CPU_TRANSFER(false, chunk_size_in_bytes);
+        }
+      }
     }
     cudaStreamSynchronize(stream);
 
@@ -1114,17 +1146,45 @@ void ce_transfer_bf_d2d_transpose(
     // Step 1: H2D per-segment from CPU BLOCKFIRST to dev_staging
     // (reverse of D2H — same contiguous layout)
     int64_t block_bytes = total_iters * chunk_size_in_bytes;
-    for (const auto &seg : analysis.segments) {
-      int64_t seg_start_block = cpu_block_ids[seg.start_k];
-      int64_t seg_bytes = (int64_t)seg.run_len * block_bytes;
-      int64_t *cpu_src = cpu_ptr_int64 +
-          (seg_start_block * cpu_block_stride_int64) +
-          cpu_startoff_inside_chunks_int64;
-      void *dst = (char *)dev_staging +
-          (int64_t)seg.start_k * total_iters * chunk_size_in_bytes;
-      cudaMemcpyAsync(dst, cpu_src, seg_bytes,
-                      cudaMemcpyHostToDevice, stream);
-      FLEXKV_GPU_CPU_TRANSFER(true, seg_bytes);
+    // See D2H Step 2: keep the fast contiguous path only when block_bytes ==
+    // cpu_block_stride (all layers at once); otherwise gather per-block
+    // per-(layer,kv) with explicit offsets (mirrors gather_from_cpu).
+    bool full_block = (block_bytes == cpu_block_stride_int64 * sizeof(int64_t));
+    if (full_block) {
+      for (const auto &seg : analysis.segments) {
+        int64_t seg_start_block = cpu_block_ids[seg.start_k];
+        int64_t seg_bytes = (int64_t)seg.run_len * block_bytes;
+        int64_t *cpu_src = cpu_ptr_int64 +
+            (seg_start_block * cpu_block_stride_int64) +
+            cpu_startoff_inside_chunks_int64;
+        void *dst = (char *)dev_staging +
+            (int64_t)seg.start_k * total_iters * chunk_size_in_bytes;
+        cudaMemcpyAsync(dst, cpu_src, seg_bytes,
+                        cudaMemcpyHostToDevice, stream);
+        FLEXKV_GPU_CPU_TRANSFER(true, seg_bytes);
+      }
+    } else {
+      // Per-layer batch: block_bytes != cpu_block_stride. Gather from CPU
+      // [block, layer, kv, chunk] to staging [num_blocks, total_iters, elems]
+      // with explicit block/layer/kv offsets.
+      for (int b = 0; b < num_blocks; ++b) {
+        int64_t cb = cpu_block_ids[b];
+        for (int64_t it = 0; it < total_iters; ++it) {
+          int li = (int)(it / kv_dim);
+          int kj = (int)(it % kv_dim);
+          const int64_t *cpu_src = cpu_ptr_int64 +
+              cb * cpu_block_stride_int64 +
+              (li + start_layer_id) * cpu_layer_stride_int64 +
+              kj * cpu_kv_stride_int64 +
+              cpu_startoff_inside_chunks_int64;
+          void *dst = (char *)dev_staging +
+              (int64_t)b * total_iters * chunk_size_in_bytes +
+              it * chunk_size_in_bytes;
+          cudaMemcpyAsync(dst, cpu_src, chunk_size_in_bytes,
+                          cudaMemcpyHostToDevice, stream);
+          FLEXKV_GPU_CPU_TRANSFER(true, chunk_size_in_bytes);
+        }
+      }
     }
 
     // Step 2: D2D reverse transpose — scatter from staging to GPU LAYERFIRST
