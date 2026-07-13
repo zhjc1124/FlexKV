@@ -317,7 +317,6 @@ class LayerwiseTransferWorker(TransferWorkerBase):
             self.indexer_gpu_layer_strides_tensor, self.indexer_gpu_chunk_sizes_tensor,
             self.indexer_ssd_files,
             ce_segment_threshold=GLOBAL_CONFIG_FROM_ENV.transfer_segment_threshold,
-            ce_use_pingpong=GLOBAL_CONFIG_FROM_ENV.transfer_pingpong,
             ce_path_opt=GLOBAL_CONFIG_FROM_ENV.transfer_path_opt)
         flexkv_logger.info(f"[LayerwiseWorker] __init__ completed successfully, worker_id={worker_id}")
 

@@ -21,13 +21,6 @@ namespace flexkv {
 
 struct CETransferConfig {
   int64_t segment_threshold = 8;
-  // use_pingpong: double-buffer the host/device staging buffers so the CPU
-  // scatter/gather of one (layer, kv) slot overlaps the async copy of the
-  // next. ONLY meaningful for the staging strategies (STAGED_SCATTER and
-  // GATHER_SCATTER); BULK_CONTIG / SEGMENTED_DIRECT do no staging and ignore
-  // it. When false, staging strategies reuse a single buffer and must drain
-  // the stream between iterations before overwriting it.
-  bool use_pingpong = true;
   // path_opt_enabled: master switch between the PER_BLOCK baseline (one memcpy
   // per block, the slow reference used to quantify optimization gains) and the
   // adaptive optimized strategies chosen by choose_path(). false = PER_BLOCK
@@ -62,7 +55,7 @@ struct CETransferConfig {
 //   STAGED_SCATTER  dst NOT physically contiguous (BLOCKFIRST, or sharded D2H)
 //                   with few segments: copy via a pinned staging buffer, then
 //                   CPU scatter/gather to the strided destination. Uses
-//                   staging (ping-pong applies). Two internal GPU-side
+//                   staging (D2H ping-pong enabled). Two internal GPU-side
 //                   variants, selected at runtime by gpu_phys_contig:
 //                     STAGED_CONTIG_RUN  GPU blocks contiguous  -> one memcpy
 //                                        per merged run between GPU and staging
@@ -74,9 +67,9 @@ struct CETransferConfig {
 //   GATHER_SCATTER  many scattered segments (> segment_threshold), GPU blocks
 //                   physically contiguous: GPU index_select gather (D2H) /
 //                   index_copy_ scatter (H2D) through a staging buffer. Uses
-//                   staging (ping-pong applies).
+//                   staging (D2H ping-pong enabled).
 //
-// ping-pong summary: applies to STAGED_SCATTER and GATHER_SCATTER only.
+// ping-pong summary: D2H only, applies to STAGED_SCATTER and GATHER_SCATTER.
 enum class CEPath : int {
   PER_BLOCK = -1,       // baseline (path_opt_enabled == false)
   BULK_CONTIG = 0,
@@ -181,7 +174,7 @@ void ce_transfer_segmented_direct(
 
 // ============================================================================
 // STAGED_SCATTER: pinned staging buffer + CPU scatter/gather to a strided
-//   destination. Uses staging (ping-pong applies). Chosen when dst NOT
+//   destination. Uses staging (D2H ping-pong enabled). Chosen when dst NOT
 //   physically contiguous (BLOCKFIRST, or sharded D2H) with few segments.
 //   Internally selects a GPU-side variant at runtime by gpu_phys_contig:
 //     STAGED_CONTIG_RUN (GPU contiguous) -> merged-run memcpy GPU<->staging
@@ -197,13 +190,12 @@ void ce_transfer_staged_scatter(
     int64_t cpu_block_stride_int64,
     int64_t cpu_startoff_inside_chunks_int64, int64_t chunk_size_in_bytes,
     cudaStream_t stream, bool is_host_to_device,
-    const CEAnalysis &analysis, const CETransferConfig &ce_config,
-    bool sync = true);
+    const CEAnalysis &analysis, const CETransferConfig &ce_config);
 
 // ============================================================================
 // GATHER_SCATTER: GPU index_select/index_copy_ pipeline through a staging
 //   buffer, for many scattered segments (> segment_threshold). Uses staging
-//   (ping-pong applies). Requires gpu_phys_contig (GPU block stride == chunk).
+//   (D2H ping-pong enabled). Requires gpu_phys_contig (GPU block stride == chunk).
 //     D2H: GPU index_select gather -> D2H staging -> CPU scatter
 //     H2D: CPU gather -> H2D staging -> GPU index_copy_ scatter
 // ============================================================================
@@ -217,7 +209,6 @@ void ce_transfer_gather_scatter(
     int64_t cpu_block_stride_int64,
     int64_t cpu_startoff_inside_chunks_int64, int64_t chunk_size_in_bytes,
     cudaStream_t stream, bool is_host_to_device,
-    const CEAnalysis &analysis, const CETransferConfig &ce_config,
-    bool sync = true);
+    const CEAnalysis &analysis, const CETransferConfig &ce_config);
 
 } // namespace flexkv

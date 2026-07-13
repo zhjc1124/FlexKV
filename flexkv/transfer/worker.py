@@ -361,7 +361,6 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
         # so mla_d2h_mode is irrelevant — MLA sharding only applies in the
         # multi-GPU tp_group_transfer / layerwise_transfer paths.
         self.ce_path_opt = GLOBAL_CONFIG_FROM_ENV.transfer_path_opt
-        self.ce_use_pingpong = GLOBAL_CONFIG_FROM_ENV.transfer_pingpong
         self.ce_segment_threshold = GLOBAL_CONFIG_FROM_ENV.transfer_segment_threshold
 
         self._compressor = compressor or NullCompressionStrategy()
@@ -419,7 +418,6 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
             self.gpu_block_type_,
             True,  # sync
             self.ce_path_opt,
-            self.ce_use_pingpong,
             self.ce_segment_threshold,
         )
 
@@ -538,7 +536,6 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
             self.gpu_chunk_sizes_in_bytes,
             gpu_device_ids,
             ce_segment_threshold=GLOBAL_CONFIG_FROM_ENV.transfer_segment_threshold,
-            ce_use_pingpong=GLOBAL_CONFIG_FROM_ENV.transfer_pingpong,
             ce_path_opt=GLOBAL_CONFIG_FROM_ENV.transfer_path_opt,
         )
 

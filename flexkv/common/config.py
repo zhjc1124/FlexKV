@@ -439,7 +439,6 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
 
     # CE adaptive path configuration (passed to C++ via CETransferConfig)
     transfer_segment_threshold=int(os.getenv('FLEXKV_TRANSFER_SEGMENT_THRESHOLD', 8)),
-    transfer_pingpong=bool(int(os.getenv('FLEXKV_TRANSFER_PINGPONG', 1))),
     # Path optimization: 0=baseline (per-block memcpy), 1=Path 0/1/2 auto-select
     transfer_path_opt=bool(int(os.getenv('FLEXKV_TRANSFER_PATH_OPT', 1))),
 

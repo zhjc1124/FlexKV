@@ -361,8 +361,8 @@ void ce_transfer_segmented_direct(
 
 // ============================================================================
 // STAGED_SCATTER: pinned staging buffer + CPU scatter/gather to a strided
-//   destination (BLOCKFIRST, or sharded D2H). Uses staging, so ping-pong
-//   (ce_config.use_pingpong) applies here. Runtime GPU-side variant on
+//   destination (BLOCKFIRST, or sharded D2H). D2H ping-pong always enabled.
+//   Runtime GPU-side variant on analysis.gpu_phys_contig:
 //   analysis.gpu_phys_contig:
 //     STAGED_CONTIG_RUN  (gpu_phys_contig)  -> merged-run memcpy GPU<->staging
 //     STAGED_PER_BLOCK   (!gpu_phys_contig) -> per-block   memcpy GPU<->staging
@@ -379,9 +379,7 @@ void ce_transfer_staged_scatter(
     int64_t cpu_block_stride_int64,
     int64_t cpu_startoff_inside_chunks_int64, int64_t chunk_size_in_bytes,
     cudaStream_t stream, bool is_host_to_device,
-    const CEAnalysis &analysis, const CETransferConfig &ce_config,
-    bool sync) {
-  bool use_pingpong = ce_config.use_pingpong;
+    const CEAnalysis &analysis, const CETransferConfig &ce_config) {
   // GPU-side variant: contiguous GPU blocks let us merge each segment into one
   // memcpy (STAGED_CONTIG_RUN); sharded D2H (!gpu_phys_contig) forces one
   // memcpy per block (STAGED_PER_BLOCK). Both share the staging buffer, CPU
@@ -390,14 +388,13 @@ void ce_transfer_staged_scatter(
   {
     // ---- staging buffer + CPU scatter/gather ----
     size_t layer_buf_size = (size_t)num_blocks * chunk_size_in_bytes;
-    // Ping-pong only helps D2H (CPU scatter overlaps with GPU D2H memcpy).
-    // H2D's CPU gather is too fast to benefit from overlap.
+    // D2H ping-pong: double-buffer the host staging buffer so CPU scatter of
+    // layer L overlaps with GPU D2H of layer L+1. H2D has no ping-pong (CPU
+    // gather is too fast to benefit from overlap).
     // Also disable for STAGED_PER_BLOCK (both sides non-contig) — per-block
     // granularity makes event overhead dominate at large num_blocks.
-    // Also require sync=true — in async/polling mode, cudaEventSynchronize
-    // would block the batch loop.
     bool is_per_block = !analysis.gpu_phys_contig && !analysis.cpu_phys_contig;
-    bool need_pingpong = use_pingpong && !is_host_to_device && sync && !is_per_block;
+    bool need_pingpong = !is_host_to_device && !is_per_block;
 
     void *host_base = get_cached_hugepage_buffer(need_pingpong ? layer_buf_size * 2
                                                          : layer_buf_size);
@@ -492,122 +489,58 @@ void ce_transfer_staged_scatter(
           }
         }
       } else {
-        // ---- H2D ----
-        if (need_pingpong) {
-          // Segment-level ping-pong: CPU gather of seg K+1 overlaps with
-          // H2D of seg K. Mirrors SGLang hicache (p800 transfer.cu).
-          // Each segment alternates between host_bufs[0] and host_bufs[1].
-          bool event_used[2] = {false, false};
-          int seg_idx = 0;
-          int64_t *cpu_base =
-              cpu_ptr_int64 + (i + start_layer_id) * cpu_layer_stride_int64 +
-              j * cpu_kv_stride_int64 + cpu_startoff_inside_chunks_int64;
-          for (const auto &seg : analysis.segments) {
-            int sidx = seg_idx & 1;
-            int64_t seg_size = (int64_t)seg.run_len * chunk_size_in_bytes;
-
-            // Wait for previous use of this slot (2 segments ago).
-            if (event_used[sidx]) {
-              cudaEventSynchronize(pingpong_events[sidx]);
-            }
-
-            // CPU gather: copy from strided CPU into staging slot.
-            int64_t off = 0;
-            for (int b = 0; b < seg.run_len; ++b) {
-              int64_t cb = cpu_block_ids[seg.start_k + b];
-              int64_t *src = cpu_base + cb * cpu_block_stride_int64;
-              memcpy((char *)host_bufs[sidx] + off, src, chunk_size_in_bytes);
-              off += chunk_size_in_bytes;
-            }
-
-            // H2D from staging to GPU.
-            if (analysis.gpu_phys_contig) {
-              int64_t *gpu_ptr = ptr_at<Type>(gpu_tensor_handler,
-                                              i + start_layer_id, j,
-                                              gpu_block_ids[seg.start_k]);
-              int64_t *gpu_ptr_off =
-                  reinterpret_cast<int64_t *>(gpu_ptr) +
-                  gpu_startoff_inside_chunks_int64;
-              cudaMemcpyAsync(gpu_ptr_off, host_bufs[sidx], seg_size,
-                              cudaMemcpyHostToDevice, stream);
-            } else {
-              // Per-block H2D (!gpu_phys_contig, rare for H2D).
-              int64_t off2 = 0;
-              for (int b = 0; b < seg.run_len; ++b) {
-                int64_t *gpu_ptr = ptr_at<Type>(gpu_tensor_handler,
-                                                i + start_layer_id, j,
-                                                gpu_block_ids[seg.start_k + b]);
-                int64_t *gpu_ptr_off =
-                    reinterpret_cast<int64_t *>(gpu_ptr) +
-                    gpu_startoff_inside_chunks_int64;
-                cudaMemcpyAsync(gpu_ptr_off,
-                                (char *)host_bufs[sidx] + off2,
-                                chunk_size_in_bytes,
-                                cudaMemcpyHostToDevice, stream);
-                off2 += chunk_size_in_bytes;
-              }
-            }
-            FLEXKV_GPU_CPU_TRANSFER(true, seg_size);
-            cudaEventRecord(pingpong_events[sidx], stream);
-            event_used[sidx] = true;
-            seg_idx++;
+        // ---- H2D (no ping-pong: CPU gather is too fast to benefit) ----
+        // Gather all segments into buf, then H2D all, then drain.
+        // `buf` is pinned to host_bufs[0] and reused every iteration.
+        int64_t *cpu_base =
+            cpu_ptr_int64 + (i + start_layer_id) * cpu_layer_stride_int64 +
+            j * cpu_kv_stride_int64 + cpu_startoff_inside_chunks_int64;
+        int64_t off = 0;
+        for (const auto &seg : analysis.segments) {
+          for (int b = 0; b < seg.run_len; ++b) {
+            int64_t cb = cpu_block_ids[seg.start_k + b];
+            int64_t *src = cpu_base + cb * cpu_block_stride_int64;
+            memcpy((char *)buf + off, src, chunk_size_in_bytes);
+            off += chunk_size_in_bytes;
           }
-          // Flush remaining in-flight segments.
-          if (event_used[0]) cudaEventSynchronize(pingpong_events[0]);
-          if (event_used[1]) cudaEventSynchronize(pingpong_events[1]);
-        } else {
-          // No ping-pong: gather all segments into buf, then H2D all, then
-          // drain. `buf` is pinned to host_bufs[0] and reused every iteration.
-          int64_t *cpu_base =
-              cpu_ptr_int64 + (i + start_layer_id) * cpu_layer_stride_int64 +
-              j * cpu_kv_stride_int64 + cpu_startoff_inside_chunks_int64;
-          int64_t off = 0;
-          for (const auto &seg : analysis.segments) {
-            for (int b = 0; b < seg.run_len; ++b) {
-              int64_t cb = cpu_block_ids[seg.start_k + b];
-              int64_t *src = cpu_base + cb * cpu_block_stride_int64;
-              memcpy((char *)buf + off, src, chunk_size_in_bytes);
-              off += chunk_size_in_bytes;
-            }
-          }
-          // H2D all segments from staging
-          off = 0;
-          if (analysis.gpu_phys_contig) {
-            for (const auto &seg : analysis.segments) {
-              int64_t seg_size = (int64_t)seg.run_len * chunk_size_in_bytes;
-              int64_t *gpu_ptr = ptr_at<Type>(gpu_tensor_handler,
-                                              i + start_layer_id, j,
-                                              gpu_block_ids[seg.start_k]);
-              int64_t *gpu_ptr_off =
-                  reinterpret_cast<int64_t *>(gpu_ptr) +
-                  gpu_startoff_inside_chunks_int64;
-              cudaMemcpyAsync(gpu_ptr_off, (char *)buf + off, seg_size,
-                              cudaMemcpyHostToDevice, stream);
-              FLEXKV_GPU_CPU_TRANSFER(true, seg_size);
-              off += seg_size;
-            }
-          } else {
-            for (const auto &seg : analysis.segments) {
-              for (int b = 0; b < seg.run_len; ++b) {
-                int64_t *gpu_ptr = ptr_at<Type>(gpu_tensor_handler,
-                                                i + start_layer_id, j,
-                                                gpu_block_ids[seg.start_k + b]);
-                int64_t *gpu_ptr_off =
-                    reinterpret_cast<int64_t *>(gpu_ptr) +
-                    gpu_startoff_inside_chunks_int64;
-                cudaMemcpyAsync(gpu_ptr_off, (char *)buf + off,
-                                chunk_size_in_bytes,
-                                cudaMemcpyHostToDevice, stream);
-                FLEXKV_GPU_CPU_TRANSFER(true, chunk_size_in_bytes);
-                off += chunk_size_in_bytes;
-              }
-            }
-          }
-          // The async H2D memcpy's above are still reading `buf` when the
-          // next iteration's CPU gather overwrites it. Drain the stream so
-          // `buf` is safe to overwrite next iteration.
-          cudaStreamSynchronize(stream);
         }
+        // H2D all segments from staging
+        off = 0;
+        if (analysis.gpu_phys_contig) {
+          for (const auto &seg : analysis.segments) {
+            int64_t seg_size = (int64_t)seg.run_len * chunk_size_in_bytes;
+            int64_t *gpu_ptr = ptr_at<Type>(gpu_tensor_handler,
+                                            i + start_layer_id, j,
+                                            gpu_block_ids[seg.start_k]);
+            int64_t *gpu_ptr_off =
+                reinterpret_cast<int64_t *>(gpu_ptr) +
+                gpu_startoff_inside_chunks_int64;
+            cudaMemcpyAsync(gpu_ptr_off, (char *)buf + off, seg_size,
+                            cudaMemcpyHostToDevice, stream);
+            FLEXKV_GPU_CPU_TRANSFER(true, seg_size);
+            off += seg_size;
+          }
+        } else {
+          for (const auto &seg : analysis.segments) {
+            for (int b = 0; b < seg.run_len; ++b) {
+              int64_t *gpu_ptr = ptr_at<Type>(gpu_tensor_handler,
+                                              i + start_layer_id, j,
+                                              gpu_block_ids[seg.start_k + b]);
+              int64_t *gpu_ptr_off =
+                  reinterpret_cast<int64_t *>(gpu_ptr) +
+                  gpu_startoff_inside_chunks_int64;
+              cudaMemcpyAsync(gpu_ptr_off, (char *)buf + off,
+                              chunk_size_in_bytes,
+                              cudaMemcpyHostToDevice, stream);
+              FLEXKV_GPU_CPU_TRANSFER(true, chunk_size_in_bytes);
+              off += chunk_size_in_bytes;
+            }
+          }
+        }
+        // The async H2D memcpy's above are still reading `buf` when the
+        // next iteration's CPU gather overwrites it. Drain the stream so
+        // `buf` is safe to overwrite next iteration.
+        cudaStreamSynchronize(stream);
       }
     }
     // Drain last ping-pong slot (D2H)
@@ -654,8 +587,7 @@ void ce_transfer_gather_scatter(
     int64_t cpu_block_stride_int64,
     int64_t cpu_startoff_inside_chunks_int64, int64_t chunk_size_in_bytes,
     cudaStream_t stream, bool is_host_to_device,
-    const CEAnalysis &analysis, const CETransferConfig &ce_config,
-    bool sync) {
+    const CEAnalysis &analysis, const CETransferConfig &ce_config) {
   TORCH_CHECK(chunk_size_in_bytes % sizeof(int64_t) == 0,
               "Path 2 requires chunk_size_in_bytes % 8 == 0");
   const int64_t elems_per_block = chunk_size_in_bytes / sizeof(int64_t);
@@ -663,7 +595,6 @@ void ce_transfer_gather_scatter(
   // elems_per_block * sizeof(int64_t) == chunk_size_in_bytes, so this is
   // equivalent to num_blocks * chunk_size_in_bytes — kept as one variable.
   const size_t buf_bytes = (size_t)num_blocks * (size_t)chunk_size_in_bytes;
-  bool use_pingpong = ce_config.use_pingpong;
 
   // Bind ATen to our cuda stream
   int cur_dev = 0;
@@ -739,7 +670,7 @@ void ce_transfer_gather_scatter(
   void *dev_raw[2] = {nullptr, nullptr};
   at::Tensor dev_buf[2];
   if (need_dev_buf) {
-    bool need_two = use_pingpong && !is_host_to_device && sync;  // D2H + sync only
+    bool need_two = !is_host_to_device;  // D2H ping-pong only
     size_t dev_alloc = need_two ? buf_bytes * 2 : buf_bytes;
     void *dev_base = get_cached_device_buffer(dev_alloc, 2);  // slot=2: dev_buf (independent from gpu_ids/dst_ids)
     dev_raw[0] = dev_base;
@@ -757,10 +688,9 @@ void ce_transfer_gather_scatter(
       !is_host_to_device ||  // D2H: always stage then scatter
       (is_host_to_device && !analysis.cpu_log_contig);  // H2D: CPU gather needed
 
-  // Ping-pong: D2H + sync=true only — CPU scatter overlaps with GPU D2H.
-  // H2D has no benefit (CPU gather too fast). sync=false (async/polling)
-  // would block batch loop with cudaEventSynchronize.
-  bool need_pingpong_host = need_host_buf && use_pingpong && !is_host_to_device && sync;
+  // D2H ping-pong: CPU scatter overlaps with GPU D2H.
+  // H2D has no ping-pong (CPU gather too fast).
+  bool need_pingpong_host = need_host_buf && !is_host_to_device;
 
   void *host_buf[2] = {nullptr, nullptr};
   if (need_host_buf) {
@@ -868,13 +798,7 @@ void ce_transfer_gather_scatter(
                   cpu_block_ids[0] * cpu_block_stride_int64 +
                   cpu_startoff_inside_chunks_int64;
       } else {
-        // Before reusing host_buf[idx], wait for the H2D copy that last used
-        // this same ping-pong slot (it-2) to finish. it>=2 guards against
-        // synchronizing an event that was never recorded (it==1, idx=1).
-        if (pingpong_events && it >= 2) {
-          cudaEventSynchronize(pingpong_events[idx]);
-        }
-        // gather into staging
+        // gather into staging (H2D: no ping-pong, idx always 0)
         int64_t *cpu_base = cpu_ptr_int64 +
             (i + start_layer_id) * cpu_layer_stride_int64 +
             j * cpu_kv_stride_int64 + cpu_startoff_inside_chunks_int64;
@@ -908,22 +832,10 @@ void ce_transfer_gather_scatter(
         dst_view.index_copy_(0, dst_ids_cuda, dev_buf[idx]);
       }
 
-      // Record AFTER the scatter so the ping-pong event covers the full
-      // H2D + index_copy_ chain. Otherwise the next iteration reusing
-      // dev_buf[idx]/host_buf[idx] (guarded by cudaEventSynchronize on this
-      // event) could overwrite the buffer while the scatter still reads it.
-      if (pingpong_events) {
-        cudaEventRecord(pingpong_events[idx], stream);
-      } else if (need_host_buf || need_dev_buf) {
-        // No ping-pong: idx is pinned to 0, so host_buf[0]/dev_buf[0] are
-        // reused every iteration. The async H2D memcpy (reading host_buf[0])
-        // and the index_copy_ scatter (reading dev_buf[0]) are still in flight
-        // on `stream` when the NEXT iteration's CPU gather memcpy's fresh data
-        // into host_buf[0] / the gather issues into dev_buf[0]. Without a
-        // barrier the next iteration stomps the staging buffer mid-copy,
-        // corrupting the transfer (observed as cross-layer/cross-kv data mixups
-        // under optimized + pingpong_off). Drain the stream so the staging buffers
-        // are safe to overwrite before the next iteration touches them.
+      // H2D: no ping-pong. idx is pinned to 0, so host_buf[0]/dev_buf[0] are
+      // reused every iteration. Drain the stream so staging buffers are safe
+      // to overwrite before the next iteration touches them.
+      if (need_host_buf || need_dev_buf) {
         cudaStreamSynchronize(stream);
       }
     }
@@ -948,21 +860,13 @@ void ce_transfer_gather_scatter(
 
   // Drain the stream before returning. The staging buffers (dev_buf,
   // host_buf) are cached and survive across calls, but the per-call
-  // id tensors (gpu_ids_raw, dst_ids_raw) and ping-pong events are
-  // freed on return — any in-flight async op referencing them would
-  // read/write freed memory. In sync=true mode this is mandatory.
-  // In sync=false mode (async/layerwise), ping-pong should have already
-  // drained the last iteration via event sync, but we still need to
-  // drain before freeing gpu_ids_raw/dst_ids_raw.
-  if (sync || !pingpong_events) {
-    cudaStreamSynchronize(stream);
-  } else {
-    // Async mode with ping-pong: drain only the last event, not the full
-    // stream. The last iteration's event covers H2D + index_copy_.
-    int64_t last = total_iters - 1;
-    int last_idx = (int)(last & 1);
-    cudaEventSynchronize(pingpong_events[last_idx]);
-  }
+  // id tensors (gpu_ids_raw, dst_ids_raw) are freed on return — any
+  // in-flight async op referencing them would read/write freed memory.
+  // D2H with ping-pong already drained the last scatter above; H2D
+  // already drained via per-iteration cudaStreamSynchronize. But we
+  // still need a final drain for the D2H non-pingpong case (when
+  // pingpong_events is null but need_host_buf is true).
+  cudaStreamSynchronize(stream);
 
   // NOTE: ping-pong events are cached (get_cached_event_pair) and NOT
   // destroyed here. All GPU work has been sync'd within the loop (via
@@ -1009,8 +913,8 @@ void ce_transfer_gather_scatter(
 FLEXKV_INST_ALL_BACKENDS(FLEXKV_INST_NOSTG, ce_transfer_per_block)
 FLEXKV_INST_ALL_BACKENDS(FLEXKV_INST_NOSTG, ce_transfer_bulk_contig)
 FLEXKV_INST_ALL_BACKENDS(FLEXKV_INST_STG, ce_transfer_segmented_direct)
-FLEXKV_INST_ALL_BACKENDS(FLEXKV_INST_STG_SYNC, ce_transfer_staged_scatter)
-FLEXKV_INST_ALL_BACKENDS(FLEXKV_INST_STG_SYNC, ce_transfer_gather_scatter)
+FLEXKV_INST_ALL_BACKENDS(FLEXKV_INST_STG, ce_transfer_staged_scatter)
+FLEXKV_INST_ALL_BACKENDS(FLEXKV_INST_STG, ce_transfer_gather_scatter)
 
 #undef FLEXKV_INST_NOSTG
 #undef FLEXKV_INST_STG

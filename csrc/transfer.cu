@@ -185,7 +185,7 @@ void transfer_kv_blocks(
               cpu_kv_stride_int64, cpu_layer_stride_int64,
               cpu_block_stride_int64, cpu_startoff_inside_chunks_int64,
               chunk_size_in_bytes, stream, is_host_to_device, analysis,
-              ce_config, sync);
+              ce_config);
           break;
         case CEPath::GATHER_SCATTER:
           ce_transfer_gather_scatter<Type>(
@@ -195,7 +195,7 @@ void transfer_kv_blocks(
               cpu_kv_stride_int64, cpu_layer_stride_int64,
               cpu_block_stride_int64, cpu_startoff_inside_chunks_int64,
               chunk_size_in_bytes, stream, is_host_to_device, analysis,
-              ce_config, sync);
+              ce_config);
           break;
         case CEPath::PER_BLOCK:
           // Not produced by choose_path(); handled by the !path_opt_enabled
