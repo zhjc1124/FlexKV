@@ -639,7 +639,8 @@ PYBIND11_MODULE(c_ext, m) {
            py::arg("cpu_tp_stride_in_bytes"), py::arg("transfer_num_cta"),
            py::arg("is_host_to_device"), py::arg("use_ce_transfer"),
            py::arg("layer_id"), py::arg("layer_granularity"),
-           py::arg("is_mla"), py::arg("mla_d2h_mode") = "auto");
+           py::arg("is_mla"), py::arg("mla_d2h_mode") = "auto",
+           py::arg("designated_rank") = 0);
 #ifdef FLEXKV_ENABLE_NVCOMP
   // nvcomp ANS variant: tp_group_transfer_ans() lazily initializes from the
   // constructor config and returns total compressed bytes across ranks.

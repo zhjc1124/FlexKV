@@ -99,6 +99,7 @@ STRATEGIES = [
     ("MLA-sharded", True,  "sharded"),
     ("MLA-all_write", True, "all_write"),
     ("MLA-rank0_only", True, "rank0_only"),
+    ("MLA-round_robin", True, "round_robin"),
 ]
 
 # CE optimization config, as two cumulative levels. Only meaningful for the
@@ -366,7 +367,8 @@ def sync_all(num_gpus):
 def bench_one(strategy_label, is_mla, mode, use_ce, cpu_layout_type,
               num_gpus, num_layers, num_blocks, head_dim, iters,
               ce_path_opt=True, ce_segment_threshold=8,
-              h2d_engine="tp"):
+              h2d_engine="tp", designated_rank=0,
+              rotate_designated_rank=False):
     """Run one benchmark configuration: full D2H+H2D round-trip.
 
     Measures the entire offload+reload path as a single timing:
@@ -409,13 +411,14 @@ def bench_one(strategy_label, is_mla, mode, use_ce, cpu_layout_type,
     gpu_ids = block_ids(num_blocks)
     cpu_ids = block_ids(num_blocks)
 
-    def do_d2h():
+    def do_d2h(dr=designated_rank):
         tp.tp_group_transfer(
             gpu_block_id_tensor=gpu_ids, cpu_block_id_tensor=cpu_ids,
             cpu_kv_stride_in_bytes=cpu_kv_sb, cpu_layer_stride_in_bytes=cpu_ly_sb,
             cpu_block_stride_in_bytes=cpu_bl_sb, cpu_tp_stride_in_bytes=cpu_tp_sb,
             transfer_num_cta=4, is_host_to_device=False, use_ce_transfer=use_ce,
-            layer_id=0, layer_granularity=num_layers, is_mla=is_mla, mla_d2h_mode=mode)
+            layer_id=0, layer_granularity=num_layers, is_mla=is_mla,
+            mla_d2h_mode=mode, designated_rank=dr)
 
     def do_h2d():
         if use_layerwise:
@@ -431,11 +434,14 @@ def bench_one(strategy_label, is_mla, mode, use_ce, cpu_layout_type,
                 layer_id=0, layer_granularity=num_layers, is_mla=is_mla, mla_d2h_mode=mode)
 
     # Warmup: full D2H + H2D round-trip
-    for _ in range(WARMUP_ITERS):
+    for w_iter in range(WARMUP_ITERS):
         for g in range(num_gpus):
             fill_gpu(all_gpu, g, num_layers, num_blocks, head_dim)
         sync_all(num_gpus)
-        do_d2h()
+        if rotate_designated_rank:
+            do_d2h(dr=w_iter % num_gpus)
+        else:
+            do_d2h()
         for g in range(num_gpus):
             for l in range(num_layers):
                 all_gpu[g][l].zero_()
@@ -445,12 +451,15 @@ def bench_one(strategy_label, is_mla, mode, use_ce, cpu_layout_type,
 
     # Timing: full D2H + H2D round-trip per iteration
     times = []
-    for _ in range(iters):
+    for t_iter in range(iters):
         for g in range(num_gpus):
             fill_gpu(all_gpu, g, num_layers, num_blocks, head_dim)
         sync_all(num_gpus)
         t0 = time.perf_counter()
-        do_d2h()
+        if rotate_designated_rank:
+            do_d2h(dr=t_iter % num_gpus)
+        else:
+            do_d2h()
         for g in range(num_gpus):
             for l in range(num_layers):
                 all_gpu[g][l].zero_()
@@ -723,6 +732,40 @@ def main():
                                     "size": size_name,
                                     "layout": layout_name,
                                     "strategy": strat_label,
+                                    "engine": engine_name,
+                                    "h2d_engine": h2d_engine,
+                                    "config": cfg_label,
+                                })
+                                results.append(r)
+                                print("avg={:.3f}ms".format(r["avg_ms"]))
+                            except Exception as e:
+                                print("FAILED: {}".format(e))
+
+                    # Designated_rank rotation variant: rank0_only with
+                    # designated_rank rotating across GPUs each iteration
+                    # (4 iterations, designated_rank = iter % num_gpus).
+                    if "MLA-rank0_only" in args.strategies:
+                        cpu_layout_type = LAYOUTS[layout_name]
+                        for cfg_label, path_opt in configs:
+                            dr_label = "MLA-rank0_dr-rot"
+                            label = "{} | h2d={} | {} | {} | {} | {}".format(
+                                size_name, h2d_engine, engine_name, layout_name,
+                                dr_label, cfg_label)
+                            print("  Running: {} ...".format(label),
+                                  end=" ", flush=True)
+                            try:
+                                r = bench_one(
+                                    "MLA-rank0_only", True, "rank0_only", use_ce,
+                                    cpu_layout_type, num_gpus, num_layers,
+                                    num_blocks, head_dim, args.iters,
+                                    ce_path_opt=path_opt,
+                                    ce_segment_threshold=args.segment_threshold,
+                                    h2d_engine=h2d_engine,
+                                    rotate_designated_rank=True)
+                                r.update({
+                                    "size": size_name,
+                                    "layout": layout_name,
+                                    "strategy": dr_label,
                                     "engine": engine_name,
                                     "h2d_engine": h2d_engine,
                                     "config": cfg_label,

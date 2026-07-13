@@ -180,7 +180,8 @@ void TPTransferThreadGroup::tp_group_transfer(
     const int64_t cpu_tp_stride_in_bytes, const int transfer_num_cta,
     const bool is_host_to_device, const bool use_ce_transfer,
     const int layer_id, const int layer_granularity, const bool is_mla,
-    const std::string &mla_d2h_mode) {
+    const std::string &mla_d2h_mode,
+    const int designated_rank) {
 
   std::atomic<bool> failed{false};
   std::string error_msg;
@@ -194,7 +195,7 @@ void TPTransferThreadGroup::tp_group_transfer(
   // Validate mla_d2h_mode parameter (only meaningful for MLA)
   std::string mode = mla_d2h_mode;
   if (is_mla && mode != "sharded" && mode != "all_write" && mode != "rank0_only"
-      && mode != "auto") {
+      && mode != "round_robin" && mode != "auto") {
     fprintf(stderr, "[FlexKV] Warning: Invalid mla_d2h_mode='%s', using default 'auto'\n",
             mode.c_str());
     mode = "auto";
@@ -225,13 +226,28 @@ void TPTransferThreadGroup::tp_group_transfer(
   }
 
   for (int i = 0; i < num_gpus_; ++i) {
-    // For rank0_only mode in D2H: only rank 0 performs transfer
-    if (is_mla && !is_host_to_device && mode == "rank0_only" && i != 0) {
-      // Skip D2H transfer for non-rank0 GPUs
+    // For rank0_only mode in D2H: only the designated rank performs transfer
+    if (is_mla && !is_host_to_device && mode == "rank0_only"
+        && i != designated_rank) {
+      // Skip D2H transfer for non-designated GPUs
       futures.emplace_back(enqueue_for_gpu(i, [i]() {
-        // Empty task - non-rank0 GPUs do nothing in rank0_only D2H mode
+        // Empty task - non-designated GPUs do nothing in rank0_only D2H mode
       }));
       continue;
+    }
+
+    // For round_robin mode in D2H: skip ranks assigned 0 layers
+    // (happens when layer_granularity < num_gpus_)
+    if (is_mla && !is_host_to_device && mode == "round_robin") {
+      int L_rr = layer_granularity, N_rr = num_gpus_;
+      int layers_per_rank_rr = L_rr / N_rr;
+      int remainder_rr = L_rr % N_rr;
+      int my_count_rr = (i < remainder_rr) ? (layers_per_rank_rr + 1)
+                                           : layers_per_rank_rr;
+      if (my_count_rr == 0) {
+        futures.emplace_back(enqueue_for_gpu(i, [i]() {}));
+        continue;
+      }
     }
 
     futures.emplace_back(enqueue_for_gpu(i, [&, i]() {
@@ -269,8 +285,16 @@ void TPTransferThreadGroup::tp_group_transfer(
             gpu_startoff_inside_chunks = 0;
             chunk_size = gpu_chunk_sizes_in_bytes_[i];
           } else if (mode == "rank0_only") {
-            // D2H: only rank 0 writes (non-rank0 handled by outer continue)
+            // D2H: only designated rank writes (others handled by outer continue)
             // H2D: all GPUs read from offset 0
+            cpu_startoff_inside_chunks = 0;
+            gpu_startoff_inside_chunks = 0;
+            chunk_size = gpu_chunk_sizes_in_bytes_[i];
+          } else if (mode == "round_robin") {
+            // D2H: each rank writes its assigned contiguous layer range to
+            //       CPU offset 0 (layers are separated by cpu_layer_stride,
+            //       so no overlap between ranks).
+            // H2D: all ranks read full KV from offset 0 (same as rank0_only).
             cpu_startoff_inside_chunks = 0;
             gpu_startoff_inside_chunks = 0;
             chunk_size = gpu_chunk_sizes_in_bytes_[i];
@@ -282,11 +306,32 @@ void TPTransferThreadGroup::tp_group_transfer(
           chunk_size = gpu_chunk_sizes_in_bytes_[i];
         }
         
+        // Effective layer range: round_robin D2H assigns each rank a
+        // contiguous subset of layers; all other modes use the full range
+        // (layer_id, layer_granularity) as-is.
+        int eff_start_layer = layer_id;
+        int eff_num_layers = layer_granularity;
+        if (is_mla && !is_host_to_device && mode == "round_robin") {
+          int L_rr = layer_granularity, N_rr = num_gpus_;
+          int layers_per_rank_rr = L_rr / N_rr;
+          int remainder_rr = L_rr % N_rr;
+          int my_start_rr;
+          if (i < remainder_rr) {
+            my_start_rr = i * (layers_per_rank_rr + 1);
+          } else {
+            my_start_rr = remainder_rr * (layers_per_rank_rr + 1) +
+                          (i - remainder_rr) * layers_per_rank_rr;
+          }
+          eff_start_layer = layer_id + my_start_rr;
+          eff_num_layers = (i < remainder_rr) ? (layers_per_rank_rr + 1)
+                                              : layers_per_rank_rr;
+        }
+
         // Dispatch to the appropriate template based on backend type
         switch (backend_type_) {
         case BackendType::VLLM:
           flexkv::transfer_kv_blocks<BackendType::VLLM>(
-              num_blocks, layer_id, layer_granularity, gpu_block_ids,
+              num_blocks, eff_start_layer, eff_num_layers, gpu_block_ids,
               gpu_tensor_handlers_[i], gpu_startoff_inside_chunks,
               cpu_block_ids, cpu_ptr, cpu_kv_stride_in_bytes,
               cpu_layer_stride_in_bytes, cpu_block_stride_in_bytes,
@@ -296,7 +341,7 @@ void TPTransferThreadGroup::tp_group_transfer(
           break;
         case BackendType::TRTLLM:
           flexkv::transfer_kv_blocks<BackendType::TRTLLM>(
-              num_blocks, layer_id, layer_granularity, gpu_block_ids,
+              num_blocks, eff_start_layer, eff_num_layers, gpu_block_ids,
               gpu_tensor_handlers_[i], gpu_startoff_inside_chunks,
               cpu_block_ids, cpu_ptr, cpu_kv_stride_in_bytes,
               cpu_layer_stride_in_bytes, cpu_block_stride_in_bytes,
@@ -306,7 +351,7 @@ void TPTransferThreadGroup::tp_group_transfer(
           break;
         case BackendType::SGLANG:
           flexkv::transfer_kv_blocks<BackendType::SGLANG>(
-              num_blocks, layer_id, layer_granularity, gpu_block_ids,
+              num_blocks, eff_start_layer, eff_num_layers, gpu_block_ids,
               gpu_tensor_handlers_[i], gpu_startoff_inside_chunks,
               cpu_block_ids, cpu_ptr, cpu_kv_stride_in_bytes,
               cpu_layer_stride_in_bytes, cpu_block_stride_in_bytes,

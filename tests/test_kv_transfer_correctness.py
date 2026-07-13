@@ -137,7 +137,7 @@ ENGINES = [
     pytest.param("ce", True, id="ce"),
 ]
 
-MLA_MODES = ["sharded", "all_write", "rank0_only"]
+MLA_MODES = ["sharded", "all_write", "rank0_only", "round_robin"]
 
 CE_MEMCPY2D_CONFIGS = [False, True]
 
@@ -1396,6 +1396,65 @@ def _strategy_matrix():
                                 "h2d" if is_h2d else "d2h")
                             rows.append((label, strat, variant))
     return rows
+
+
+# ---------------------------------------------------------------------------
+# designated_rank test: rank0_only with a non-zero designated rank
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("data_config", [pytest.param((4, 8, 16, 1, 512), id="ds3-mini")])
+@pytest.mark.parametrize("designated_rank", list(range(NUM_GPUS)))
+def test_mla_designated_rank_d2h(data_config, designated_rank):
+    """D2H with rank0_only + designated_rank=X -> H2D -> verify.
+
+    Exercises the designated_rank parameter: only the designated GPU
+    performs D2H, then all GPUs read back via layerwise H2D.
+    """
+    skip_if_engine_unsupported(use_ce=True)
+    num_layers, num_blocks, tpb, num_heads, head_dim = data_config
+    num_gpus = NUM_GPUS
+    gpu_layout, cpu_layout, cpu_layout_tp, kv_dim, heads_per_rank = make_layouts(
+        num_layers, num_blocks, tpb, num_heads, head_dim, "BLOCKFIRST", True, num_gpus)
+    all_gpu = [make_gpu_tensors(num_layers, num_blocks, tpb, heads_per_rank, head_dim, kv_dim, g) for g in range(num_gpus)]
+    fill_gpu(all_gpu[0], 0, num_layers, num_blocks, tpb, heads_per_rank, head_dim, kv_dim)
+    for g in range(1, num_gpus):
+        for l in range(num_layers):
+            all_gpu[g][l].copy_(all_gpu[0][l])
+    sync_all(num_gpus)
+    cpu_stride_block = cpu_layout.get_block_stride() * ES
+    cpu_stride_tp = cpu_stride_block // num_gpus
+    cpu_kv = make_cpu_tensor(cpu_layout, num_layers, num_blocks)
+    tp = make_tp_group(cpu_kv.data_ptr(), all_gpu, num_gpus, gpu_layout, num_layers, ce_is_blockfirst=True, ce_is_mla=True)
+    ids = block_ids(num_blocks)
+    tp.tp_group_transfer(
+        gpu_block_id_tensor=ids, cpu_block_id_tensor=ids,
+        cpu_kv_stride_in_bytes=cpu_layout_tp.get_kv_stride() * ES,
+        cpu_layer_stride_in_bytes=cpu_layout_tp.get_layer_stride() * ES,
+        cpu_block_stride_in_bytes=cpu_stride_block,
+        cpu_tp_stride_in_bytes=cpu_stride_tp,
+        transfer_num_cta=4, is_host_to_device=False, use_ce_transfer=True,
+        layer_id=0, layer_granularity=num_layers, is_mla=True,
+        mla_d2h_mode="rank0_only", designated_rank=designated_rank)
+    sync_all(num_gpus)
+    del tp
+    for g in range(num_gpus):
+        for l in range(num_layers):
+            all_gpu[g][l].zero_()
+    sync_all(num_gpus)
+    lw = make_layerwise_group(cpu_kv, all_gpu, num_gpus, gpu_layout, num_layers, ce_is_blockfirst=True, ce_is_mla=True)
+    lw.layerwise_transfer(
+        torch.empty(0, dtype=torch.int64), torch.empty(0, dtype=torch.int64),
+        0, 0, 0, 0, 0, ids, ids,
+        cpu_layout_tp.get_kv_stride() * ES, cpu_layout_tp.get_layer_stride() * ES, cpu_stride_block,
+        gpu_layout.get_chunk_size() * ES,
+        cpu_layout_tp.get_kv_stride() * ES, cpu_layout_tp.get_layer_stride() * ES, cpu_stride_tp,
+        4, True, num_layers, 1, True, 0,
+        torch.Tensor(), torch.Tensor(), 0, 0, 0, 0,
+        torch.Tensor(), torch.Tensor(), 0, 0, 0, 0,
+        "rank0_only", "hostfunc")
+    sync_all(num_gpus)
+    spot_check_gpu(all_gpu, 0, num_gpus, num_layers, num_blocks, tpb, head_dim, kv_dim, label=f"designated={designated_rank}")
+    del lw
 
 
 def test_ce_strategy_coverage():
