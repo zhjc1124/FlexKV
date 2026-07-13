@@ -614,7 +614,7 @@ void LayerwiseTransferGroup::layerwise_transfer(
     // Validate mla_d2h_mode once before the per-GPU loop
     std::string mode = mla_d2h_mode;
     if (is_mla && mode != "sharded" && mode != "all_write" && mode != "rank0_only"
-        && mode != "auto") {
+        && mode != "round_robin" && mode != "auto") {
       fprintf(stderr, "[FlexKV] Warning: Invalid mla_d2h_mode='%s', using default 'auto'\n",
               mode.c_str());
       mode = "auto";
@@ -642,7 +642,10 @@ void LayerwiseTransferGroup::layerwise_transfer(
           // block_stride == chunk_size (same result).
           cpu_startoff_inside_chunks = i * num_blocks * cpu_block_stride_in_bytes;
           gpu_startoff_inside_chunks = 0;
-        } else if (mode == "rank0_only") {
+        } else if (mode == "rank0_only" || mode == "round_robin") {
+          // H2D: all ranks read full KV from offset 0.
+          // (round_robin D2H splits layers across ranks, but H2D reads
+          // everything back — same as rank0_only H2D.)
           cpu_startoff_inside_chunks = 0;
           gpu_startoff_inside_chunks = 0;
         }
