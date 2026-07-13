@@ -369,6 +369,26 @@ void ce_transfer_segmented_direct(
 }
 
 // ============================================================================
+// Ping-pong scope (D2H double-buffering of the host staging buffer)
+// ============================================================================
+//
+// D2H ping-pong exists ONLY in:
+//   - STAGED_SCATTER CONTIG_RUN variant
+//       need_pingpong = !is_host_to_device && !is_per_block
+//       (is_per_block = !gpu_phys_contig && !cpu_phys_contig, i.e. sharded D2H
+//       with both sides non-contiguous -- per-block granularity makes event
+//       overhead dominate, so ping-pong is disabled.)
+//   - GATHER_SCATTER
+//       need_pingpong_host = need_host_buf && !is_host_to_device
+//
+// Ping-pong is NOT in:
+//   - BULK_CONTIG / SEGMENTED_DIRECT (no staging buffer at all)
+//   - STAGED_SCATTER PER_BLOCK variant (disabled by the !is_per_block condition)
+//   - BF_D2D_TRANSPOSE (no staging after transpose -- direct per-segment memcpy)
+//   - scatter_to_cpu / gather_from_cpu themselves (ping-pong wraps AROUND them
+//     in the main per-(layer,kv) loop, not inside the scatter/gather function)
+
+// ============================================================================
 // scatter_to_cpu: scatter from contiguous staging buffer to strided CPU dst.
 //   Shared by STAGED_SCATTER and GATHER_SCATTER.
 //   When cpu_phys_contig (LAYERFIRST), consecutive cpu_block_ids are also
@@ -408,6 +428,53 @@ void scatter_to_cpu(const void *staging_buf, int64_t *cpu_ptr_int64,
       memcpy(cpu_base + cb * cpu_block_stride_int64,
              (const char *)staging_buf +
                  (int64_t)k * chunk_size_in_bytes,
+             chunk_size_in_bytes);
+    }
+    ++k;
+  }
+}
+
+// ============================================================================
+// gather_from_cpu: gather from strided CPU positions to contiguous staging buf.
+//   H2D symmetric counterpart of scatter_to_cpu (src/dst swapped, const-ness
+//   adjusted). When cpu_phys_contig (LAYERFIRST), consecutive cpu_block_ids
+//   are also physically adjacent, so we merge them into a single memcpy. When
+//   !cpu_phys_contig (BLOCKFIRST), consecutive block_ids have a stride gap
+//   between them, so each block must be gathered individually.
+//   Shared by STAGED_SCATTER and GATHER_SCATTER.
+// ============================================================================
+void gather_from_cpu(void *staging_buf, const int64_t *cpu_ptr_int64,
+                     const int64_t *cpu_block_ids, int num_blocks,
+                     int64_t cpu_block_stride_int64,
+                     int64_t cpu_startoff_inside_chunks_int64,
+                     int64_t chunk_size_in_bytes, int layer_idx, int kv_idx,
+                     int64_t cpu_kv_stride_int64, int64_t cpu_layer_stride_int64,
+                     int start_layer_id, bool cpu_phys_contig) {
+  const int64_t *cpu_base = cpu_ptr_int64 +
+      (layer_idx + start_layer_id) * cpu_layer_stride_int64 +
+      kv_idx * cpu_kv_stride_int64 + cpu_startoff_inside_chunks_int64;
+  int64_t k = 0;
+  while (k < num_blocks) {
+    int64_t run_start = k;
+    if (cpu_phys_contig) {
+      // LAYERFIRST: consecutive block_ids are physically adjacent -- merge.
+      while (k + 1 < num_blocks &&
+             cpu_block_ids[k + 1] == cpu_block_ids[k] + 1) {
+        ++k;
+      }
+      int64_t run_len = k - run_start + 1;
+      int64_t cb = cpu_block_ids[run_start];
+      int64_t run_bytes = run_len * chunk_size_in_bytes;
+      memcpy((char *)staging_buf +
+                 (int64_t)run_start * chunk_size_in_bytes,
+             cpu_base + cb * cpu_block_stride_int64,
+             run_bytes);
+    } else {
+      // BLOCKFIRST: each block is at a strided position -- gather individually.
+      int64_t cb = cpu_block_ids[k];
+      memcpy((char *)staging_buf +
+                 (int64_t)k * chunk_size_in_bytes,
+             cpu_base + cb * cpu_block_stride_int64,
              chunk_size_in_bytes);
     }
     ++k;
@@ -575,20 +642,15 @@ void ce_transfer_staged_scatter(
       // ---- H2D (no ping-pong: CPU gather is too fast to benefit) ----
       // Gather all segments into buf, then H2D all, then drain.
       // `buf` is pinned to host_bufs[0] and reused every iteration.
-      int64_t *cpu_base =
-          cpu_ptr_int64 + (i + start_layer_id) * cpu_layer_stride_int64 +
-          j * cpu_kv_stride_int64 + cpu_startoff_inside_chunks_int64;
-      int64_t off = 0;
-      for (const auto &seg : analysis.segments) {
-        for (int b = 0; b < seg.run_len; ++b) {
-          int64_t cb = cpu_block_ids[seg.start_k + b];
-          int64_t *src = cpu_base + cb * cpu_block_stride_int64;
-          memcpy((char *)buf + off, src, chunk_size_in_bytes);
-          off += chunk_size_in_bytes;
-        }
-      }
+      gather_from_cpu(buf, cpu_ptr_int64,
+                      cpu_block_ids, num_blocks,
+                      cpu_block_stride_int64,
+                      cpu_startoff_inside_chunks_int64,
+                      chunk_size_in_bytes, i, j,
+                      cpu_kv_stride_int64, cpu_layer_stride_int64,
+                      start_layer_id, analysis.cpu_phys_contig);
       // H2D all segments from staging
-      off = 0;
+      int64_t off = 0;
       if (analysis.gpu_phys_contig) {
         for (const auto &seg : analysis.segments) {
           int64_t seg_size = (int64_t)seg.run_len * chunk_size_in_bytes;
@@ -865,16 +927,13 @@ void ce_transfer_gather_scatter(
                   cpu_startoff_inside_chunks_int64;
       } else {
         // gather into staging (H2D: no ping-pong, idx always 0)
-        int64_t *cpu_base = cpu_ptr_int64 +
-            (i + start_layer_id) * cpu_layer_stride_int64 +
-            j * cpu_kv_stride_int64 + cpu_startoff_inside_chunks_int64;
-        for (int k = 0; k < num_blocks; ++k) {
-          int64_t cb = cpu_block_ids[k];
-          memcpy((char *)host_buf[idx] +
-                     (int64_t)k * chunk_size_in_bytes,
-                 cpu_base + cb * cpu_block_stride_int64,
-                 chunk_size_in_bytes);
-        }
+        gather_from_cpu(host_buf[idx], cpu_ptr_int64,
+                        cpu_block_ids, num_blocks,
+                        cpu_block_stride_int64,
+                        cpu_startoff_inside_chunks_int64,
+                        chunk_size_in_bytes, i, j,
+                        cpu_kv_stride_int64, cpu_layer_stride_int64,
+                        start_layer_id, analysis.cpu_phys_contig);
         h2d_src = host_buf[idx];
       }
 

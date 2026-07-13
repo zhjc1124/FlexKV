@@ -266,4 +266,18 @@ void scatter_to_cpu(const void *staging_buf, int64_t *cpu_ptr_int64,
                     int64_t cpu_kv_stride_int64, int64_t cpu_layer_stride_int64,
                     int start_layer_id, bool cpu_phys_contig);
 
+// ============================================================================
+// gather_from_cpu: gather from strided CPU positions to contiguous staging buf.
+//   H2D symmetric counterpart of scatter_to_cpu. Same parameters and merge
+//   optimization, with src/dst swapped and const-ness adjusted.
+//   Shared by STAGED_SCATTER and GATHER_SCATTER.
+// ============================================================================
+void gather_from_cpu(void *staging_buf, const int64_t *cpu_ptr_int64,
+                     const int64_t *cpu_block_ids, int num_blocks,
+                     int64_t cpu_block_stride_int64,
+                     int64_t cpu_startoff_inside_chunks_int64,
+                     int64_t chunk_size_in_bytes, int layer_idx, int kv_idx,
+                     int64_t cpu_kv_stride_int64, int64_t cpu_layer_stride_int64,
+                     int start_layer_id, bool cpu_phys_contig);
+
 } // namespace flexkv
