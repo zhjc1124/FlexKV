@@ -741,13 +741,12 @@ def main():
                             except Exception as e:
                                 print("FAILED: {}".format(e))
 
-                    # Designated_rank rotation variant: rank0_only with
-                    # designated_rank rotating across GPUs each iteration
-                    # (4 iterations, designated_rank = iter % num_gpus).
+                    # Request-level round-robin: rank0_only with designated_rank
+                    # rotating across GPUs each iteration (designated_rank = iter % num_gpus).
                     if "MLA-rank0_only" in args.strategies:
                         cpu_layout_type = LAYOUTS[layout_name]
                         for cfg_label, path_opt in configs:
-                            dr_label = "MLA-rank0_dr-rot"
+                            dr_label = "MLA-rank_rr"
                             label = "{} | h2d={} | {} | {} | {} | {}".format(
                                 size_name, h2d_engine, engine_name, layout_name,
                                 dr_label, cfg_label)
