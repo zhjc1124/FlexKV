@@ -3,7 +3,7 @@ Microbenchmark: MLA D2H transfer modes — end-to-end round-trip, REAL FlexKV AP
 
 Measures the full offload+reload path (D2H then H2D = one round-trip) across
 the 4 transfer strategies, and — for the CE engine — proves the optimization
-progression baseline -> optimized -> optimized+ping-pong.
+progression baseline -> optimized.
 
 Compares 4 transfer strategies:
   - MHA (non-MLA):    each TP rank owns different head partition (cpu_tp_stride)
@@ -14,12 +14,12 @@ Compares 4 transfer strategies:
 Matrix:
   - Strategy:  MHA / sharded / all_write / rank0_only  (4 types)
   - Engine:    CUDA kernel / CE  (probed, unsupported skipped)
-  - CE config: baseline / opt / opt+pingpong  (CE only; kernel ignores path_opt/pingpong)
+  - CE config: baseline / opt  (CE only; kernel ignores path_opt)
   - H2D reload engine: TP-group / LayerwiseTransferGroup  (CE only, --no-layerwise)
   - Layout:    LAYERFIRST / BLOCKFIRST  (CPU side)
   - Size:      small / medium / large  (each gets its own summary)
 
-path_opt / ping-pong / segment_threshold are passed per-construction to the
+path_opt / segment_threshold are passed per-construction to the
 group ctor (NOT via env), matching production and the correctness tests.
 Uses KVCacheLayout for stride computation (same as production worker.py).
 
@@ -101,16 +101,13 @@ STRATEGIES = [
     ("MLA-rank0_only", True, "rank0_only"),
 ]
 
-# CE optimization config, as three cumulative levels. Only meaningful for the
-# CE engine (the CUDA kernel engine ignores path_opt/pingpong). Proves the
-# progression baseline -> optimized -> optimized+pingpong. ping-pong is only
-# effective with path_opt on (it needs the staging strategies), so we do NOT
-# test the meaningless baseline+pingpong combo.
-#   (label, path_opt, use_pingpong)
+# CE optimization config, as two cumulative levels. Only meaningful for the
+# CE engine (the CUDA kernel engine ignores path_opt). Proves the
+# progression baseline -> optimized.
+#   (label, path_opt)
 CE_CONFIGS = [
-    ("baseline",   False, False),   # PER_BLOCK, no optimization
-    ("opt",        True,  False),   # optimized strategies, single staging buf
-    ("opt+pingpong",     True,  True),    # optimized strategies + double-buffered
+    ("baseline",   False),   # PER_BLOCK, no optimization
+    ("opt",        True),    # optimized strategies
 ]
 
 WARMUP_ITERS = 3
@@ -243,11 +240,11 @@ def block_ids(n):
 
 
 def make_tp_group(cpu_ptr, all_gpu, num_gpus, gpu_layout, num_layers,
-                  ce_path_opt=True, ce_use_pingpong=True,
+                  ce_path_opt=True,
                   ce_segment_threshold=8):
     """TPTransferThreadGroup with CE config passed per-construction.
 
-    path_opt / pingpong / segment_threshold go into the C++ CETransferConfig
+    path_opt / segment_threshold go into the C++ CETransferConfig
     via ctor args (NOT env) — matching production and the correctness tests.
     """
     gpu_ptrs = []
@@ -265,12 +262,11 @@ def make_tp_group(cpu_ptr, all_gpu, num_gpus, gpu_layout, num_layers,
         gpu_device_ids=list(range(num_gpus)),
         enable_nvcomp=False,
         ce_segment_threshold=ce_segment_threshold,
-        ce_use_pingpong=ce_use_pingpong,
         ce_path_opt=ce_path_opt)
 
 
 def make_layerwise_group(cpu_kv_tensor, all_gpu, num_gpus, gpu_layout,
-                         num_layers, ce_path_opt=True, ce_use_pingpong=True,
+                         num_layers, ce_path_opt=True,
                          ce_segment_threshold=8):
     """LayerwiseTransferGroup (H2D reload engine) with CE config per-ctor.
 
@@ -303,7 +299,6 @@ def make_layerwise_group(cpu_kv_tensor, all_gpu, num_gpus, gpu_layout,
         indexer_gpu_chunk_sizes_tensor=empty_tensor,
         indexer_ssd_files={},
         ce_segment_threshold=ce_segment_threshold,
-        ce_use_pingpong=ce_use_pingpong,
         ce_path_opt=ce_path_opt)
 
 
@@ -313,7 +308,7 @@ def layerwise_h2d(lw_group, ids, cpu_kv_sb, cpu_ly_sb, cpu_bl_sb, cpu_tp_sb,
 
     use_ce controls whether the internal transfer_kv_blocks uses CE
     (cudaMemcpyAsync) or the CUDA kernel path. LayerwiseTransferGroup supports
-    both — the CE engine benefits from path_opt/ping-pong staging; the kernel
+    both — the CE engine benefits from path_opt staging; the kernel
     engine is the same grid-stride loop as TP-group H2D but driven per-layer
     by the layerwise pipeline.
     Every trailing optional param is passed explicitly (pybind11-construct-debug).
@@ -364,7 +359,7 @@ def sync_all(num_gpus):
 
 def bench_one(strategy_label, is_mla, mode, use_ce, cpu_layout_type,
               num_gpus, num_layers, num_blocks, head_dim, iters,
-              ce_path_opt=True, ce_use_pingpong=True, ce_segment_threshold=8,
+              ce_path_opt=True, ce_segment_threshold=8,
               h2d_engine="tp"):
     """Run one benchmark configuration: full D2H+H2D round-trip.
 
@@ -373,7 +368,7 @@ def bench_one(strategy_label, is_mla, mode, use_ce, cpu_layout_type,
     The H2D leg uses either the TP-group (h2d_engine="tp") or the production
     LayerwiseTransferGroup reload engine (h2d_engine="layerwise", CE-only).
 
-    ce_path_opt / ce_use_pingpong / ce_segment_threshold are passed per-ctor to
+    ce_path_opt / ce_segment_threshold are passed per-ctor to
     both groups (they only affect the CE engine). Returns round-trip timing.
     """
     kv_dim = 1 if is_mla else 2
@@ -391,7 +386,6 @@ def bench_one(strategy_label, is_mla, mode, use_ce, cpu_layout_type,
                              is_mla, num_gpus)
     tp = make_tp_group(cpu_kv.data_ptr(), all_gpu, num_gpus, gpu_layout,
                        num_layers, ce_path_opt=ce_path_opt,
-                       ce_use_pingpong=ce_use_pingpong,
                        ce_segment_threshold=ce_segment_threshold)
 
     use_layerwise = (h2d_engine == "layerwise")
@@ -400,7 +394,6 @@ def bench_one(strategy_label, is_mla, mode, use_ce, cpu_layout_type,
     if use_layerwise:
         lw = make_layerwise_group(cpu_kv, all_gpu, num_gpus, gpu_layout,
                                   num_layers, ce_path_opt=ce_path_opt,
-                                  ce_use_pingpong=ce_use_pingpong,
                                   ce_segment_threshold=ce_segment_threshold)
 
     gpu_ids = block_ids(num_blocks)
@@ -499,8 +492,8 @@ def print_results_table(results):
         sep = "-" * len(hdr)
         print("  " + hdr)
         print("  " + sep)
-        # Sort: layout, strategy, engine (CUDA before CE), config (baseline/opt/opt+pingpong/n/a)
-        cfg_order = {"baseline": 0, "opt": 1, "opt+pingpong": 2, "n/a": 3}
+        # Sort: layout, strategy, engine (CUDA before CE), config (baseline/opt/n/a)
+        cfg_order = {"baseline": 0, "opt": 1, "n/a": 2}
         rows_sorted = sorted(rows, key=lambda r: (
             r["layout"], r["strategy"], 0 if r["engine"] == "CUDA" else 1,
             cfg_order.get(r.get("config", "n/a"), 9)))
@@ -516,15 +509,15 @@ def print_results_table(results):
 
 
 def print_analysis(results):
-    """Prove the CE optimization progression baseline -> opt -> opt+pingpong.
+    """Prove the CE optimization progression baseline -> opt.
 
     Organized as (size, h2d_engine) two-dimensional blocks: within each block,
-    every (layout, strategy) combination shows baseline / opt / opt+pingpong
+    every (layout, strategy) combination shows baseline / opt
     side by side with speedup vs baseline and the fastest marked. A global
-    verdict tallies how often opt+pingpong wins across all blocks.
+    verdict tallies how often opt wins across all blocks.
     """
     print("\n" + "=" * 96)
-    print("CE optimization analysis (D2H+H2D round-trip): baseline vs opt vs opt+pingpong")
+    print("CE optimization analysis (D2H+H2D round-trip): baseline vs opt")
     print("  two-dimensional primary axis: (size, h2d_engine)")
     print("=" * 96)
 
@@ -541,17 +534,17 @@ def print_analysis(results):
     for r in ce_results:
         groups[gkey(r)][r.get("config", "-")] = r["avg_ms"]
 
-    opt_pingpong_wins = 0
-    opt_pingpong_total = 0
+    opt_wins = 0
+    opt_total = 0
 
     # Outer loop: (size, h2d) blocks
     block_keys = sorted(set((k[0], k[1]) for k in groups.keys()))
     for (size, h2d) in block_keys:
         print("\n  === size={} | h2d={} ===".format(size, h2d))
-        print("  {:<7} {:<16} {:>10} {:>10} {:>10}  {}".format(
-            "layout", "strategy", "baseline", "opt", "opt+pingpong",
-            "opt+pingpong vs base"))
-        print("  " + "-" * 78)
+        print("  {:<7} {:<16} {:>10} {:>10}  {}".format(
+            "layout", "strategy", "baseline", "opt",
+            "opt vs base"))
+        print("  " + "-" * 68)
         # Inner: (layout, strategy) rows within this block
         block_groups = {k: v for k, v in groups.items()
                         if k[0] == size and k[1] == h2d}
@@ -560,8 +553,7 @@ def print_analysis(results):
             cfgs = groups[key]
             base = cfgs.get("baseline")
             opt = cfgs.get("opt")
-            opt_pingpong = cfgs.get("opt+pingpong")
-            fastest = min((v for v in (base, opt, opt_pingpong) if v is not None),
+            fastest = min((v for v in (base, opt) if v is not None),
                           default=None)
 
             def fmt(v):
@@ -571,30 +563,30 @@ def print_analysis(results):
                 return "{:>9.3f}{}".format(v, star)
 
             speedup = ""
-            if base and opt_pingpong:
-                speedup = "{:.2f}x".format(base / opt_pingpong)
-                opt_pingpong_total += 1
-                if opt_pingpong == fastest:
-                    opt_pingpong_wins += 1
+            if base and opt:
+                speedup = "{:.2f}x".format(base / opt)
+                opt_total += 1
+                if opt == fastest:
+                    opt_wins += 1
 
-            print("  {:<7} {:<16} {} {} {}  {:>10}".format(
-                layout, strat, fmt(base), fmt(opt), fmt(opt_pingpong), speedup))
+            print("  {:<7} {:<16} {} {}  {:>10}".format(
+                layout, strat, fmt(base), fmt(opt), speedup))
 
     # --- Global verdict ---
-    print("\n  " + "-" * 78)
-    if opt_pingpong_total:
-        print("  opt+pingpong was the fastest config in {}/{} CE groups ({:.0f}%).".format(
-            opt_pingpong_wins, opt_pingpong_total, 100.0 * opt_pingpong_wins / opt_pingpong_total))
-        if opt_pingpong_wins == opt_pingpong_total:
-            print("  => optimized paths + ping-pong is uniformly the best CE config.")
+    print("\n  " + "-" * 68)
+    if opt_total:
+        print("  opt was the fastest config in {}/{} CE groups ({:.0f}%).".format(
+            opt_wins, opt_total, 100.0 * opt_wins / opt_total))
+        if opt_wins == opt_total:
+            print("  => optimized paths are uniformly the best CE config.")
         else:
-            print("  => optimized paths + ping-pong wins in most cases; inspect the "
+            print("  => optimized paths win in most cases; inspect the "
                   "groups above where it does not (usually tiny transfers where "
-                  "staging/pingpong overhead dominates).")
+                  "staging overhead dominates).")
 
     # --- Fastest overall per (size, strategy), across layout+config+h2d ---
     print("\n  Fastest CE config per (size, strategy):")
-    print("  " + "-" * 78)
+    print("  " + "-" * 68)
     per = defaultdict(list)
     for r in ce_results:
         per[(r["size"], r["strategy"])].append(r)
@@ -696,14 +688,14 @@ def main():
         for h2d_engine in h2d_engines_all:
             print("\n  >>> h2d_engine = {} <<<".format(h2d_engine))
             for engine_name, use_ce in engines:
-                # path_opt / pingpong only matter for the CE engine. For the
+                # path_opt only matters for the CE engine. For the
                 # CUDA kernel engine, run a single "n/a" config (ignored).
-                configs = CE_CONFIGS if use_ce else [("n/a", True, True)]
+                configs = CE_CONFIGS if use_ce else [("n/a", True)]
 
                 for layout_name in args.layouts:
                     for strat_label, is_mla, mode in active_strategies:
                         cpu_layout_type = LAYOUTS[layout_name]
-                        for cfg_label, path_opt, pingpong in configs:
+                        for cfg_label, path_opt in configs:
                             label = "{} | h2d={} | {} | {} | {} | {}".format(
                                 size_name, h2d_engine, engine_name, layout_name,
                                 strat_label, cfg_label)
@@ -715,7 +707,6 @@ def main():
                                     cpu_layout_type, num_gpus, num_layers,
                                     num_blocks, head_dim, args.iters,
                                     ce_path_opt=path_opt,
-                                    ce_use_pingpong=pingpong,
                                     ce_segment_threshold=args.segment_threshold,
                                     h2d_engine=h2d_engine)
                                 r.update({

@@ -259,11 +259,11 @@ def make_pattern_with_segments(num_blocks, num_segments):
 
 
 def make_tp_group(cpu_ptr, all_gpu, num_gpus, gpu_layout, num_layers,
-                  ce_path_opt=True, ce_use_pingpong=True,
+                  ce_path_opt=True,
                   ce_segment_threshold=8):
     """TPTransferThreadGroup with CE config passed per-construction.
 
-    path_opt / pingpong / segment_threshold go into the C++ CETransferConfig
+    path_opt / segment_threshold go into the C++ CETransferConfig
     via ctor args (NOT env) — matching production and the correctness tests.
     """
     gpu_ptrs = []
@@ -281,7 +281,6 @@ def make_tp_group(cpu_ptr, all_gpu, num_gpus, gpu_layout, num_layers,
         gpu_device_ids=list(range(num_gpus)),
         enable_nvcomp=False,
         ce_segment_threshold=ce_segment_threshold,
-        ce_use_pingpong=ce_use_pingpong,
         ce_path_opt=ce_path_opt)
 
 
@@ -298,7 +297,7 @@ def bench_threshold(cpu_layout_type, num_gpus, num_layers, num_blocks, head_dim,
                     iters, ce_segment_threshold, num_segments):
     """One (threshold, seg_count) point: median D2H+H2D round-trip time (ms).
 
-    Uses CE with path_opt=True, pingpong=True (the optimized path where the
+    Uses CE with path_opt=True (the optimized path where the
     STAGED/GATHER crossover — i.e. segment_threshold — actually matters).
     The block-id pattern is built with EXACTLY num_segments contiguous runs so
     the engine's choose_path() sees that segment count.
@@ -319,7 +318,7 @@ def bench_threshold(cpu_layout_type, num_gpus, num_layers, num_blocks, head_dim,
     cpu_kv = make_cpu_tensor(cpu_layout, num_layers, total_blocks, head_dim,
                              is_mla, num_gpus)
     tp = make_tp_group(cpu_kv.data_ptr(), all_gpu, num_gpus, gpu_layout,
-                       num_layers, ce_path_opt=True, ce_use_pingpong=True,
+                       num_layers, ce_path_opt=True,
                        ce_segment_threshold=ce_segment_threshold)
 
     # Same pattern for gpu and cpu side; num_segments controls the crossover.

@@ -158,7 +158,6 @@ def main():
         gpu_device_ids=list(range(num_gpus)),
         enable_nvcomp=False,
         ce_segment_threshold=threshold,
-        ce_use_pingpong=True,
         ce_path_opt=True,
         ce_force_path=3)  # 3 = GATHER_SCATTER
 

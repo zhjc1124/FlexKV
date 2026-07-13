@@ -2,8 +2,8 @@
 Microbenchmark: CE transfer strategy comparison (five execution forms).
 
 Drives the C++ CE engine through each of its FIVE execution forms and compares
-three cumulative CE configs on every form, proving the optimization progression
-baseline -> optimized -> optimized+ping-pong per form.
+two cumulative CE configs on every form, proving the optimization progression
+baseline -> optimized per form.
 
 The five CE execution forms (see csrc/ce_transfer.h CEPath / CEStagedVariant):
   - BULK_CONTIG       single large memcpy (contiguous ids, dst phys contiguous)
@@ -17,13 +17,11 @@ direction). STAGED_PER_BLOCK only appears on the sharded-D2H leg (the only
 src_phys=False path); every other form is exercised H2D with rank0_only
 (only rank 0 performs the transfer; non-rank0 GPUs idle in D2H, all read in H2D).
 
-Three cumulative CE configs (ping-pong only meaningful with path_opt on, so the
-meaningless baseline+pingpong combo is not tested):
+Two cumulative CE configs:
   - baseline : path_opt off  -> C++ runs PER_BLOCK
   - opt      : path_opt on
-  - opt+pingpong   : path_opt on + ping-pong (double-buffered staging)
 
-path_opt / ping-pong / segment_threshold are passed per-construction to the
+path_opt / segment_threshold are passed per-construction to the
 group ctor (NOT via env), matching production and the correctness tests.
 
 Usage:
@@ -149,13 +147,13 @@ def make_cpu_tensor_strat(cpu_layout, num_layers, total_blocks, head_dim,
 
 
 def make_tp_group(cpu_ptr, all_gpu, num_gpus, gpu_layout, num_layers,
-                  ce_path_opt=True, ce_use_pingpong=True,
+                  ce_path_opt=True,
                   ce_segment_threshold=8, ce_force_path=-1):
     """TPTransferThreadGroup with CE config passed per-construction.
 
     ce_force_path: test/benchmark only. -1 = auto (choose_path); 0-3 = force
     a specific CEPath. Production never sets it.
-    path_opt / pingpong / segment_threshold go into the C++ CETransferConfig
+    path_opt / segment_threshold go into the C++ CETransferConfig
     via ctor args (NOT env) -- matching production and the correctness tests.
     """
     gpu_ptrs = []
@@ -173,7 +171,6 @@ def make_tp_group(cpu_ptr, all_gpu, num_gpus, gpu_layout, num_layers,
         gpu_device_ids=list(range(num_gpus)),
         enable_nvcomp=False,
         ce_segment_threshold=ce_segment_threshold,
-        ce_use_pingpong=ce_use_pingpong,
         ce_path_opt=ce_path_opt,
         ce_force_path=ce_force_path)
 
@@ -301,12 +298,11 @@ PATH_FORMS = [
      [(2, "STAGED_SCATTER"), (3, "GATHER_SCATTER")]),
 ]
 
-# Three cumulative CE configs (ping-pong only meaningful with path_opt on).
-#   (label, path_opt, use_pingpong)
+# Two cumulative CE configs.
+#   (label, path_opt)
 PATH_CONFIGS = [
-    ("baseline", False, False),   # C++ runs PER_BLOCK
-    ("opt",      True,  False),
-    ("opt+pingpong",   True,  True),
+    ("baseline", False),   # C++ runs PER_BLOCK
+    ("opt",      True),
 ]
 
 # All 4 CEPaths for Part 2's uniform column layout (not all viable for every
@@ -328,7 +324,7 @@ def run_strategy_compare(args):
     cta = 16
 
     print("=" * 96)
-    print("  CE Strategy Comparison: 5 forms x 2 dirs x 3 configs + force-path")
+    print("  CE Strategy Comparison: 5 forms x 2 dirs x 2 configs + force-path")
     print("=" * 96)
     print("  GPUs:        {}".format(num_gpus))
     print("  Sizes:       {}".format(args.sizes))
@@ -377,14 +373,14 @@ def run_strategy_compare(args):
                 print("\n-- Form: {} | pattern={} | layout={} | mode={} | dir={} --".format(
                     form_name, pattern, layout_key, mode, dir_name))
 
-                # Step 1: three CE configs (baseline / opt / opt+pingpong)
-                for cfg_label, path_opt, pingpong in PATH_CONFIGS:
+                # Step 1: two CE configs (baseline / opt)
+                for cfg_label, path_opt in PATH_CONFIGS:
                     print("  {} ...".format(cfg_label), end=" ", flush=True)
                     try:
                         tp = make_tp_group(
                             cpu_kv.data_ptr(), all_gpu, num_gpus, gpu_layout,
                             num_layers, ce_path_opt=path_opt,
-                            ce_use_pingpong=pingpong, ce_segment_threshold=threshold)
+                            ce_segment_threshold=threshold)
                         med = bench_one_dir(
                             tp, ids, cpu_kv_sb, cpu_ly_sb, cpu_bl_sb, cpu_tp_sb,
                             num_layers, is_h2d, num_gpus, args.iters, is_mla, mode,
@@ -395,7 +391,7 @@ def run_strategy_compare(args):
                     except Exception as e:
                         print("FAILED: {}".format(e))
 
-                # Step 2: force each viable path (under opt+pingpong)
+                # Step 2: force each viable path (under opt)
                 for fp_id, fp_name in viable:
                     label = "force_" + fp_name
                     print("  {} ...".format(label), end=" ", flush=True)
@@ -403,7 +399,7 @@ def run_strategy_compare(args):
                         tp = make_tp_group(
                             cpu_kv.data_ptr(), all_gpu, num_gpus, gpu_layout,
                             num_layers, ce_path_opt=True,
-                            ce_use_pingpong=True, ce_segment_threshold=threshold,
+                            ce_segment_threshold=threshold,
                             ce_force_path=fp_id)
                         med = bench_one_dir(
                             tp, ids, cpu_kv_sb, cpu_ly_sb, cpu_bl_sb, cpu_tp_sb,
@@ -435,11 +431,11 @@ def run_strategy_compare(args):
             for is_h2d in dirs:
                 run_rows.append((form_name, "H2D" if is_h2d else "D2H", viable))
 
-        # -- Part 1: baseline vs opt vs opt+pingpong ---------------------------
-        print("\n  Part 1: Optimization Config (baseline / opt / opt+pingpong)")
-        print("  '*' = fastest of the 3 for each row.")
-        hdr = "{:>18s}  {:>4s}  {:>12s}  {:>12s}  {:>12s}  {:>12s}".format(
-            "Form", "Dir", "baseline", "opt", "opt+pp", "base/opt+pp")
+        # -- Part 1: baseline vs opt ------------------------------------------
+        print("\n  Part 1: Optimization Config (baseline / opt)")
+        print("  '*' = fastest of the 2 for each row.")
+        hdr = "{:>18s}  {:>4s}  {:>12s}  {:>12s}  {:>12s}".format(
+            "Form", "Dir", "baseline", "opt", "base/opt")
         print("  " + hdr)
         print("  " + "-" * len(hdr))
 
@@ -447,8 +443,7 @@ def run_strategy_compare(args):
             cfgs = results.get((form_name, dir_name), {})
             base = cfgs.get("baseline")
             opt = cfgs.get("opt")
-            opt_pp = cfgs.get("opt+pingpong")
-            fastest = min((v for v in (base, opt, opt_pp) if v is not None),
+            fastest = min((v for v in (base, opt) if v is not None),
                           default=None)
 
             def fmt(v):
@@ -458,13 +453,13 @@ def run_strategy_compare(args):
                 return "{:>11.3f}{}".format(v, star)
 
             speedup = "-"
-            if base and opt_pp and opt_pp > 0:
-                speedup = "{:.2f}x".format(base / opt_pp)
-            print("  {:>18s}  {:>4s}  {}  {}  {}  {:>12s}".format(
-                form_name, dir_name, fmt(base), fmt(opt), fmt(opt_pp), speedup))
+            if base and opt and opt > 0:
+                speedup = "{:.2f}x".format(base / opt)
+            print("  {:>18s}  {:>4s}  {}  {}  {:>12s}".format(
+                form_name, dir_name, fmt(base), fmt(opt), speedup))
 
         # -- Part 2: force-path head-to-head ----------------------------------
-        print("\n  Part 2: Force-Path Head-to-Head (all under opt+pingpong)")
+        print("\n  Part 2: Force-Path Head-to-Head (all under opt)")
         print("  'auto' = choose_path pick. '*' = fastest. Proves optimality.")
         col_w = 16
         hdr2 = "  {:>18s}  {:>4s}  {:>{w}s}".format("Form", "Dir", "auto", w=col_w)
@@ -477,7 +472,7 @@ def run_strategy_compare(args):
         auto_total = 0
         for form_name, dir_name, viable in run_rows:
             cfgs = results.get((form_name, dir_name), {})
-            auto = cfgs.get("opt+pingpong")
+            auto = cfgs.get("opt")
             viable_names = {pn for _, pn in viable}
             forced_dict = {}
             for fp_id, fp_name in ALL_FORCE_PATHS:
@@ -519,7 +514,7 @@ def run_strategy_compare(args):
 def main():
     parser = argparse.ArgumentParser(
         description="Microbenchmark CE transfer strategy comparison "
-                    "(5 forms x 3 configs + force-path head-to-head)")
+                    "(5 forms x 2 configs + force-path head-to-head)")
     parser.add_argument("--num-gpus", type=int, default=0,
                         help="Number of GPUs (0 = all available, default: 0)")
     parser.add_argument("--iters", type=int, default=20,

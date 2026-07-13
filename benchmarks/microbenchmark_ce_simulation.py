@@ -7,11 +7,10 @@ permutation of range(num_blocks) — the segment count naturally varies from 1
 (fully contiguous) to N (fully scattered). This simulates real inference
 workloads where KV cache block IDs have unpredictable fragmentation.
 
-For each round, 4 configs are timed SEPARATELY for D2H and H2D:
+For each round, 3 configs are timed SEPARATELY for D2H and H2D:
   - kernel   : CUDA kernel transfer (use_ce=False)
   - baseline : CE with path_opt off (PER_BLOCK)
   - opt      : CE with path_opt on (choose_path auto-select)
-  - opt+pp   : CE with path_opt + ping-pong
 
 D2H and H2D are timed independently with CUDA events, and the round-trip
 (D2H + H2D) total is also reported. The output groups results by (size,
@@ -87,10 +86,9 @@ STRATEGIES = [
 ]
 
 CE_CONFIGS = [
-    ("kernel",   False, False, False),  # use_ce, path_opt, pingpong
-    ("baseline", True,  False, False),
-    ("opt",      True,  True,  False),
-    ("opt+pp",   True,  True,  True),
+    ("kernel",   False, False),  # use_ce, path_opt
+    ("baseline", True,  False),
+    ("opt",      True,  True),
 ]
 
 
@@ -150,7 +148,7 @@ def make_cpu_tensor(cpu_layout, num_layers, total_blocks, head_dim, is_mla, num_
 
 
 def make_tp_group(cpu_ptr, all_gpu, num_gpus, gpu_layout, num_layers,
-                  ce_path_opt=True, ce_use_pingpong=True, ce_segment_threshold=8):
+                  ce_path_opt=True, ce_segment_threshold=8):
     gpu_ptrs = []
     for g in range(num_gpus):
         for l in range(num_layers):
@@ -166,7 +164,6 @@ def make_tp_group(cpu_ptr, all_gpu, num_gpus, gpu_layout, num_layers,
         gpu_device_ids=list(range(num_gpus)),
         enable_nvcomp=False,
         ce_segment_threshold=ce_segment_threshold,
-        ce_use_pingpong=ce_use_pingpong,
         ce_path_opt=ce_path_opt)
 
 
@@ -426,11 +423,10 @@ def run_simulation(args):
 
                     # Run all 4 configs for this round's ids
                     round_times = {}
-                    for cfg_label, use_ce, path_opt, pingpong in CE_CONFIGS:
+                    for cfg_label, use_ce, path_opt in CE_CONFIGS:
                         tp = make_tp_group(
                             cpu_kv.data_ptr(), all_gpu, num_gpus, gpu_layout,
                             num_layers, ce_path_opt=path_opt,
-                            ce_use_pingpong=pingpong,
                             ce_segment_threshold=threshold)
 
                         try:
@@ -460,7 +456,7 @@ def run_simulation(args):
                     # Print this round
                     seg_str = "blk={:>5d} seg={:>5d}".format(batch_size, actual_seg)
                     parts = []
-                    for cfg_label, _, _, _ in CE_CONFIGS:
+                    for cfg_label, _, _ in CE_CONFIGS:
                         t = round_times.get(cfg_label, {})
                         d2h = t.get("d2h")
                         h2d = t.get("h2d")
@@ -502,7 +498,7 @@ def run_simulation(args):
         base_h2d = _median(all_results[combo].get("baseline", {}).get("h2d", []))
         base_rt = _median(all_results[combo].get("baseline", {}).get("rt", []))
 
-        for cfg_label, _, _, _ in CE_CONFIGS:
+        for cfg_label, _, _ in CE_CONFIGS:
             d2h = _median(all_results[combo][cfg_label]["d2h"])
             h2d = _median(all_results[combo][cfg_label]["h2d"])
             rt = _median(all_results[combo][cfg_label]["rt"])

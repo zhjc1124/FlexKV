@@ -267,7 +267,6 @@ def expected_val(gpu_id, layer, block, token, hd, kv_dim_idx=0):
 
 def make_tp_group(cpu_ptr, all_gpu, num_gpus, gpu_layout, num_layers,
                   ce_segment_threshold=None,
-                  ce_use_pingpong=None,
                   ce_path_opt=None):
     """Create TPTransferThreadGroup with strides from KVCacheLayout.
 
@@ -279,8 +278,6 @@ def make_tp_group(cpu_ptr, all_gpu, num_gpus, gpu_layout, num_layers,
     """
     if ce_segment_threshold is None:
         ce_segment_threshold = GLOBAL_CONFIG_FROM_ENV.transfer_segment_threshold
-    if ce_use_pingpong is None:
-        ce_use_pingpong = GLOBAL_CONFIG_FROM_ENV.transfer_pingpong
     if ce_path_opt is None:
         ce_path_opt = GLOBAL_CONFIG_FROM_ENV.transfer_path_opt
     gpu_ptrs = []
@@ -302,14 +299,12 @@ def make_tp_group(cpu_ptr, all_gpu, num_gpus, gpu_layout, num_layers,
         nvcomp_batch_size=0,
         nvcomp_data_type=0,
         ce_segment_threshold=ce_segment_threshold,
-        ce_use_pingpong=ce_use_pingpong,
         ce_path_opt=ce_path_opt,
     )
 
 
 def make_layerwise_group(cpu_ptr_unused, all_gpu, num_gpus, gpu_layout, num_layers,
                          ce_segment_threshold=None,
-                         ce_use_pingpong=None,
                          ce_path_opt=None,
                          layer_eventfds_tensor=None):
     """Create LayerwiseTransferGroup for H2D-only testing (no SSD).
@@ -323,8 +318,6 @@ def make_layerwise_group(cpu_ptr_unused, all_gpu, num_gpus, gpu_layout, num_laye
     """
     if ce_segment_threshold is None:
         ce_segment_threshold = GLOBAL_CONFIG_FROM_ENV.transfer_segment_threshold
-    if ce_use_pingpong is None:
-        ce_use_pingpong = GLOBAL_CONFIG_FROM_ENV.transfer_pingpong
     if ce_path_opt is None:
         ce_path_opt = GLOBAL_CONFIG_FROM_ENV.transfer_path_opt
     if layer_eventfds_tensor is None:
@@ -334,7 +327,7 @@ def make_layerwise_group(cpu_ptr_unused, all_gpu, num_gpus, gpu_layout, num_laye
 
     # NOTE: the C++ LayerwiseTransferGroup ctor has the indexer_* params
     # (with torch::Tensor()/empty-container defaults) sitting BEFORE the
-    # non-defaulted ce_segment_threshold/ce_use_pingpong/ce_path_opt. When a
+    # non-defaulted ce_segment_threshold/ce_path_opt. When a
     # caller omits the indexer_* args, pybind11 fails to synthesize their
     # defaults and rejects the whole call ("incompatible constructor
     # arguments"). Pass every trailing param explicitly (empty tensors / {})
@@ -362,7 +355,6 @@ def make_layerwise_group(cpu_ptr_unused, all_gpu, num_gpus, gpu_layout, num_laye
         indexer_gpu_chunk_sizes_tensor=empty_tensor,
         indexer_ssd_files={},
         ce_segment_threshold=ce_segment_threshold,
-        ce_use_pingpong=ce_use_pingpong,
         ce_path_opt=ce_path_opt,
     )
 
@@ -371,7 +363,7 @@ def layerwise_h2d_readback(all_gpu, cpu_kv, num_gpus, gpu_layout, num_layers,
                            ids, cpu_stride_kv, cpu_stride_layer,
                            cpu_stride_block, cpu_stride_tp, chunk_size,
                            is_mla, mode, ce_path_opt=None,
-                           ce_use_pingpong=None, ce_segment_threshold=None,
+                           ce_segment_threshold=None,
                            notify_mode="hostfunc", layer_granularity=None):
     """Run a single CE H2D via LayerwiseTransferGroup, reading `cpu_kv` back
     into `all_gpu` with block-id list `ids`.
@@ -385,12 +377,11 @@ def layerwise_h2d_readback(all_gpu, cpu_kv, num_gpus, gpu_layout, num_layers,
     notify_mode: "hostfunc" (default, uses CUDA hostfunc callback) or
     "polling" (uses a CPU polling thread that queries cudaEventQuery per
     batch).  Polling mode exercises the async GATHER_SCATTER/STAGED_SCATTER
-    ping-pong path (sync=false) that was previously deadlocked.
+    path (sync=false) that was previously deadlocked.
     """
     lw_group = make_layerwise_group(cpu_kv, all_gpu, num_gpus,
                                     gpu_layout, num_layers,
                                     ce_path_opt=ce_path_opt,
-                                    ce_use_pingpong=ce_use_pingpong,
                                     ce_segment_threshold=ce_segment_threshold)
     empty_ids = torch.empty(0, dtype=torch.int64).pin_memory()
     empty_indexer = torch.Tensor()
@@ -943,11 +934,10 @@ def test_invalid_mode_fallback():
 # Coverage of the four optimized strategies + the two STAGED_SCATTER variants
 # is asserted by test_ce_strategy_coverage below (via _expected_strategy).
 #
-# Both ce_path_opt (baseline vs optimized) and ce_use_pingpong (double-buffered
-# staging on/off) are per-construction CETransferConfig fields (bindings.cpp
-# sets cfg.path_opt_enabled / cfg.use_pingpong from the ctor args), NOT env-
-# cached statics -- so we sweep both as ordinary orthogonal parametrize
-# dimensions in-process.
+# ce_path_opt (baseline vs optimized) is a per-construction CETransferConfig
+# field (bindings.cpp sets cfg.path_opt_enabled from the ctor arg), NOT env-
+# cached static -- so we sweep it as an ordinary orthogonal parametrize
+# dimension in-process.
 # ---------------------------------------------------------------------------
 
 # Combined (data_config, is_mla, mode) parametrization.
@@ -1083,12 +1073,11 @@ def _expected_strategy(pattern_name, cpu_layout_name, is_mla, mode,
 @pytest.mark.parametrize("data_config,is_mla,mode", CE_MODE_CONFIGS)
 @pytest.mark.parametrize("cpu_layout_name", CPU_LAYOUTS)
 @pytest.mark.parametrize("pattern", CE_PATTERNS)
-@pytest.mark.parametrize("use_pingpong", [False, True], ids=["pingpong_off", "pingpong_on"])
 @pytest.mark.parametrize("segment_threshold", CE_SEGMENT_THRESHOLDS,
                          ids=lambda t: "thr{}".format(t))
 @pytest.mark.parametrize("path_opt", [False, True], ids=["baseline", "optimized"])
 def test_ce_paths_roundtrip(data_config, is_mla, cpu_layout_name, pattern,
-                            path_opt, use_pingpong, mode, segment_threshold):
+                            path_opt, mode, segment_threshold):
     """CE strategy round-trip correctness via block-id patterns.
 
     Combos come from CE_MODE_CONFIGS: MLA sizes x {sharded, all_write,
@@ -1100,11 +1089,6 @@ def test_ce_paths_roundtrip(data_config, is_mla, cpu_layout_name, pattern,
                     STAGED_SCATTER per-block (sharded D2H)
     (STAGED_SCATTER picks STAGED_CONTIG_RUN vs STAGED_PER_BLOCK internally by
     src_phys_contig; see _expected_strategy and test_ce_strategy_coverage.)
-
-    ping-pong (double-buffered staging) is orthogonal: it only affects the
-    staging strategies (STAGED_SCATTER / GATHER_SCATTER), but we sweep both
-    on/off across every pattern, layout, mode and path_opt to guarantee
-    correctness is independent of it.
     """
     skip_if_engine_unsupported(use_ce=True)
     num_layers, num_blocks, tpb, num_heads, head_dim = data_config
@@ -1140,7 +1124,6 @@ def test_ce_paths_roundtrip(data_config, is_mla, cpu_layout_name, pattern,
     cpu_kv = make_cpu_tensor(cpu_layout, num_layers, total_cpu_blocks)
     tp = make_tp_group(cpu_kv.data_ptr(), all_gpu, num_gpus,
                        gpu_layout, num_layers, ce_path_opt=path_opt,
-                       ce_use_pingpong=use_pingpong,
                        ce_segment_threshold=segment_threshold)
 
     ids = make_block_id_pattern(pattern, num_blocks)
@@ -1202,14 +1185,13 @@ def test_ce_paths_roundtrip(data_config, is_mla, cpu_layout_name, pattern,
 @pytest.mark.parametrize("data_config,is_mla,mode", CE_MODE_CONFIGS)
 @pytest.mark.parametrize("cpu_layout_name", CPU_LAYOUTS)
 @pytest.mark.parametrize("pattern", CE_PATTERNS)
-@pytest.mark.parametrize("use_pingpong", [False, True], ids=["pingpong_off", "pingpong_on"])
 @pytest.mark.parametrize("segment_threshold", CE_SEGMENT_THRESHOLDS,
                          ids=lambda t: "thr{}".format(t))
 @pytest.mark.parametrize("path_opt", [False, True], ids=["baseline", "optimized"])
 @pytest.mark.parametrize("notify_mode", ["polling"], ids=["polling"])
 @pytest.mark.parametrize("layer_granularity", [1, None], ids=["lg1", "lg_all"])
 def test_ce_paths_layerwise_h2d(data_config, is_mla, cpu_layout_name, pattern,
-                                path_opt, use_pingpong, mode, segment_threshold,
+                                path_opt, mode, segment_threshold,
                                 notify_mode, layer_granularity):
     """CE strategy correctness for LayerwiseTransferGroup H2D.
 
@@ -1222,7 +1204,7 @@ def test_ce_paths_layerwise_h2d(data_config, is_mla, cpu_layout_name, pattern,
     rank0_only} plus non-MLA sizes once (mode is a don't-care for MHA).
 
     notify_mode="polling" exercises the async GATHER_SCATTER/STAGED_SCATTER
-    ping-pong path (sync=false), which was previously deadlocked by internal
+    path (sync=false), which was previously deadlocked by internal
     cudaStreamSynchronize. hostfunc mode is already covered by the default
     in other layerwise tests, so we only sweep polling here to avoid doubling
     the test count.
@@ -1286,15 +1268,14 @@ def test_ce_paths_layerwise_h2d(data_config, is_mla, cpu_layout_name, pattern,
 
     # Step 2: H2D via LayerwiseTransferGroup (test target). path_opt selects
     # baseline (PER_BLOCK) vs optimized (BULK_CONTIG / SEGMENTED_DIRECT /
-    # STAGED_SCATTER / GATHER_SCATTER) on the H2D path;
-    # use_pingpong toggles double-buffered staging on the optimized paths.
+    # STAGED_SCATTER / GATHER_SCATTER) on the H2D path.
     # (Step 1 above intentionally keeps default config -- it only prepares the
     # reference CPU data, the swept dims apply to this H2D test target.)
     layerwise_h2d_readback(
         all_gpu, cpu_kv, num_gpus, gpu_layout, num_layers, ids,
         cpu_stride_kv, cpu_stride_layer, cpu_stride_block, cpu_stride_tp,
         chunk_size, is_mla, mode,
-        ce_path_opt=path_opt, ce_use_pingpong=use_pingpong,
+        ce_path_opt=path_opt,
         ce_segment_threshold=segment_threshold, notify_mode=notify_mode,
         layer_granularity=layer_granularity)
 
