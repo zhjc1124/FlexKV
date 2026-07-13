@@ -268,11 +268,12 @@ def expected_val(gpu_id, layer, block, token, hd, kv_dim_idx=0):
 def make_tp_group(cpu_ptr, all_gpu, num_gpus, gpu_layout, num_layers,
                   ce_segment_threshold=None,
                   ce_path_opt=None,
-                  ce_sharded_memcpy2d=None,
-                  ce_is_blockfirst=None):
+                  ce_enable_memcpy2d=None,
+                  ce_is_blockfirst=None,
+                  ce_is_mla=None):
     """Create TPTransferThreadGroup with strides from KVCacheLayout.
 
-    Matches production worker.py:472 exactly — chunk_size does NOT include kv_dim.
+    Matches production worker.py:472 exactly -- chunk_size does NOT include kv_dim.
     The C++ kernel iterates num_chunks = num_layers * kv_dim * num_blocks and
     copies chunk_size bytes per chunk, so kv_dim is a separate iteration axis.
 
@@ -282,10 +283,12 @@ def make_tp_group(cpu_ptr, all_gpu, num_gpus, gpu_layout, num_layers,
         ce_segment_threshold = GLOBAL_CONFIG_FROM_ENV.transfer_segment_threshold
     if ce_path_opt is None:
         ce_path_opt = GLOBAL_CONFIG_FROM_ENV.transfer_path_opt
-    if ce_sharded_memcpy2d is None:
-        ce_sharded_memcpy2d = GLOBAL_CONFIG_FROM_ENV.sharded_mla_d2h_memcpy2d
+    if ce_enable_memcpy2d is None:
+        ce_enable_memcpy2d = GLOBAL_CONFIG_FROM_ENV.enable_memcpy2d
     if ce_is_blockfirst is None:
         ce_is_blockfirst = (GLOBAL_CONFIG_FROM_ENV.cpu_layout_type == KVCacheLayoutType.BLOCKFIRST)
+    if ce_is_mla is None:
+        ce_is_mla = gpu_layout.is_mla
     gpu_ptrs = []
     for g in range(num_gpus):
         for l in range(num_layers):
@@ -306,16 +309,18 @@ def make_tp_group(cpu_ptr, all_gpu, num_gpus, gpu_layout, num_layers,
         nvcomp_data_type=0,
         ce_segment_threshold=ce_segment_threshold,
         ce_path_opt=ce_path_opt,
-        ce_sharded_memcpy2d=ce_sharded_memcpy2d,
+        ce_enable_memcpy2d=ce_enable_memcpy2d,
         ce_is_blockfirst=ce_is_blockfirst,
+        ce_is_mla=ce_is_mla,
     )
 
 
 def make_layerwise_group(cpu_ptr_unused, all_gpu, num_gpus, gpu_layout, num_layers,
                          ce_segment_threshold=None,
                          ce_path_opt=None,
-                         ce_sharded_memcpy2d=None,
+                         ce_enable_memcpy2d=None,
                          ce_is_blockfirst=None,
+                         ce_is_mla=None,
                          layer_eventfds_tensor=None):
     """Create LayerwiseTransferGroup for H2D-only testing (no SSD).
 
@@ -330,10 +335,12 @@ def make_layerwise_group(cpu_ptr_unused, all_gpu, num_gpus, gpu_layout, num_laye
         ce_segment_threshold = GLOBAL_CONFIG_FROM_ENV.transfer_segment_threshold
     if ce_path_opt is None:
         ce_path_opt = GLOBAL_CONFIG_FROM_ENV.transfer_path_opt
-    if ce_sharded_memcpy2d is None:
-        ce_sharded_memcpy2d = GLOBAL_CONFIG_FROM_ENV.sharded_mla_d2h_memcpy2d
+    if ce_enable_memcpy2d is None:
+        ce_enable_memcpy2d = GLOBAL_CONFIG_FROM_ENV.enable_memcpy2d
     if ce_is_blockfirst is None:
         ce_is_blockfirst = (GLOBAL_CONFIG_FROM_ENV.cpu_layout_type == KVCacheLayoutType.BLOCKFIRST)
+    if ce_is_mla is None:
+        ce_is_mla = gpu_layout.is_mla
     if layer_eventfds_tensor is None:
         layer_eventfds_tensor = torch.empty(0, dtype=torch.int32)
     def strides_tensor(getter):
@@ -370,8 +377,9 @@ def make_layerwise_group(cpu_ptr_unused, all_gpu, num_gpus, gpu_layout, num_laye
         indexer_ssd_files={},
         ce_segment_threshold=ce_segment_threshold,
         ce_path_opt=ce_path_opt,
-        ce_sharded_memcpy2d=ce_sharded_memcpy2d,
+        ce_enable_memcpy2d=ce_enable_memcpy2d,
         ce_is_blockfirst=ce_is_blockfirst,
+        ce_is_mla=ce_is_mla,
     )
 
 
@@ -1050,8 +1058,9 @@ def _expected_strategy(pattern_name, cpu_layout_name, is_mla, mode,
     should pick, mirroring csrc/ce_transfer.cu choose_path().
 
     Returns (strategy, variant) where strategy is one of
-    BULK_CONTIG / SEGMENTED_DIRECT / STAGED_SCATTER / GATHER_SCATTER and
-    variant is STAGED_CONTIG_RUN / STAGED_PER_BLOCK for STAGED_SCATTER else "".
+    BULK_CONTIG / SEGMENTED_DIRECT / STAGED_SCATTER / GATHER_SCATTER /
+    BF_D2D_TRANSPOSE and variant is STAGED_CONTIG_RUN / STAGED_PER_BLOCK
+    for STAGED_SCATTER else "".
 
     Key stride facts (see cpu_layout_for_mode / tp_transfer_thread_group.cpp):
       dst_phys_contig  == (cpu_block_stride == chunk_size)  -> LAYERFIRST only.
@@ -1061,11 +1070,14 @@ def _expected_strategy(pattern_name, cpu_layout_name, is_mla, mode,
         the full block -> NOT contiguous. sharded H2D uses the full chunk, so
         it IS contiguous. Hence STAGED_PER_BLOCK arises only on the sharded
         D2H leg; the H2D leg of the same case is STAGED_CONTIG_RUN.
+    BF_D2D_TRANSPOSE is selected when !dst_phys && BLOCKFIRST && is_mla
+      (BF MLA rank0_only/all_write). BF MHA falls through to STAGED_SCATTER.
     segment_threshold decides the STAGED/GATHER crossover: with a small
     threshold even few_seg (4 segments) can exceed it and route to
     GATHER_SCATTER, exactly as choose_path() does.
     """
     dst_phys = (cpu_layout_name == "LAYERFIRST")
+    is_blockfirst = (cpu_layout_name == "BLOCKFIRST")
     sharded_d2h = (is_mla and mode == "sharded" and not is_host_to_device)
     src_phys = not sharded_d2h  # only sharded D2H breaks GPU-side contiguity
 
@@ -1077,21 +1089,22 @@ def _expected_strategy(pattern_name, cpu_layout_name, is_mla, mode,
         num_segments = num_blocks
 
     # choose_path() replica -----------------------------------------------
-    # BULK_CONTIG needs only src_log && dst_log && dst_phys (choose_path does
-    # NOT check src_phys here); contiguous ids => fully logically contiguous.
-    if pattern_name == "contiguous" and dst_phys:
+    # BULK_CONTIG: logical + physical contiguity on both sides.
+    if pattern_name == "contiguous" and dst_phys and src_phys:
         return ("BULK_CONTIG", "")
+    # Sharded D2H (!gpu_phys_contig) -> always STAGED_SCATTER (PER_BLOCK).
     if not src_phys:
-        # dst strided -> staging (per-block variant); dst phys -> direct
-        if dst_phys:
-            return ("SEGMENTED_DIRECT", "")
         return ("STAGED_SCATTER", "STAGED_PER_BLOCK")
+    # BF MLA (rank0_only/all_write): D2D transpose path.
+    # Only for MLA (BF MHA has tp-strided layout that D2D can't fix).
+    if not dst_phys and is_blockfirst and is_mla:
+        return ("BF_D2D_TRANSPOSE", "")
+    # LAYERFIRST or BF MHA: few segments -> SEGMENTED_DIRECT or STAGED_SCATTER.
     if num_segments <= threshold:
         if dst_phys:
             return ("SEGMENTED_DIRECT", "")
         return ("STAGED_SCATTER", "STAGED_CONTIG_RUN")
-    # many segments, src contiguous -> GATHER_SCATTER (unless dst strided +
-    # sharded which was handled above via !src_phys)
+    # many segments, src contiguous -> GATHER_SCATTER
     return ("GATHER_SCATTER", "")
 
 
@@ -1385,7 +1398,7 @@ def test_ce_strategy_coverage():
     variants = {v for _, _, v in rows if v}
 
     for required in ("BULK_CONTIG", "SEGMENTED_DIRECT",
-                     "STAGED_SCATTER", "GATHER_SCATTER"):
+                     "STAGED_SCATTER", "GATHER_SCATTER", "BF_D2D_TRANSPOSE"):
         assert required in strategies, \
             "no swept case exercises strategy {} (covered: {})".format(
                 required, sorted(strategies))

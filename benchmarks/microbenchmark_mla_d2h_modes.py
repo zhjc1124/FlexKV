@@ -241,11 +241,12 @@ def block_ids(n):
 
 def make_tp_group(cpu_ptr, all_gpu, num_gpus, gpu_layout, num_layers,
                   ce_path_opt=True,
-                  ce_segment_threshold=8):
+                  ce_segment_threshold=8,
+                  ce_is_mla=False, ce_is_blockfirst=False):
     """TPTransferThreadGroup with CE config passed per-construction.
 
     path_opt / segment_threshold go into the C++ CETransferConfig
-    via ctor args (NOT env) — matching production and the correctness tests.
+    via ctor args (NOT env) -- matching production and the correctness tests.
     """
     gpu_ptrs = []
     for g in range(num_gpus):
@@ -262,12 +263,15 @@ def make_tp_group(cpu_ptr, all_gpu, num_gpus, gpu_layout, num_layers,
         gpu_device_ids=list(range(num_gpus)),
         enable_nvcomp=False,
         ce_segment_threshold=ce_segment_threshold,
-        ce_path_opt=ce_path_opt)
+        ce_path_opt=ce_path_opt,
+        ce_is_mla=ce_is_mla,
+        ce_is_blockfirst=ce_is_blockfirst)
 
 
 def make_layerwise_group(cpu_kv_tensor, all_gpu, num_gpus, gpu_layout,
                          num_layers, ce_path_opt=True,
-                         ce_segment_threshold=8):
+                         ce_segment_threshold=8,
+                         ce_is_mla=False, ce_is_blockfirst=False):
     """LayerwiseTransferGroup (H2D reload engine) with CE config per-ctor.
 
     Mirrors LayerwiseTransferWorker construction; SSD/eventfd/indexer disabled.
@@ -299,7 +303,9 @@ def make_layerwise_group(cpu_kv_tensor, all_gpu, num_gpus, gpu_layout,
         indexer_gpu_chunk_sizes_tensor=empty_tensor,
         indexer_ssd_files={},
         ce_segment_threshold=ce_segment_threshold,
-        ce_path_opt=ce_path_opt)
+        ce_path_opt=ce_path_opt,
+        ce_is_mla=ce_is_mla,
+        ce_is_blockfirst=ce_is_blockfirst)
 
 
 def layerwise_h2d(lw_group, ids, cpu_kv_sb, cpu_ly_sb, cpu_bl_sb, cpu_tp_sb,
@@ -386,7 +392,9 @@ def bench_one(strategy_label, is_mla, mode, use_ce, cpu_layout_type,
                              is_mla, num_gpus)
     tp = make_tp_group(cpu_kv.data_ptr(), all_gpu, num_gpus, gpu_layout,
                        num_layers, ce_path_opt=ce_path_opt,
-                       ce_segment_threshold=ce_segment_threshold)
+                       ce_segment_threshold=ce_segment_threshold,
+                       ce_is_mla=is_mla,
+                       ce_is_blockfirst=(cpu_layout_type == KVCacheLayoutType.BLOCKFIRST))
 
     use_layerwise = (h2d_engine == "layerwise")
     lw = None
@@ -394,7 +402,9 @@ def bench_one(strategy_label, is_mla, mode, use_ce, cpu_layout_type,
     if use_layerwise:
         lw = make_layerwise_group(cpu_kv, all_gpu, num_gpus, gpu_layout,
                                   num_layers, ce_path_opt=ce_path_opt,
-                                  ce_segment_threshold=ce_segment_threshold)
+                                  ce_segment_threshold=ce_segment_threshold,
+                                  ce_is_mla=is_mla,
+                                  ce_is_blockfirst=(cpu_layout_type == KVCacheLayoutType.BLOCKFIRST))
 
     gpu_ids = block_ids(num_blocks)
     cpu_ids = block_ids(num_blocks)

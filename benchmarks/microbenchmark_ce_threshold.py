@@ -260,11 +260,12 @@ def make_pattern_with_segments(num_blocks, num_segments):
 
 def make_tp_group(cpu_ptr, all_gpu, num_gpus, gpu_layout, num_layers,
                   ce_path_opt=True,
-                  ce_segment_threshold=8):
+                  ce_segment_threshold=8,
+                  ce_is_mla=False, ce_is_blockfirst=False):
     """TPTransferThreadGroup with CE config passed per-construction.
 
     path_opt / segment_threshold go into the C++ CETransferConfig
-    via ctor args (NOT env) — matching production and the correctness tests.
+    via ctor args (NOT env) -- matching production and the correctness tests.
     """
     gpu_ptrs = []
     for g in range(num_gpus):
@@ -281,7 +282,9 @@ def make_tp_group(cpu_ptr, all_gpu, num_gpus, gpu_layout, num_layers,
         gpu_device_ids=list(range(num_gpus)),
         enable_nvcomp=False,
         ce_segment_threshold=ce_segment_threshold,
-        ce_path_opt=ce_path_opt)
+        ce_path_opt=ce_path_opt,
+        ce_is_mla=ce_is_mla,
+        ce_is_blockfirst=ce_is_blockfirst)
 
 
 def sync_all(num_gpus):
@@ -319,7 +322,9 @@ def bench_threshold(cpu_layout_type, num_gpus, num_layers, num_blocks, head_dim,
                              is_mla, num_gpus)
     tp = make_tp_group(cpu_kv.data_ptr(), all_gpu, num_gpus, gpu_layout,
                        num_layers, ce_path_opt=True,
-                       ce_segment_threshold=ce_segment_threshold)
+                       ce_segment_threshold=ce_segment_threshold,
+                       ce_is_mla=is_mla,
+                       ce_is_blockfirst=(cpu_layout_type == KVCacheLayoutType.BLOCKFIRST))
 
     # Same pattern for gpu and cpu side; num_segments controls the crossover.
     ids = make_pattern_with_segments(num_blocks, num_segments)

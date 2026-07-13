@@ -27,34 +27,37 @@ struct CETransferConfig {
   // always; true = pick BULK_CONTIG / SEGMENTED_DIRECT / STAGED_SCATTER /
   // GATHER_SCATTER based on block-id contiguity + CPU/GPU layout.
   bool path_opt_enabled = true;
-  // force_path: test/benchmark only. -1 = auto (choose_path); 0-3 = force a
+  // force_path: test/benchmark only. -1 = auto (choose_path); 0-4 = force a
   // specific CEPath (0=BULK_CONTIG, 1=SEGMENTED_DIRECT, 2=STAGED_SCATTER,
-  // 3=GATHER_SCATTER). Production MUST leave this at -1 (never set it).
+  // 3=GATHER_SCATTER, 4=BF_D2D_TRANSPOSE). Production MUST leave this at -1.
   // Used by microbenchmark_ce_strategy.py to prove choose_path picks the
   // fastest strategy for each case (runs all viable paths head-to-head).
   int force_path = -1;
-  // sharded_mla_d2h_memcpy2d: when true, sharded BF D2H uses cudaMemcpy2DAsync
-  // (strided D2H directly to CPU interleave positions). Fast on NVIDIA (H20:
+  // enable_memcpy2d: when true, STAGED_SCATTER D2H uses cudaMemcpy2DAsync
+  // (strided D2H directly to CPU positions). Fast on NVIDIA (H20:
   // 58ms, 24 GiB/s), catastrophically slow on P800/Kunlunxin (12.8s, 0.11
   // GiB/s — the DMA engine does not handle 2D strided patterns). Default
-  // false: use D2D shard transpose + contiguous D2H + CPU interleave merge
-  // (works on all platforms, ~130ms on P800). Set to 1 on NVIDIA via
-  // FLEXKV_ENABLE_SHARDED_MLA_D2H_MEMCPY2D=1.
-  bool sharded_mla_d2h_memcpy2d = false;
+  // false: use staging buffer + CPU scatter (works on all platforms).
+  // Set to 1 on NVIDIA via FLEXKV_ENABLE_MEMCPY2D=1.
+  bool enable_memcpy2d = false;
   // is_blockfirst: CPU KV cache layout is BLOCKFIRST (vs LAYERFIRST).
   // Set from FLEXKV_CPU_LAYOUT env var via worker.py/layerwise.py.
   // choose_path uses this to select BF_D2D_TRANSPOSE only for actual
   // BLOCKFIRST layouts (not LAYERFIRST non-MLA where !cpu_phys_contig
   // is also true due to per-rank chunk_size < cpu_block_stride).
   bool is_blockfirst = false;
+  // is_mla: whether the model uses MLA (kv_dim=1, no head split).
+  // BF_D2D_TRANSPOSE is only selected when is_blockfirst && is_mla
+  // (BF MHA has tp-strided layout that D2D transpose cannot fix).
+  bool is_mla = false;
 };
 
 // ============================================================================
 // CE transfer strategy taxonomy
 // ============================================================================
 //
-// Every CE transfer is one of five execution strategies. path_opt_enabled
-// selects PER_BLOCK (the baseline) vs the four optimized strategies; among the
+// Every CE transfer is one of six execution strategies. path_opt_enabled
+// selects PER_BLOCK (the baseline) vs the five optimized strategies; among the
 // optimized ones choose_path() picks based on the CEAnalysis flags.
 //
 //   PER_BLOCK       baseline: one cudaMemcpyAsync per block. No merging, no
@@ -88,10 +91,9 @@ enum class CEPath : int {
   PER_BLOCK = -1,       // baseline (path_opt_enabled == false)
   BULK_CONTIG = 0,
   SEGMENTED_DIRECT = 1,
-  STAGED_SCATTER = 2,   // legacy: per-layer D2H + CPU scatter (replaced by below)
+  STAGED_SCATTER = 2,   // staging + CPU scatter (sharded D2H or BF few-seg)
   GATHER_SCATTER = 3,
-  BF_D2D_TRANSPOSE = 4, // BF non-sharded: D2D transpose + 3-path cudaMemcpyAsync
-  BF_SHARDED = 5,       // BF sharded: cudaMemcpy2DAsync or D2D+contig+merge
+  BF_D2D_TRANSPOSE = 4, // BF MLA: D2D transpose + 3-path cudaMemcpyAsync
 };
 
 // ============================================================================
@@ -228,11 +230,13 @@ void ce_transfer_gather_scatter(
     const CEAnalysis &analysis, const CETransferConfig &ce_config);
 
 // ============================================================================
-// BF_D2D_TRANSPOSE: BF non-sharded (rank0_only/MHA) D2H/H2D.
-//   D2D transpose (LAYERFIRST→BLOCKFIRST) via index_select + transpose +
-//   contiguous, then 3-path cudaMemcpyAsync (contiguous/segmented/per-block)
+// BF_D2D_TRANSPOSE: BF MLA (rank0_only/all_write) D2H/H2D.
+//   D2D transpose (LAYERFIRST->BLOCKFIRST) via index_select + transpose +
+//   contiguous, then per-segment cudaMemcpyAsync (contiguous/segmented/per-block)
 //   matching the transposed BLOCKFIRST layout. No CPU scatter needed for
 //   contiguous/few_seg; per-block for scattered. D2D SM overhead <1ms (large).
+//   Only selected when is_blockfirst && is_mla (BF MHA has tp-strided layout
+//   that D2D transpose cannot fix).
 // ============================================================================
 template <BackendType Type>
 void ce_transfer_bf_d2d_transpose(
@@ -247,24 +251,19 @@ void ce_transfer_bf_d2d_transpose(
     const CEAnalysis &analysis, const CETransferConfig &ce_config);
 
 // ============================================================================
-// BF_SHARDED: BF sharded MLA D2H. Two sub-paths selected by
-//   ce_config.sharded_mla_d2h_memcpy2d:
-//   memcpy2d=true (NVIDIA): cudaMemcpy2DAsync per (layer, segment), strided
-//     D2H directly to CPU interleave. No D2D, no CPU merge.
-//   memcpy2d=false (P800 default): D2D shard transpose + contiguous D2H to
-//     separate host regions + CPU interleave merge.
-//   H2D uses existing paths (sharded H2D == rank0_only H2D).
+// scatter_to_cpu: scatter from contiguous staging buffer to strided CPU dst.
+//   When cpu_phys_contig (LAYERFIRST), consecutive cpu_block_ids are also
+//   physically adjacent, so we merge them into a single memcpy. When
+//   !cpu_phys_contig (BLOCKFIRST), consecutive block_ids have a stride gap
+//   between them, so each block must be scattered individually.
+//   Shared by STAGED_SCATTER and GATHER_SCATTER.
 // ============================================================================
-template <BackendType Type>
-void ce_transfer_bf_sharded_d2h(
-    int num_blocks, int start_layer_id, int num_layers, int kv_dim,
-    int64_t *gpu_block_ids, GTensorHandler gpu_tensor_handler,
-    int64_t gpu_startoff_inside_chunks_int64,
-    int64_t *cpu_block_ids, int64_t *cpu_ptr_int64,
-    int64_t cpu_kv_stride_int64, int64_t cpu_layer_stride_int64,
-    int64_t cpu_block_stride_int64,
-    int64_t cpu_startoff_inside_chunks_int64, int64_t chunk_size_in_bytes,
-    cudaStream_t stream, bool is_host_to_device,
-    const CEAnalysis &analysis, const CETransferConfig &ce_config);
+void scatter_to_cpu(const void *staging_buf, int64_t *cpu_ptr_int64,
+                    int64_t *cpu_block_ids, int num_blocks,
+                    int64_t cpu_block_stride_int64,
+                    int64_t cpu_startoff_inside_chunks_int64,
+                    int64_t chunk_size_in_bytes, int layer_idx, int kv_idx,
+                    int64_t cpu_kv_stride_int64, int64_t cpu_layer_stride_int64,
+                    int start_layer_id, bool cpu_phys_contig);
 
 } // namespace flexkv

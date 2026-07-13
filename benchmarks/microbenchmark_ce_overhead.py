@@ -93,7 +93,8 @@ def make_cpu_tensor(cpu_layout):
     return torch.empty(tuple(cpu_layout.kv_shape), dtype=DTYPE, pin_memory=True)
 
 
-def make_tp_group(cpu_ptr, all_gpu, num_gpus, gpu_layout, num_layers):
+def make_tp_group(cpu_ptr, all_gpu, num_gpus, gpu_layout, num_layers,
+                  ce_is_mla=False, ce_is_blockfirst=False):
     gpu_ptrs = []
     for g in range(num_gpus):
         for l in range(num_layers):
@@ -111,7 +112,9 @@ def make_tp_group(cpu_ptr, all_gpu, num_gpus, gpu_layout, num_layers):
         gpu_layer_strides_in_bytes=[gpu_layout.get_layer_stride() * ES] * num_gpus,
         gpu_chunk_sizes_in_bytes=[gpu_layout.get_chunk_size() * ES] * num_gpus,
         gpu_device_ids=list(range(num_gpus)),
-        enable_nvcomp=False)
+        enable_nvcomp=False,
+        ce_is_mla=ce_is_mla,
+        ce_is_blockfirst=ce_is_blockfirst)
 
 
 def block_ids(n):

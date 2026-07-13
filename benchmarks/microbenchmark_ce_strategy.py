@@ -148,10 +148,11 @@ def make_cpu_tensor_strat(cpu_layout, num_layers, total_blocks, head_dim,
 
 def make_tp_group(cpu_ptr, all_gpu, num_gpus, gpu_layout, num_layers,
                   ce_path_opt=True,
-                  ce_segment_threshold=8, ce_force_path=-1):
+                  ce_segment_threshold=8, ce_force_path=-1,
+                  ce_is_mla=False, ce_is_blockfirst=False):
     """TPTransferThreadGroup with CE config passed per-construction.
 
-    ce_force_path: test/benchmark only. -1 = auto (choose_path); 0-3 = force
+    ce_force_path: test/benchmark only. -1 = auto (choose_path); 0-4 = force
     a specific CEPath. Production never sets it.
     path_opt / segment_threshold go into the C++ CETransferConfig
     via ctor args (NOT env) -- matching production and the correctness tests.
@@ -172,7 +173,9 @@ def make_tp_group(cpu_ptr, all_gpu, num_gpus, gpu_layout, num_layers,
         enable_nvcomp=False,
         ce_segment_threshold=ce_segment_threshold,
         ce_path_opt=ce_path_opt,
-        ce_force_path=ce_force_path)
+        ce_force_path=ce_force_path,
+        ce_is_mla=ce_is_mla,
+        ce_is_blockfirst=ce_is_blockfirst)
 
 
 def fill_gpu(all_gpu, gpu_id, num_layers, num_blocks, head_dim):
@@ -267,7 +270,7 @@ def bench_one_dir(tp, ids, cpu_kv_sb, cpu_ly_sb, cpu_bl_sb, cpu_tp_sb,
 #   SEGMENTED_DIRECT(1) needs cpu_phys_contig (lfirst)
 #   STAGED_SCATTER(2)    always viable (staging works for any layout)
 #   GATHER_SCATTER(3)   needs gpu_phys_contig (no sharded D2H)
-# CEPath enum: 0=BULK_CONTIG, 1=SEGMENTED_DIRECT, 2=STAGED_SCATTER, 3=GATHER_SCATTER
+# CEPath enum: 0=BULK_CONTIG, 1=SEGMENTED_DIRECT, 2=STAGED_SCATTER, 3=GATHER_SCATTER, 4=BF_D2D_TRANSPOSE
 #
 # layout_key -> cpu_phys_contig: lfirst=True, bfirst=False
 # mode=sharded D2H -> gpu_phys_contig=False; otherwise True
@@ -275,6 +278,7 @@ def bench_one_dir(tp, ids, cpu_kv_sb, cpu_ly_sb, cpu_bl_sb, cpu_tp_sb,
 #
 # STAGED_PER_BLOCK only exists in D2H+sharded (the only !gpu_phys_contig case).
 # H2D+sharded does NOT shrink chunk -> gpu_phys_contig stays true -> STAGED_CONTIG_RUN.
+# BF_D2D_TRANSPOSE(4) needs !cpu_phys_contig && is_blockfirst && is_mla (BF MLA only).
 PATH_FORMS = [
     ("BULK_CONTIG",
      "contiguous", "lfirst", True, "rank0_only",
@@ -287,7 +291,7 @@ PATH_FORMS = [
     ("STAGED_CONTIG_RUN",
      "few_seg", "bfirst", True, "rank0_only",
      [True, False],
-     [(2, "STAGED_SCATTER"), (3, "GATHER_SCATTER")]),
+     [(2, "STAGED_SCATTER"), (3, "GATHER_SCATTER"), (4, "BF_D2D_TRANSPOSE")]),
     ("STAGED_PER_BLOCK",
      "scattered", "bfirst", True, "sharded",
      [False],  # D2H only: sharded D2H -> !gpu_phys_contig -> PER_BLOCK variant
@@ -295,7 +299,7 @@ PATH_FORMS = [
     ("GATHER_SCATTER",
      "scattered", "bfirst", True, "rank0_only",
      [True, False],
-     [(2, "STAGED_SCATTER"), (3, "GATHER_SCATTER")]),
+     [(2, "STAGED_SCATTER"), (3, "GATHER_SCATTER"), (4, "BF_D2D_TRANSPOSE")]),
 ]
 
 # Two cumulative CE configs.
@@ -305,13 +309,14 @@ PATH_CONFIGS = [
     ("opt",      True),
 ]
 
-# All 4 CEPaths for Part 2's uniform column layout (not all viable for every
+# All 5 CEPaths for Part 2's uniform column layout (not all viable for every
 # form -- non-viable cells show '-').
 ALL_FORCE_PATHS = [
     (0, "BULK_CONTIG"),
     (1, "SEGMENTED_DIRECT"),
     (2, "STAGED_SCATTER"),
     (3, "GATHER_SCATTER"),
+    (4, "BF_D2D_TRANSPOSE"),
 ]
 
 
@@ -380,7 +385,9 @@ def run_strategy_compare(args):
                         tp = make_tp_group(
                             cpu_kv.data_ptr(), all_gpu, num_gpus, gpu_layout,
                             num_layers, ce_path_opt=path_opt,
-                            ce_segment_threshold=threshold)
+                            ce_segment_threshold=threshold,
+                            ce_is_mla=is_mla,
+                            ce_is_blockfirst=(layout_key == "bfirst"))
                         med = bench_one_dir(
                             tp, ids, cpu_kv_sb, cpu_ly_sb, cpu_bl_sb, cpu_tp_sb,
                             num_layers, is_h2d, num_gpus, args.iters, is_mla, mode,
@@ -400,7 +407,9 @@ def run_strategy_compare(args):
                             cpu_kv.data_ptr(), all_gpu, num_gpus, gpu_layout,
                             num_layers, ce_path_opt=True,
                             ce_segment_threshold=threshold,
-                            ce_force_path=fp_id)
+                            ce_force_path=fp_id,
+                            ce_is_mla=is_mla,
+                            ce_is_blockfirst=(layout_key == "bfirst"))
                         med = bench_one_dir(
                             tp, ids, cpu_kv_sb, cpu_ly_sb, cpu_bl_sb, cpu_tp_sb,
                             num_layers, is_h2d, num_gpus, args.iters, is_mla, mode,

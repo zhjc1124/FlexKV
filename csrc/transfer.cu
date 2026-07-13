@@ -150,8 +150,8 @@ void transfer_kv_blocks(
       // force_path: test/benchmark override (production never sets it).
       CEPath path;
       if (ce_config.force_path >= 0) {
-        TORCH_CHECK(ce_config.force_path <= 5,
-                    "force_path out of range [0,5]: ", ce_config.force_path);
+        TORCH_CHECK(ce_config.force_path <= 4,
+                    "force_path out of range [0,4]: ", ce_config.force_path);
         path = static_cast<CEPath>(ce_config.force_path);
       } else {
         path = choose_path(analysis, ce_config, chunk_size_in_bytes);
@@ -199,16 +199,6 @@ void transfer_kv_blocks(
           break;
         case CEPath::BF_D2D_TRANSPOSE:
           ce_transfer_bf_d2d_transpose<Type>(
-              num_blocks, start_layer_id, num_layers, kv_dim,
-              gpu_block_ids, gpu_tensor_handler,
-              gpu_startoff_inside_chunks_int64, cpu_block_ids, cpu_ptr_int64,
-              cpu_kv_stride_int64, cpu_layer_stride_int64,
-              cpu_block_stride_int64, cpu_startoff_inside_chunks_int64,
-              chunk_size_in_bytes, stream, is_host_to_device, analysis,
-              ce_config);
-          break;
-        case CEPath::BF_SHARDED:
-          ce_transfer_bf_sharded_d2h<Type>(
               num_blocks, start_layer_id, num_layers, kv_dim,
               gpu_block_ids, gpu_tensor_handler,
               gpu_startoff_inside_chunks_int64, cpu_block_ids, cpu_ptr_int64,

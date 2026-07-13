@@ -148,7 +148,8 @@ def make_cpu_tensor(cpu_layout, num_layers, total_blocks, head_dim, is_mla, num_
 
 
 def make_tp_group(cpu_ptr, all_gpu, num_gpus, gpu_layout, num_layers,
-                  ce_path_opt=True, ce_segment_threshold=8):
+                  ce_path_opt=True, ce_segment_threshold=8,
+                  ce_is_mla=False, ce_is_blockfirst=False):
     gpu_ptrs = []
     for g in range(num_gpus):
         for l in range(num_layers):
@@ -164,7 +165,9 @@ def make_tp_group(cpu_ptr, all_gpu, num_gpus, gpu_layout, num_layers,
         gpu_device_ids=list(range(num_gpus)),
         enable_nvcomp=False,
         ce_segment_threshold=ce_segment_threshold,
-        ce_path_opt=ce_path_opt)
+        ce_path_opt=ce_path_opt,
+        ce_is_mla=ce_is_mla,
+        ce_is_blockfirst=ce_is_blockfirst)
 
 
 def fill_gpu(all_gpu, gpu_id, num_layers, num_blocks, head_dim):
@@ -427,7 +430,9 @@ def run_simulation(args):
                         tp = make_tp_group(
                             cpu_kv.data_ptr(), all_gpu, num_gpus, gpu_layout,
                             num_layers, ce_path_opt=path_opt,
-                            ce_segment_threshold=threshold)
+                            ce_segment_threshold=threshold,
+                            ce_is_mla=is_mla,
+                            ce_is_blockfirst=(cpu_layout_type == KVCacheLayoutType.BLOCKFIRST))
 
                         try:
                             d2h_ms = bench_one_dir(
