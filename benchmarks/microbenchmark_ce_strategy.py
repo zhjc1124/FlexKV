@@ -258,7 +258,7 @@ def bench_one_dir(tp, ids, cpu_kv_sb, cpu_ly_sb, cpu_bl_sb, cpu_tp_sb,
 
 
 # The 5 CE execution forms and how to trigger each (num_blocks=64, threshold=8).
-#   (form_name, pattern, layout_key, is_mla, mode, dirs, viable_force_paths)
+#   (pattern, layout_key, is_mla, mode, dirs, viable_force_paths)
 # viable_force_paths: which CEPaths can physically run for this form's
 # (pattern, layout, mode) combo. Used for the force-path head-to-head.
 # dirs: directions to test (both H2D and D2H unless physically impossible).
@@ -280,28 +280,41 @@ def bench_one_dir(tp, ids, cpu_kv_sb, cpu_ly_sb, cpu_bl_sb, cpu_tp_sb,
 #
 # STAGED_BLOCK only exists in D2H+sharded (the only !gpu_phys_contig case).
 # H2D+sharded does NOT shrink chunk -> gpu_phys_contig stays true -> STAGED_MERGE.
-# BF_TRANSPOSE is checked first in choose_path: BLOCKFIRST + MLA + !cpu_phys_contig.
+# All pattern × layout combos (rank0_only) + sharded D2H special case.
+# No form names — pattern/layout/mode are shown directly in output.
+# Tuple: (pattern, layout_key, is_mla, mode, dirs, viable_force_paths)
+ALL_FORCE_PATHS_LIST = [
+    (0, "BULK_CONTIG"), (1, "SEGMENTED_DIRECT"), (2, "STAGED_MERGE"),
+    (3, "STAGED_BLOCK"), (4, "GATHER_SCATTER"), (5, "BF_TRANSPOSE"),
+]
+
+# Full matrix: 3 patterns × 2 layouts × 3 modes (mla-rank0_only, mla-sharded, mha).
+# mla-sharded is D2H-only (H2D sharded has gpu_phys_contig=true, not sharded).
+# mha has no sharded mode (sharded is MLA-only); mode is don't-care for MHA.
+_ALL = ALL_FORCE_PATHS_LIST  # all 6 paths viable; invalid ones show FAILED
+
 PATH_FORMS = [
-    ("BULK_CONTIG",
-     "contiguous", "lfirst", True, "rank0_only",
-     [True, False],  # H2D, D2H
-     [(0, "BULK_CONTIG"), (1, "SEGMENTED_DIRECT"), (2, "STAGED_MERGE"), (3, "STAGED_BLOCK"), (4, "GATHER_SCATTER"), (5, "BF_TRANSPOSE")]),
-    ("SEGMENTED_DIRECT",
-     "few_seg", "lfirst", True, "rank0_only",
-     [True, False],
-     [(1, "SEGMENTED_DIRECT"), (2, "STAGED_MERGE"), (3, "STAGED_BLOCK"), (4, "GATHER_SCATTER")]),
-    ("STAGED_MERGE",
-     "few_seg", "bfirst", True, "rank0_only",
-     [True, False],
-     [(2, "STAGED_MERGE"), (3, "STAGED_BLOCK"), (4, "GATHER_SCATTER"), (5, "BF_TRANSPOSE")]),
-    ("STAGED_BLOCK",
-     "scattered", "bfirst", True, "sharded",
-     [False],  # D2H only: sharded D2H -> !gpu_phys_contig -> per-block memcpy
-     [(2, "STAGED_MERGE"), (3, "STAGED_BLOCK"), (5, "BF_TRANSPOSE")]),
-    ("GATHER_SCATTER",
-     "scattered", "bfirst", True, "rank0_only",
-     [True, False],
-     [(2, "STAGED_MERGE"), (3, "STAGED_BLOCK"), (4, "GATHER_SCATTER"), (5, "BF_TRANSPOSE")]),
+    # --- mla + rank0_only (H2D + D2H) ---
+    ("contiguous", "lfirst", True,  "rank0_only", [True, False], _ALL),
+    ("contiguous", "bfirst", True,  "rank0_only", [True, False], _ALL),
+    ("few_seg",    "lfirst", True,  "rank0_only", [True, False], _ALL),
+    ("few_seg",    "bfirst", True,  "rank0_only", [True, False], _ALL),
+    ("scattered",  "lfirst", True,  "rank0_only", [True, False], _ALL),
+    ("scattered",  "bfirst", True,  "rank0_only", [True, False], _ALL),
+    # --- mla + sharded (D2H only) ---
+    ("contiguous", "lfirst", True,  "sharded",    [False], _ALL),
+    ("contiguous", "bfirst", True,  "sharded",    [False], _ALL),
+    ("few_seg",    "lfirst", True,  "sharded",    [False], _ALL),
+    ("few_seg",    "bfirst", True,  "sharded",    [False], _ALL),
+    ("scattered",  "lfirst", True,  "sharded",    [False], _ALL),
+    ("scattered",  "bfirst", True,  "sharded",    [False], _ALL),
+    # --- mha (H2D + D2H, mode=rank0_only but don't-care) ---
+    ("contiguous", "lfirst", False, "rank0_only", [True, False], _ALL),
+    ("contiguous", "bfirst", False, "rank0_only", [True, False], _ALL),
+    ("few_seg",    "lfirst", False, "rank0_only", [True, False], _ALL),
+    ("few_seg",    "bfirst", False, "rank0_only", [True, False], _ALL),
+    ("scattered",  "lfirst", False, "rank0_only", [True, False], _ALL),
+    ("scattered",  "bfirst", False, "rank0_only", [True, False], _ALL),
 ]
 
 # Two cumulative CE configs.
@@ -389,7 +402,9 @@ def run_strategy_compare(args):
         results = all_results[size_name]
         heads_per_rank = 1
 
-        for form_name, pattern, layout_key, is_mla, mode, dirs, viable in PATH_FORMS:
+        for pattern, layout_key, is_mla, mode, dirs, viable in PATH_FORMS:
+            mla_tag = "mla" if is_mla else "mha"
+            form_name = "{}/{}/{}/{}".format(pattern, layout_key, mla_tag, mode)
             if pattern == "scattered" and num_blocks <= threshold:
                 print("  SKIP {} (num_blocks={} <= threshold={})".format(
                     form_name, num_blocks, threshold))
@@ -487,9 +502,10 @@ def run_strategy_compare(args):
 
         # Build the list of (form_name, dir_name) rows actually run.
         run_rows = []
-        for form_name, pattern, layout_key, is_mla, mode, dirs, viable in PATH_FORMS:
+        for pattern, layout_key, is_mla, mode, dirs, viable in PATH_FORMS:
             if pattern == "scattered" and num_blocks <= threshold:
                 continue
+            form_name = "{}/{}/{}".format(pattern, layout_key, mode)
             for is_h2d in dirs:
                 run_rows.append((form_name, "H2D" if is_h2d else "D2H", viable))
 
