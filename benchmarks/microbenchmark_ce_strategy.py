@@ -324,7 +324,7 @@ ALL_FORCE_PATHS = [
 
 
 def python_choose_path(pattern, layout_key, mode, is_h2d, threshold,
-                       chunk_size_bytes):
+                       chunk_size_bytes, is_mla=True):
     """Mirror of C++ choose_path (ce_transfer.cu). Returns the CEPath name
     that choose_path would pick for the given (pattern, layout, mode, dir).
 
@@ -332,6 +332,7 @@ def python_choose_path(pattern, layout_key, mode, is_h2d, threshold,
     so the reader can confirm opt == force_<auto_path> timing.
     """
     cpu_phys_contig = (layout_key == "lfirst")
+    is_blockfirst = (layout_key == "bfirst")
     # Sharded D2H shrinks GPU chunk -> gpu_phys_contig == False.
     gpu_phys_contig = not (mode == "sharded" and not is_h2d)
     # num_segments: contiguous=1, few_seg=4, scattered=many(>threshold)
@@ -342,6 +343,10 @@ def python_choose_path(pattern, layout_key, mode, is_h2d, threshold,
     else:  # scattered
         num_segments = threshold + 1  # > threshold
 
+    # BF_TRANSPOSE: checked first (BLOCKFIRST + MLA + !cpu_phys_contig).
+    # Covers both rank0_only/all_write and sharded D2H.
+    if is_blockfirst and is_mla and not cpu_phys_contig:
+        return "BF_TRANSPOSE"
     if cpu_phys_contig and gpu_phys_contig and num_segments == 1:
         return "BULK_CONTIG"
     if not gpu_phys_contig:
@@ -412,7 +417,7 @@ def run_strategy_compare(args):
                 # (form, dir) so we can annotate the opt row.
                 auto_path = python_choose_path(
                     pattern, layout_key, mode, is_h2d, threshold,
-                    head_dim * ES)
+                    head_dim * ES, is_mla=is_mla)
                 results[key]["auto_path"] = auto_path
                 print("\n-- Form: {} | pattern={} | layout={} | mode={} | dir={} | auto={} --".format(
                     form_name, pattern, layout_key, mode, dir_name, auto_path))
