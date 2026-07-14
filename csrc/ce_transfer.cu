@@ -102,11 +102,8 @@ CEAnalysis analyze_ce_transfer(
 // self-describing name. GATHER_SCATTER (was Path 2) is unchanged.
 CEPath choose_path(const CEAnalysis &a, const CETransferConfig &ce_config,
                    int64_t chunk_size_in_bytes) {
-  // BULK_CONTIG: physical contiguity on both sides AND a single contiguous
-  // run of block ids (num_segments == 1 subsumes gpu_log_contig &&
-  // cpu_log_contig: num_segments stays 1 only when every step is +1 on both
-  // sides). -> one big memcpy.
-  if (a.cpu_phys_contig && a.gpu_phys_contig && a.num_segments == 1)
+  // BULK_CONTIG: logical + physical contiguity on both sides -> one big memcpy.
+  if (a.gpu_log_contig && a.cpu_log_contig && a.cpu_phys_contig && a.gpu_phys_contig)
     return CEPath::BULK_CONTIG;
 
   // Sharded D2H: !gpu_phys_contig (chunk shrunk to shard, stride = full chunk).
@@ -514,7 +511,13 @@ void ce_transfer_staged_merge(
   // Direction (is_host_to_device) selects src/dst/pitch/kind:
   //   D2H: GPU src (contiguous within segment) -> CPU dst (strided)
   //   H2D: CPU src (strided) -> GPU dst (contiguous within segment)
-  if (ce_config.enable_memcpy2d) {
+  // Only use memcpy2d when there are mergeable segments (run_len > 1).
+  // When every segment has run_len == 1 (scattered pattern), 2D copy
+  // degenerates to 1D with extra overhead — staging + scatter is faster.
+  bool has_mergeable = false;
+  for (const auto &seg : analysis.segments)
+    if (seg.run_len > 1) { has_mergeable = true; break; }
+  if (ce_config.enable_memcpy2d && has_mergeable) {
     cudaMemcpyKind kind = is_host_to_device ? cudaMemcpyHostToDevice
                                             : cudaMemcpyDeviceToHost;
     const int64_t total_iters = (int64_t)num_layers * kv_dim;
@@ -711,7 +714,13 @@ void ce_transfer_staged_block(
   // For STAGED_BLOCK (sharded D2H), gpu_pitch (computed from pointer diff)
   // is the full GPU block stride (>= chunk_size), and width=chunk_size
   // (shard) — memcpy2D strides through the GPU source correctly.
-  if (ce_config.enable_memcpy2d) {
+  // Only use memcpy2d when there are mergeable segments (run_len > 1).
+  // When every segment has run_len == 1 (scattered pattern), 2D copy
+  // degenerates to 1D with extra overhead — staging + scatter is faster.
+  bool has_mergeable = false;
+  for (const auto &seg : analysis.segments)
+    if (seg.run_len > 1) { has_mergeable = true; break; }
+  if (ce_config.enable_memcpy2d && has_mergeable) {
     cudaMemcpyKind kind = is_host_to_device ? cudaMemcpyHostToDevice
                                             : cudaMemcpyDeviceToHost;
     const int64_t total_iters = (int64_t)num_layers * kv_dim;
