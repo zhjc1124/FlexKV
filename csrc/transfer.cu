@@ -149,10 +149,13 @@ void transfer_kv_blocks(
     } else {
       // BF MLA preprocess: D2D transpose (before choose_path, not via the
       // five CEPath strategies). Triggered when BLOCKFIRST + MLA + CPU
-      // non-contiguous + GPU contiguous (non-sharded). Sharded D2H
-      // (!gpu_phys_contig) falls through to choose_path -> STAGED_BLOCK.
+      // non-contiguous. Covers both non-sharded (gpu_phys_contig) and
+      // sharded D2H (!gpu_phys_contig): sharded D2H previously fell through
+      // to choose_path -> STAGED_BLOCK (per-block memcpy), but benchmark
+      // shows BF + sharded via D2D transpose is ~12.4x faster. sharded H2D
+      // is unaffected (H2D always has gpu_phys_contig == true).
       if (ce_config.is_blockfirst && ce_config.is_mla &&
-          !analysis.cpu_phys_contig && analysis.gpu_phys_contig) {
+          !analysis.cpu_phys_contig) {
         ce_transfer_bf_d2d_transpose<Type>(
             num_blocks, start_layer_id, num_layers, kv_dim,
             gpu_block_ids, gpu_tensor_handler,

@@ -1191,10 +1191,22 @@ void ce_transfer_bf_d2d_transpose(
     for (int64_t it = 0; it < total_iters; ++it) {
       int i = (int)(it / kv_dim);
       int j = (int)(it % kv_dim);
-      int64_t *gpu_layer_kv_base =
+      int64_t *gpu_ptr_block0 =
           ptr_at<Type>(gpu_tensor_handler, i + start_layer_id, j, 0);
+      int64_t *gpu_ptr_block1 =
+          ptr_at<Type>(gpu_tensor_handler, i + start_layer_id, j, 1);
+      // GPU block stride (pitch) in int64 elements. Non-sharded: equals
+      // elems_per_block (contiguous). Sharded D2H: full_chunk stride while
+      // elems_per_block = shard_size/8, so from_blob needs an explicit stride.
+      int64_t gpu_block_stride_elems =
+          (int64_t)((char *)gpu_ptr_block1 - (char *)gpu_ptr_block0) /
+          sizeof(int64_t);
+      // Add gpu_startoff to land on this rank's shard (sharded D2H).
+      int64_t *gpu_layer_kv_base =
+          gpu_ptr_block0 + gpu_startoff_inside_chunks_int64;
       at::Tensor src_view = at::from_blob(
-          gpu_layer_kv_base, {max_gpu_id + 1, elems_per_block}, i64_cuda);
+          gpu_layer_kv_base, {max_gpu_id + 1, elems_per_block},
+          {gpu_block_stride_elems, 1}, i64_cuda);
       at::Tensor gathered;
       if (analysis.gpu_log_contig) {
         gathered = src_view.narrow(0, gpu_block_ids[0], num_blocks).clone();
@@ -1306,10 +1318,20 @@ void ce_transfer_bf_d2d_transpose(
     for (int64_t it = 0; it < total_iters; ++it) {
       int i = (int)(it / kv_dim);
       int j = (int)(it % kv_dim);
-      int64_t *gpu_layer_kv_base =
+      int64_t *gpu_ptr_block0 =
           ptr_at<Type>(gpu_tensor_handler, i + start_layer_id, j, 0);
+      int64_t *gpu_ptr_block1 =
+          ptr_at<Type>(gpu_tensor_handler, i + start_layer_id, j, 1);
+      // GPU block stride (pitch) in int64 elements (see D2H branch).
+      int64_t gpu_block_stride_elems =
+          (int64_t)((char *)gpu_ptr_block1 - (char *)gpu_ptr_block0) /
+          sizeof(int64_t);
+      // Add gpu_startoff to land on this rank's shard (defensive for sharded).
+      int64_t *gpu_layer_kv_base =
+          gpu_ptr_block0 + gpu_startoff_inside_chunks_int64;
       at::Tensor dst_view = at::from_blob(
-          gpu_layer_kv_base, {max_gpu_id + 1, elems_per_block}, i64_cuda);
+          gpu_layer_kv_base, {max_gpu_id + 1, elems_per_block},
+          {gpu_block_stride_elems, 1}, i64_cuda);
       at::Tensor src_slice = dev_staging_view.select(1, it);
       if (analysis.gpu_log_contig) {
         dst_view.narrow(0, gpu_block_ids[0], num_blocks).copy_(src_slice);
