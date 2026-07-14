@@ -417,7 +417,7 @@ def layerwise_h2d_readback(all_gpu, cpu_kv, num_gpus, gpu_layout, num_layers,
 
     notify_mode: "hostfunc" (default, uses CUDA hostfunc callback) or
     "polling" (uses a CPU polling thread that queries cudaEventQuery per
-    batch).  Polling mode exercises the async GATHER_SCATTER/STAGED_MERGE/STAGED_BLOCK
+    batch).  Polling mode exercises the async GATHER_SCATTER/STAGED_MERGE
     path (sync=false) that was previously deadlocked.
     """
     lw_group = make_layerwise_group(cpu_kv, all_gpu, num_gpus,
@@ -967,9 +967,9 @@ def test_invalid_mode_fallback():
 # ---------------------------------------------------------------------------
 # CE adaptive strategy tests
 #
-# The C++ CE engine selects among five execution strategies (see the CEPath
-# taxonomy in csrc/ce_transfer.h) plus the BF MLA preprocess. path_opt_enabled
-# picks PER_BLOCK (baseline) vs the five optimized strategies; choose_path()
+# The C++ CE engine selects among six execution strategies (see the CEPath
+# taxonomy in csrc/ce_transfer.h). path_opt_enabled
+# picks PER_BLOCK (baseline) vs the six optimized strategies; choose_path()
 # picks among the optimized ones by block-id contiguity + CPU/GPU layout:
 #   PER_BLOCK        — one memcpy per block (baseline, path_opt=False)
 #   BULK_CONTIG      — single large memcpy (contiguous ids + dst phys contig)
@@ -990,7 +990,7 @@ def test_invalid_mode_fallback():
 #   scattered  — random permutation           → N segments (>8)
 #
 # Strategy is chosen automatically from strides; there is no force override.
-# Coverage of the five optimized strategies is asserted by
+# Coverage of the six optimized strategies is asserted by
 # test_ce_strategy_coverage below (via _expected_strategy).
 #
 # ce_path_opt (baseline vs optimized) is a per-construction CETransferConfig
@@ -1052,8 +1052,8 @@ CE_PATTERNS = ["contiguous", "few_seg", "scattered"]
 CE_SEGMENT_THRESHOLDS = [8, 2]
 
 # enable_memcpy2d is swept as an orthogonal dimension. When True and the path
-# is STAGED_MERGE/STAGED_BLOCK and direction is D2H, the C++ engine uses cudaMemcpy2DAsync
-# instead of staging+scatter. It has no effect on H2D or non-STAGED_MERGE/STAGED_BLOCK
+# is STAGED_MERGE and direction is D2H, the C++ engine uses cudaMemcpy2DAsync
+# instead of staging+scatter. It has no effect on H2D or non-STAGED_MERGE
 # paths (the C++ check is `if (ce_config.enable_memcpy2d && !is_host_to_device)`).
 # CE_MEMCPY2D_CONFIGS defined near top of file (before first use).
 
@@ -1103,11 +1103,11 @@ def _expected_strategy(pattern_name, cpu_layout_name, is_mla, mode,
         the full block -> NOT contiguous. sharded H2D uses the full chunk, so
         it IS contiguous. Hence STAGED_BLOCK arises only on the sharded
         D2H leg; the H2D leg of the same case is STAGED_MERGE.
-    BF_TRANSPOSE is selected when !dst_phys && BLOCKFIRST && is_mla.
-      It is a CEPath strategy (enum value 5), checked first in choose_path.
-      Covers both non-sharded (rank0_only/all_write) and sharded D2H:
-      sharded D2H also benefits from transpose (12.4x vs STAGED_BLOCK).
-      BF MHA falls through to STAGED_MERGE.
+    BF_TRANSPOSE is selected when !dst_phys && BLOCKFIRST (covers both MLA
+      and MHA). It is a CEPath strategy (enum value 5), checked first in
+      choose_path. Covers both non-sharded (rank0_only/all_write) and
+      sharded D2H: sharded D2H also benefits from transpose (12.4x vs
+      STAGED_BLOCK).
     segment_threshold decides the STAGED/GATHER crossover: with a small
     threshold even few_seg (4 segments) can exceed it and route to
     GATHER_SCATTER, exactly as choose_path() does.
@@ -1166,6 +1166,10 @@ def test_ce_paths_roundtrip(data_config, is_mla, cpu_layout_name, pattern,
     gpu_phys_contig; see _expected_strategy and test_ce_strategy_coverage.)
     """
     skip_if_engine_unsupported(use_ce=True)
+    # BF always uses BF_TRANSPOSE (checked first in choose_path), so
+    # segment_threshold has no effect — skip redundant threshold sweeps.
+    if cpu_layout_name == "BLOCKFIRST" and segment_threshold != 8:
+        pytest.skip("BF always uses BF_TRANSPOSE, threshold has no effect")
     num_layers, num_blocks, tpb, num_heads, head_dim = data_config
     if pattern == "scattered" and num_blocks <= segment_threshold:
         pytest.skip("scattered needs num_blocks > segment_threshold ({}) "
@@ -1281,15 +1285,19 @@ def test_ce_paths_layerwise_h2d(data_config, is_mla, cpu_layout_name, pattern,
     Combos come from CE_MODE_CONFIGS: MLA sizes x {sharded, all_write,
     rank0_only} plus non-MLA sizes once (mode is a don't-care for MHA).
 
-    notify_mode="polling" exercises the async GATHER_SCATTER/STAGED_MERGE/STAGED_BLOCK
+    notify_mode="polling" exercises the async GATHER_SCATTER/STAGED_MERGE
     path (sync=false), which was previously deadlocked by internal
     cudaStreamSynchronize. hostfunc mode is already covered by the default
     in other layerwise tests, so we only sweep polling here to avoid doubling
     the test count.
     """
     skip_if_engine_unsupported(use_ce=True)
+    # BF always uses BF_TRANSPOSE (checked first in choose_path), so
+    # segment_threshold has no effect — skip redundant threshold sweeps.
+    if cpu_layout_name == "BLOCKFIRST" and segment_threshold != 8:
+        pytest.skip("BF always uses BF_TRANSPOSE, threshold has no effect")
     # memcpy2d now applies to H2D as well (symmetric to D2H): when the
-    # selected path is STAGED_MERGE/STAGED_BLOCK and enable_memcpy2d=True, H2D goes
+    # selected path is STAGED_MERGE and enable_memcpy2d=True, H2D goes
     # through the cudaMemcpy2DAsync branch. Other paths
     # (BF_TRANSPOSE/BULK_CONTIG/SEGMENTED_DIRECT/GATHER_SCATTER) do not
     # consult enable_memcpy2d, so their behavior is unchanged.
@@ -1511,7 +1519,7 @@ def test_ce_strategy_coverage():
     # BF_TRANSPOSE (CEPath=5) is checked first in choose_path.
     # Verify it is exercised by the swept space.
     assert "BF_TRANSPOSE" in strategies, \
-        "no swept case exercises BF MLA preprocess (BF_TRANSPOSE)"
+        "no swept case exercises BF_TRANSPOSE strategy"
 
 
 if __name__ == "__main__":

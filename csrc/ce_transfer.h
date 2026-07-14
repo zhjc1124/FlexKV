@@ -25,17 +25,17 @@ struct CETransferConfig {
   // per block, the slow reference used to quantify optimization gains) and the
   // adaptive optimized strategies chosen by choose_path(). false = PER_BLOCK
   // always; true = pick BULK_CONTIG / SEGMENTED_DIRECT / STAGED_MERGE /
-  // STAGED_BLOCK / GATHER_SCATTER based on block-id contiguity + CPU/GPU layout.
+  // STAGED_BLOCK / GATHER_SCATTER / BF_TRANSPOSE based on block-id contiguity
+  // + CPU/GPU layout.
   bool path_opt_enabled = true;
   // force_path: test/benchmark only. -1 = auto (choose_path); 0-5 = force a
   // specific CEPath (0=BULK_CONTIG, 1=SEGMENTED_DIRECT, 2=STAGED_MERGE,
-  // 3=STAGED_BLOCK, 4=GATHER_SCATTER). Production MUST leave this at -1.
-  // Used by microbenchmark_ce_strategy.py to prove choose_path picks the
-  // fastest strategy for each case (runs all viable paths head-to-head).
-  // NOTE: BF_TRANSPOSE is no longer a CEPath enum value; it is a
-  // preprocess entry checked before choose_path (see transfer.cu).
+  // 3=STAGED_BLOCK, 4=GATHER_SCATTER, 5=BF_TRANSPOSE). Production MUST leave
+  // this at -1. Used by microbenchmark_ce_strategy.py to prove choose_path
+  // picks the fastest strategy for each case (runs all viable paths
+  // head-to-head).
   int force_path = -1;
-  // enable_memcpy2d: when true, STAGED_MERGE/STAGED_BLOCK D2H uses cudaMemcpy2DAsync
+  // enable_memcpy2d: when true, STAGED_MERGE D2H uses cudaMemcpy2DAsync
   // (strided D2H directly to CPU positions). Fast on NVIDIA (H20:
   // 58ms, 24 GiB/s), catastrophically slow on P800/Kunlunxin (12.8s, 0.11
   // GiB/s — the DMA engine does not handle 2D strided patterns). Default
@@ -44,13 +44,13 @@ struct CETransferConfig {
   bool enable_memcpy2d = false;
   // is_blockfirst: CPU KV cache layout is BLOCKFIRST (vs LAYERFIRST).
   // Set from FLEXKV_CPU_LAYOUT env var via worker.py/layerwise.py.
-  // The BF MLA preprocess (transfer.cu) uses this to select BF_TRANSPOSE
-  // only for actual BLOCKFIRST layouts (not LAYERFIRST non-MLA where
-  // !cpu_phys_contig is also true due to per-rank chunk_size < cpu_block_stride).
+  // choose_path() uses this to select BF_TRANSPOSE for actual BLOCKFIRST
+  // layouts (not LAYERFIRST non-MLA where !cpu_phys_contig is also true due
+  // to per-rank chunk_size < cpu_block_stride).
   bool is_blockfirst = false;
   // is_mla: whether the model uses MLA (kv_dim=1, no head split).
-  // BF_TRANSPOSE preprocess is only triggered when is_blockfirst && is_mla
-  // (BF MHA has tp-strided layout that D2D transpose cannot fix).
+  // BF_TRANSPOSE is checked first in choose_path for all BLOCKFIRST +
+  // !cpu_phys_contig cases (covers both MLA and MHA).
   bool is_mla = false;
 };
 
@@ -58,11 +58,10 @@ struct CETransferConfig {
 // CE transfer strategy taxonomy
 // ============================================================================
 //
-// Every CE transfer is one of six execution strategies plus the BF MLA
-// preprocess. path_opt_enabled selects PER_BLOCK (the baseline) vs the five
-// optimized strategies; among the optimized ones choose_path() picks based on
-// the CEAnalysis flags. BF_TRANSPOSE is a preprocess entry checked before
-// choose_path (see transfer.cu), not a CEPath enum value.
+// Every CE transfer is one of six execution strategies. path_opt_enabled
+// selects PER_BLOCK (the baseline) vs the six optimized strategies; among
+// the optimized ones choose_path() picks based on the CEAnalysis flags.
+// BF_TRANSPOSE is checked first in choose_path (CEPath enum value 5).
 //
 //   PER_BLOCK       baseline: one cudaMemcpyAsync per block. No merging, no
 //                   staging. Correct for every layout; slowest. Only used when
@@ -268,9 +267,9 @@ void ce_transfer_gather_scatter(
     const CEAnalysis &analysis, const CETransferConfig &ce_config);
 
 // ============================================================================
-// BF_TRANSPOSE (preprocess entry, NOT a CEPath enum value):
-//   BF MLA (rank0_only/all_write) D2H/H2D. Called from transfer.cu BEFORE
-//   choose_path() when is_blockfirst && is_mla && !cpu_phys_contig &&
+// BF_TRANSPOSE (CEPath enum value 5, checked first in choose_path):
+//   BF (BLOCKFIRST) + !cpu_phys_contig (covers both MLA and MHA).
+//   Called from choose_path() when is_blockfirst && !cpu_phys_contig.
 //   gpu_phys_contig. D2D transpose (LAYERFIRST->BLOCKFIRST) via index_select +
 //   transpose + contiguous, then per-segment cudaMemcpyAsync
 //   (contiguous/segmented/per-block) matching the transposed BLOCKFIRST layout.

@@ -119,7 +119,7 @@ CEPath choose_path(const CEAnalysis &a, const CETransferConfig &ce_config,
   if (!a.gpu_phys_contig)
     return CEPath::STAGED_BLOCK;
 
-  // LAYERFIRST or BF MHA: five paths by contiguity.
+  // LAYERFIRST or BF MHA: remaining paths by contiguity.
   // LAYERFIRST non-MLA (!cpu_phys_contig && !is_blockfirst): STAGED_MERGE
   // (strided is head-dimension, not layer-dimension; D2D transpose can't help).
   if (a.num_segments <= ce_config.segment_threshold) {
