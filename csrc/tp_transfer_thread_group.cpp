@@ -195,17 +195,10 @@ void TPTransferThreadGroup::tp_group_transfer(
   // Validate mla_d2h_mode parameter (only meaningful for MLA)
   std::string mode = mla_d2h_mode;
   if (is_mla && mode != "sharded" && mode != "all_write" && mode != "rank0_only"
-      && mode != "layer_parallel" && mode != "rank_rotate" && mode != "auto") {
-    fprintf(stderr, "[FlexKV] Warning: Invalid mla_d2h_mode='%s', using default 'auto'\n",
+      && mode != "layer_parallel" && mode != "rank_rotate") {
+    fprintf(stderr, "[FlexKV] Warning: Invalid mla_d2h_mode='%s', using default 'rank_rotate'\n",
             mode.c_str());
-    mode = "auto";
-  }
-  // Resolve "auto": sharded when CE is off, rank0_only when CE is on.
-  // (rank0_only gives contiguous GPU memory access pattern that the CE
-  //  multi-path strategy can exploit; sharded is better for kernel path
-  //  because each GPU writes a smaller shard, reducing per-GPU load.)
-  if (mode == "auto") {
-    mode = use_ce_transfer ? "rank0_only" : "sharded";
+    mode = "rank_rotate";
   }
 
   // In sharded D2H mode, chunk_size is divided by num_gpus_ and used as both

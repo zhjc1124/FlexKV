@@ -22,8 +22,7 @@ Background — segment_threshold semantics (authoritative):
   threshold is passed PER-CONSTRUCTION (ce_segment_threshold ctor arg), NOT via
   env — matching production and the correctness tests.
 
-Note on mode: we use mla_d2h_mode="rank0_only" throughout (CE on → auto
-resolves to rank0_only). Threshold behavior is
+Note on mode: we use mla_d2h_mode="rank0_only" throughout. Threshold behavior is
 mode-independent: choose_path() only looks at the segment count + destination
 contiguity, so "rank0_only" keeps CPU-buffer sizing simple without changing which
 path the threshold selects.
@@ -93,8 +92,7 @@ _LAYOUT_TYPES = {
     "BLOCKFIRST": KVCacheLayoutType.BLOCKFIRST,
 }
 
-# All threshold cases run MLA "rank0_only" mode (CE on → auto resolves to
-# rank0_only; see FLEXKV_MLA_D2H_MODE). Threshold behavior is mode-independent:
+# All threshold cases run MLA "rank0_only" mode. Threshold behavior is mode-independent:
 # choose_path() only looks at the segment count + destination contiguity, so
 # rank0_only keeps CPU-buffer sizing simple without changing which path the
 # threshold selects.

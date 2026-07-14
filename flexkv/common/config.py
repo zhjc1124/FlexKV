@@ -477,10 +477,9 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
 
     # MLA D2H transfer mode (only effective when kv_heads=1)
     # Available modes:
-    #   "auto"      (default): auto-select — "sharded" when CE is off, "rank0_only" when CE is on
+    #   "rank_rotate"   (default): rotate designated rank per request (best with CE)
     #   "sharded"   Each GPU writes 1/N shard (requires chunk_size % num_gpus == 0)
     #   "all_write"     Each GPU writes complete KV to its own region (N× CPU memory)
-    #   "rank_rotate"   Rotate designated rank per request (best MLA D2H mode with CE)
     #   "rank0_only"    Only rank 0 writes complete KV
     mla_d2h_mode=os.getenv('FLEXKV_MLA_D2H_MODE', 'rank_rotate'),
 
