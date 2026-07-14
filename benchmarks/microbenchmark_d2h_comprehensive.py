@@ -5,7 +5,7 @@ Evaluates every combination discussed:
   Layouts: LAYERFIRST, BLOCKFIRST
   Modes: MHA, MLA rank0_only, MLA sharded, MLA all_write
   Approaches:
-    A. baseline: per-block cudaMemcpyAsync + CPU scatter (current STAGED_BLOCK)
+    A. baseline: per-block cudaMemcpyAsync + CPU scatter (current removed)
     B. memcpy2d: per-(layer,segment) cudaMemcpy2DAsync, no scatter
     C. d2d_3path: D2D transpose + 3-path (contiguous memcpy / per-seg memcpy / per-block memcpy)
     D. d2d_memcpy2d: D2D transpose + cudaMemcpy2DAsync (for sharded strided)
@@ -208,7 +208,7 @@ def run_case(size_name, num_layers, num_blocks, head_dim, num_gpus,
 
             # 3-path D2H based on segments
             if len(segments) == 1 and segments[0][1] == num_blocks:
-                # BULK_CONTIG: one shot
+                # CONTIG_DIRECT: one shot
                 dst_ptr = cpu_buf.data_ptr() + shard_off
                 src_ptr = transposed.data_ptr()
                 size = num_blocks * num_layers * d2h_chunk
@@ -223,7 +223,7 @@ def run_case(size_name, num_layers, num_blocks, head_dim, num_gpus,
                 blk_stride = num_layers * d2h_chunk
                 for seg_bid, run_len, seg_k in segments:
                     if run_len > 1:
-                        # SEGMENTED_DIRECT: contiguous per segment
+                        # SEGMENT_DIRECT: contiguous per segment
                         dst_off = seg_bid * cpu_block_stride + shard_off
                         src_off = seg_k * num_layers * d2h_chunk
                         size = run_len * num_layers * d2h_chunk

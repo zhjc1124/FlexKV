@@ -2,7 +2,7 @@
 """Microbenchmark: sharded D2H optimization approaches comparison.
 
 Compares 4 approaches for sharded MLA BLOCKFIRST D2H:
-  1. baseline: per-block cudaMemcpyAsync + CPU scatter (current STAGED_BLOCK)
+  1. baseline: per-block cudaMemcpyAsync + CPU scatter (current removed)
   2. memcpy2d: per-(layer,segment) cudaMemcpy2DAsync, no CPU scatter
   3. d2d+memcpy2d: D2D transpose shard + per-segment cudaMemcpy2DAsync
   4. rank0_only: D2D transpose full + one-shot contiguous D2H (reference)

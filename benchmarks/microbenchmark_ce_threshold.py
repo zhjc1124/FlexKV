@@ -8,10 +8,10 @@ time and the output makes that choice explicit ("<-- best for THIS case").
 
 Background — segment_threshold semantics (authoritative):
   The CE engine's choose_path() uses segment_threshold to pick between
-  STAGED_MERGE (segment memcpy through a staging buffer) and GATHER_SCATTER
+  SEGMENT_SCATTER (segment memcpy through a staging buffer) and GATHER_SCATTER
   (GPU index_select/copy):
-    - num_segments <= threshold -> STAGED_MERGE
-                                    (or SEGMENTED_DIRECT if the dst is
+    - num_segments <= threshold -> SEGMENT_SCATTER
+                                    (or SEGMENT_DIRECT if the dst is
                                      physically contiguous / LAYERFIRST)
     - num_segments >  threshold -> GATHER_SCATTER
   So threshold controls the STAGED/GATHER crossover. By driving the number of
@@ -78,7 +78,7 @@ THRESHOLD_SIZES = {
     "mla-large":  (80, 256, 16, 512, 1),
 }
 
-# Only sweep LAYERFIRST: BLOCKFIRST always uses BF_TRANSPOSE (checked first
+# Only sweep LAYERFIRST: BLOCKFIRST always uses GATHER_DIRECT (checked first
 # in choose_path), so segment_threshold has no effect on BF. Running threshold
 # sweeps on BF would produce identical results for every threshold value.
 THRESHOLD_LAYOUTS = ["LAYERFIRST"]

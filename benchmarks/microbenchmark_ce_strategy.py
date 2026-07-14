@@ -1,29 +1,25 @@
 """
-Microbenchmark: CE transfer strategy comparison (six CEPath strategies).
+Microbenchmark: CE transfer strategy comparison and auto-selection.
 
-Drives the C++ CE engine through each of its execution forms and compares
-two cumulative CE configs on every form, proving the optimization progression
-baseline -> optimized per form.
+Runs all viable CEPath strategies for each (pattern, layout, mode, dir) form,
+then automatically selects the fastest strategy as the recommendation.
 
-The CE execution forms (see csrc/ce_transfer.h CEPath):
-  - BULK_CONTIG       single large memcpy (contiguous ids, dst phys contiguous)
-  - SEGMENTED_DIRECT  per-run memcpy, dst phys contiguous, no staging
-  - STAGED_MERGE      staging + CPU scatter, GPU side contiguous run (merged segment memcpy)
-  - STAGED_BLOCK      staging + CPU scatter, GPU side per-block (sharded D2H)
-  - GATHER_SCATTER    GPU index_select/index_copy_ pipeline (many segments)
-  - BF_TRANSPOSE      BF MLA: D2D transpose + direct per-segment memcpy (checked first)
+Five strategies + baseline (PER_BLOCK):
+  Naming: <source>_<dest> — how data is read from GPU → how data is written to CPU
+  - baseline           PER_BLOCK: per-block memcpy, no optimization (cached)
+  - CONTIG_DIRECT      contiguous source → direct memcpy (1 segment, no staging)
+  - SEGMENT_DIRECT     segmented source → direct per-segment memcpy (no staging)
+  - SEGMENT_SCATTER    segmented source → staging buffer + CPU scatter
+  - GATHER_SCATTER     GPU index_select_out gather → staging + CPU scatter
+                       (many segments OR sharded D2H via strided from_blob)
+  - GATHER_DIRECT      GPU index_select_out gather into 3D staging (BLOCKFIRST)
+                       → direct per-segment memcpy (no staging, no CPU scatter)
+                       BF only: D2D layout transform needed for direct match
 
-Each form is triggered by a specific (block-id pattern, cpu_layout, mla_mode,
-direction). STAGED_BLOCK only appears on the sharded-D2H leg (the only
-src_phys=False path); every other form is exercised H2D with rank0_only
-(only rank 0 performs the transfer; non-rank0 GPUs idle in D2H, all read in H2D).
-
-Two cumulative CE configs:
-  - baseline : path_opt off  -> C++ runs PER_BLOCK
-  - opt      : path_opt on
-
-path_opt / segment_threshold are passed per-construction to the
-group ctor (NOT via env), matching production and the correctness tests.
+For each form, all viable strategies are force-tested head-to-head. The
+fastest is marked as 'recommended'. If choose_path's auto-pick matches the
+recommended, choose_path is optimal for that form; otherwise it should be
+investigated.
 
 Usage:
     python benchmarks/microbenchmark_ce_strategy.py --num-gpus 4 --iters 20
@@ -31,7 +27,6 @@ Usage:
 
 import argparse
 import sys
-import time
 from collections import defaultdict
 
 import numpy as np
@@ -56,8 +51,6 @@ DTYPE = torch.float16
 ES = DTYPE.itemsize
 WARMUP_ITERS = 3
 
-# Model-representative sizes: (num_layers, num_blocks, head_dim)
-# Same as microbenchmark_mla_d2h_modes.py for consistency.
 SIZES = {
     "small":  (32,   512,  128),
     "medium": (61,  2048,  512),
@@ -81,7 +74,7 @@ def make_layouts_strat(num_layers, num_blocks, head_dim, cpu_layout_type,
     MHA: kv_dim=2, head=num_gpus (each rank gets 1 head).
     """
     num_head = 1 if is_mla else num_gpus
-    heads_per_rank = 1  # MLA: 1 shared head; MHA: num_gpus/num_gpus = 1
+    heads_per_rank = 1
     gpu_layout = KVCacheLayout(
         type=KVCacheLayoutType.LAYERFIRST,
         num_layer=num_layers, num_block=num_blocks,
@@ -97,12 +90,7 @@ def make_layouts_strat(num_layers, num_blocks, head_dim, cpu_layout_type,
 
 def cpu_strides_for_strategy(cpu_layout, num_layers, num_blocks, head_dim,
                              is_mla, mode, num_gpus):
-    """Return (cpu_kv_sb, cpu_layer_sb, cpu_block_sb, cpu_tp_sb, total_blocks).
-
-    rank0_only / sharded: CPU holds 1 copy, total = num_blocks.
-    (all_write would hold N copies, but we don't use it.)
-    For MHA: div_head(tp_size) on BLOCKFIRST for per-rank CPU strides.
-    """
+    """Return (cpu_kv_sb, cpu_layer_sb, cpu_block_sb, cpu_tp_sb, total_blocks)."""
     total = num_blocks
     num_head = 1 if is_mla else num_gpus
 
@@ -112,7 +100,6 @@ def cpu_strides_for_strategy(cpu_layout, num_layers, num_blocks, head_dim,
         tokens_per_block=1, num_head=num_head,
         head_size=head_dim, is_mla=is_mla)
 
-    # For non-MLA BLOCKFIRST, div_head to get per-rank strides
     if not is_mla and cpu_layout.type == KVCacheLayoutType.BLOCKFIRST:
         layout_for_kv_stride = layout_for_kv_stride.div_head(num_gpus)
 
@@ -134,10 +121,6 @@ def make_gpu_tensors_strat(num_layers, kv_dim, num_blocks, heads_per_rank,
 
 def make_cpu_tensor_strat(cpu_layout, num_layers, total_blocks, head_dim,
                           is_mla, num_gpus):
-    # rank0_only / sharded: total_blocks = num_blocks (1 copy on CPU).
-    # The simple per-GPU sizing can still under-size the CPU buffer for some
-    # modes (benchmark-fidelity limitation: timing is representative, data is
-    # not correctness-verified). Kept consistent with the sibling files.
     num_head = 1 if is_mla else num_gpus
     layout = KVCacheLayout(
         type=cpu_layout.type,
@@ -151,13 +134,7 @@ def make_tp_group(cpu_ptr, all_gpu, num_gpus, gpu_layout, num_layers,
                   ce_path_opt=True,
                   ce_segment_threshold=8, ce_force_path=-1,
                   ce_is_mla=False, ce_is_blockfirst=False):
-    """TPTransferThreadGroup with CE config passed per-construction.
-
-    ce_force_path: test/benchmark only. -1 = auto (choose_path); 0-5 = force
-    a specific CEPath. Production never sets it.
-    path_opt / segment_threshold go into the C++ CETransferConfig
-    via ctor args (NOT env) -- matching production and the correctness tests.
-    """
+    """TPTransferThreadGroup with CE config passed per-construction."""
     gpu_ptrs = []
     for g in range(num_gpus):
         for l in range(num_layers):
@@ -191,21 +168,13 @@ def sync_all(num_gpus):
 
 
 def make_block_id_pattern(kind, num_blocks):
-    """Build a pinned int64 block-id tensor selecting a CE execution form.
-
-    contiguous : arange (single contiguous run)
-    few_seg    : 4 contiguous runs with gaps (a few large segments)
-    scattered  : deterministic random permutation (many tiny segments)
-    """
+    """Build a pinned int64 block-id tensor selecting a CE execution form."""
     if kind == "contiguous":
         ids = torch.arange(num_blocks, dtype=torch.int64)
     elif kind == "few_seg":
         q = num_blocks // 4
         parts = [torch.arange(i * q, (i + 1) * q, dtype=torch.int64)
                  for i in range(4)]
-        # Reorder quarters (Q0, Q2, Q1, Q3) to create gaps between runs.
-        # Q0=[0..127], Q2=[256..383], Q1=[128..255], Q3=[384..511]
-        # → 4 contiguous segments: [0..127, 256..383, 128..255, 384..511]
         ids = torch.cat([parts[0], parts[2], parts[1], parts[3]])[:num_blocks]
     elif kind == "scattered":
         gen = torch.Generator()
@@ -257,166 +226,145 @@ def bench_one_dir(tp, ids, cpu_kv_sb, cpu_ly_sb, cpu_bl_sb, cpu_tp_sb,
     return float(np.median(times_ms))
 
 
-# The 5 CE execution forms and how to trigger each (num_blocks=64, threshold=8).
-#   (pattern, layout_key, is_mla, mode, dirs, viable_force_paths)
-# viable_force_paths: which CEPaths can physically run for this form's
-# (pattern, layout, mode) combo. Used for the force-path head-to-head.
-# dirs: directions to test (both H2D and D2H unless physically impossible).
+# ============================================================================
+# Five strategies
+# CEPath enum: 0=CONTIG_DIRECT, 1=SEGMENT_DIRECT, 2=SEGMENT_SCATTER,
+#              3=GATHER_SCATTER, 4=GATHER_DIRECT
+# ============================================================================
+
+STRATEGIES = [
+    (0, "CONTIG_DIRECT"),
+    (1, "SEGMENT_DIRECT"),
+    (2, "SEGMENT_SCATTER"),
+    (3, "GATHER_SCATTER"),
+    (4, "GATHER_DIRECT"),
+]
+
+# Abbreviations for table columns: <source>_<dest> pattern
+# Source: C=CONTIG, S=SEGMENT, G=GATHER | Dest: DIR=DIRECT, SCT=SCATTER
+STR_ABBR = {
+    "CONTIG_DIRECT": "C_DIR",
+    "SEGMENT_DIRECT": "S_DIR",
+    "SEGMENT_SCATTER": "S_SCT",
+    "GATHER_SCATTER": "G_SCT",
+    "GATHER_DIRECT": "G_DIR",
+}
+
+# -- Viable force paths per form ---------------------------------------------
+# STRICT compatibility (data correct + no segfault).
 #
-# Physical constraints (from choose_path in ce_transfer.cu):
-#   gpu_phys_contig = (gpu_block_stride == chunk_size). GPU is always LAYERFIRST
-#     so true, EXCEPT sharded D2H where chunk shrinks to shard -> false.
-#   cpu_phys_contig = (cpu_block_stride == chunk_size). lfirst=true, bfirst=false.
-#   BULK_CONTIG(0)      needs gpu_log_contig && cpu_log_contig && cpu_phys_contig && gpu_phys_contig
-#   SEGMENTED_DIRECT(1) needs cpu_phys_contig (lfirst)
-#   STAGED_MERGE(2)      always viable (staging works for any layout)
-#   STAGED_BLOCK(3)      always viable (staging works for any layout)
-#   GATHER_SCATTER(4)   needs gpu_phys_contig (no sharded D2H)
-# CEPath enum: 0=BULK_CONTIG, 1=SEGMENTED_DIRECT, 2=STAGED_MERGE, 3=STAGED_BLOCK, 4=GATHER_SCATTER, 5=BF_TRANSPOSE
-#
-# layout_key -> cpu_phys_contig: lfirst=True, bfirst=False
-# mode=sharded D2H -> gpu_phys_contig=False; otherwise True
-# pattern=contiguous -> log_contig=True; few_seg/scattered -> log_contig=False
-#
-# STAGED_BLOCK only exists in D2H+sharded (the only !gpu_phys_contig case).
-# H2D+sharded does NOT shrink chunk -> gpu_phys_contig stays true -> STAGED_MERGE.
-# All pattern × layout combos (rank0_only) + sharded D2H special case.
-# No form names — pattern/layout/mode are shown directly in output.
-# Tuple: (pattern, layout_key, is_mla, mode, dirs, viable_force_paths)
+# - CONTIG_DIRECT: contiguous + LF + non-sharded
+# - SEGMENT_DIRECT: LF + non-sharded (cpu_phys_contig)
+# - SEGMENT_SCATTER: all scenarios (ptr_at + staging + scatter)
+# - GATHER_SCATTER: LF + MLA (non-sharded OR sharded via strided from_blob)
+#   (BF segfault; MHA segfault)
+# - GATHER_DIRECT: BF only (LF segfault — from_blob with BF stride assumption)
+_MERGE = [(2, "SEGMENT_SCATTER")]
 
-# Viable force paths — STRICT compatibility (data correct + no segfault + no FAILED).
-# Only paths that produce CORRECT data for the given scenario are listed.
-#
-# Compatibility rules (derived from code semantics +实测):
-# - BULK_CONTIG: requires contiguous pattern + LF + non-sharded
-#   (1 segment + cpu_phys_contig + gpu_phys_contig)
-# - SEGMENTED_DIRECT: requires LF + non-sharded
-#   (cpu_phys_contig + gpu_phys_contig for per-segment memcpy)
-# - STAGED_MERGE / STAGED_BLOCK: all scenarios
-#   (ptr_at + staging + scatter handles any pattern/layout/mode)
-# - GATHER_SCATTER: requires LF + MLA + non-sharded
-#   (BF segfault: from_blob without stride; MHA segfault: unconfirmed root cause;
-#    sharded: stride mismatch on from_blob)
-# - BF_TRANSPOSE: requires BF
-#   (LF segfault: from_blob with BF stride assumption)
-_BASE = [(2, "STAGED_MERGE"), (3, "STAGED_BLOCK")]
+# LF + MLA + non-sharded
+_LF_CONTIG_MLA = [(0, "CONTIG_DIRECT"), (1, "SEGMENT_DIRECT")] + _MERGE + [(3, "GATHER_SCATTER")]
+_LF_OTHER_MLA  = [(1, "SEGMENT_DIRECT")] + _MERGE + [(3, "GATHER_SCATTER")]
 
-# LF + MLA + rank0_only (non-sharded): full set
-_LF_CONTIG_MLA = [(0, "BULK_CONTIG"), (1, "SEGMENTED_DIRECT")] + _BASE + [(4, "GATHER_SCATTER")]
-_LF_OTHER_MLA  = [(1, "SEGMENTED_DIRECT")] + _BASE + [(4, "GATHER_SCATTER")]
+# LF + sharded: GATHER_SCATTER only
+# (SEGMENT_SCATTER assumes gpu_phys_contig for merged segment memcpy —
+#  sharded breaks this; CONTIG_DIRECT/SEGMENT_DIRECT need gpu_phys_contig too)
+_LF_SHARDED = [(3, "GATHER_SCATTER")]
 
-# LF + sharded: only STAGED_MERGE + STAGED_BLOCK
-# (no BULK_CONTIG/SEGMENTED_DIRECT: gpu_phys_contig=false; no GATHER_SCATTER: stride mismatch)
-_LF_SHARDED = list(_BASE)
+# LF + MHA: only SEGMENT_SCATTER is data-correct.
+# CONTIG_DIRECT/SEGMENT_DIRECT produce wrong data (cpu_phys_contig=false:
+# per-rank chunk < full block_stride). GATHER_SCATTER segfaults on MHA.
+_LF_MHA = _MERGE  # only SEGMENT_SCATTER
 
-# LF + MHA: no GATHER_SCATTER (MHA segfaults)
-_LF_CONTIG_MHA = [(0, "BULK_CONTIG"), (1, "SEGMENTED_DIRECT")] + _BASE
-_LF_OTHER_MHA  = [(1, "SEGMENTED_DIRECT")] + _BASE
+# BF (any pattern/mla/mode): SEGMENT_SCATTER + GATHER_DIRECT
+_BF = _MERGE + [(4, "GATHER_DIRECT")]
 
-# BF (any pattern/mla/mode): no BULK/SEG_DIRECT (cpu_phys_contig=false), no GATHER (segfault)
-_BF = _BASE + [(5, "BF_TRANSPOSE")]
-
-# Full matrix: 3 patterns × 2 layouts × 3 modes (mla-rank_rotate, mla-sharded, mha).
-# mla-sharded is D2H-only (H2D sharded has gpu_phys_contig=true, not sharded).
-# mha has no sharded mode (sharded is MLA-only); mode is don't-care for MHA.
+# Full matrix: 3 patterns x 2 layouts x 3 mla modes (rank0_only, layer_parallel,
+# sharded) + 3 patterns x 2 layouts x 1 mha (mode is don't-care, not shown).
 PATH_FORMS = [
-    # --- mla + rank_rotate (H2D + D2H) ---
-    ("contiguous", "lfirst", True,  "rank_rotate", [True, False], _LF_CONTIG_MLA),
-    ("contiguous", "bfirst", True,  "rank_rotate", [True, False], _BF),
-    ("few_seg",    "lfirst", True,  "rank_rotate", [True, False], _LF_OTHER_MLA),
-    ("few_seg",    "bfirst", True,  "rank_rotate", [True, False], _BF),
-    ("scattered",  "lfirst", True,  "rank_rotate", [True, False], _LF_OTHER_MLA),
-    ("scattered",  "bfirst", True,  "rank_rotate", [True, False], _BF),
+    # --- mla + rank0_only (H2D + D2H) ---
+    ("contiguous", "lfirst", True,  "rank0_only",     [True, False], _LF_CONTIG_MLA),
+    ("contiguous", "bfirst", True,  "rank0_only",     [True, False], _BF),
+    ("few_seg",    "lfirst", True,  "rank0_only",     [True, False], _LF_OTHER_MLA),
+    ("few_seg",    "bfirst", True,  "rank0_only",     [True, False], _BF),
+    ("scattered",  "lfirst", True,  "rank0_only",     [True, False], _LF_OTHER_MLA),
+    ("scattered",  "bfirst", True,  "rank0_only",     [True, False], _BF),
+    # --- mla + layer_parallel (H2D + D2H) ---
+    ("contiguous", "lfirst", True,  "layer_parallel", [True, False], _LF_CONTIG_MLA),
+    ("contiguous", "bfirst", True,  "layer_parallel", [True, False], _BF),
+    ("few_seg",    "lfirst", True,  "layer_parallel", [True, False], _LF_OTHER_MLA),
+    ("few_seg",    "bfirst", True,  "layer_parallel", [True, False], _BF),
+    ("scattered",  "lfirst", True,  "layer_parallel", [True, False], _LF_OTHER_MLA),
+    ("scattered",  "bfirst", True,  "layer_parallel", [True, False], _BF),
     # --- mla + sharded (D2H only) ---
-    ("contiguous", "lfirst", True,  "sharded",    [False], _LF_SHARDED),
-    ("contiguous", "bfirst", True,  "sharded",    [False], _BF),
-    ("few_seg",    "lfirst", True,  "sharded",    [False], _LF_SHARDED),
-    ("few_seg",    "bfirst", True,  "sharded",    [False], _BF),
-    ("scattered",  "lfirst", True,  "sharded",    [False], _LF_SHARDED),
-    ("scattered",  "bfirst", True,  "sharded",    [False], _BF),
-    # --- mha (H2D + D2H, mode=rank0_only but don't-care) ---
-    ("contiguous", "lfirst", False, "rank0_only", [True, False], _LF_CONTIG_MHA),
-    ("contiguous", "bfirst", False, "rank0_only", [True, False], _BF),
-    ("few_seg",    "lfirst", False, "rank0_only", [True, False], _LF_OTHER_MHA),
-    ("few_seg",    "bfirst", False, "rank0_only", [True, False], _BF),
-    ("scattered",  "lfirst", False, "rank0_only", [True, False], _LF_OTHER_MHA),
-    ("scattered",  "bfirst", False, "rank0_only", [True, False], _BF),
-]
-
-# Two cumulative CE configs.
-#   (label, path_opt)
-PATH_CONFIGS = [
-    ("baseline", False),   # C++ runs PER_BLOCK
-    ("opt",      True),
-]
-
-# All 6 CEPaths for Part 2's uniform column layout (not all viable for every
-# form -- non-viable cells show '-').
-ALL_FORCE_PATHS = [
-    (0, "BULK_CONTIG"),
-    (1, "SEGMENTED_DIRECT"),
-    (2, "STAGED_MERGE"),
-    (3, "STAGED_BLOCK"),
-    (4, "GATHER_SCATTER"),
-    (5, "BF_TRANSPOSE"),
+    ("contiguous", "lfirst", True,  "sharded",        [False], _LF_SHARDED),
+    ("contiguous", "bfirst", True,  "sharded",        [False], _BF),
+    ("few_seg",    "lfirst", True,  "sharded",        [False], _LF_SHARDED),
+    ("few_seg",    "bfirst", True,  "sharded",        [False], _BF),
+    ("scattered",  "lfirst", True,  "sharded",        [False], _LF_SHARDED),
+    ("scattered",  "bfirst", True,  "sharded",        [False], _BF),
+    # --- mha (H2D + D2H, mode is don't-care) ---
+    ("contiguous", "lfirst", False, "rank0_only",     [True, False], _LF_MHA),
+    ("contiguous", "bfirst", False, "rank0_only",     [True, False], _BF),
+    ("few_seg",    "lfirst", False, "rank0_only",     [True, False], _LF_MHA),
+    ("few_seg",    "bfirst", False, "rank0_only",     [True, False], _BF),
+    ("scattered",  "lfirst", False, "rank0_only",     [True, False], _LF_MHA),
+    ("scattered",  "bfirst", False, "rank0_only",     [True, False], _BF),
 ]
 
 
 def python_choose_path(pattern, layout_key, mode, is_h2d, threshold,
                        chunk_size_bytes, is_mla=True):
-    """Mirror of C++ choose_path (ce_transfer.cu). Returns the CEPath name
+    """Mirror of C++ choose_path (ce_transfer.cu). Returns the strategy name
     that choose_path would pick for the given (pattern, layout, mode, dir).
-
-    Used to annotate the opt (auto) row with the path choose_path selected,
-    so the reader can confirm opt == force_<auto_path> timing.
     """
-    cpu_phys_contig = (layout_key == "lfirst")
+    cpu_phys_contig = (layout_key == "lfirst") and is_mla
+    # MHA + LF: cpu_block_stride = num_gpus * head_dim != chunk_size = head_dim
+    # (per-rank), so cpu_phys_contig = false even for LAYERFIRST.
     is_blockfirst = (layout_key == "bfirst")
-    # Sharded D2H shrinks GPU chunk -> gpu_phys_contig == False.
     gpu_phys_contig = not (mode == "sharded" and not is_h2d)
-    # num_segments: contiguous=1, few_seg=4, scattered=many(>threshold)
     if pattern == "contiguous":
         num_segments = 1
     elif pattern == "few_seg":
         num_segments = 4
-    else:  # scattered
-        num_segments = threshold + 1  # > threshold
+    else:
+        num_segments = threshold + 1
 
-    # BF_TRANSPOSE: checked first (BLOCKFIRST + !cpu_phys_contig, covers MLA+MHA).
-    # Covers both rank0_only/all_write and sharded D2H.
+    # GATHER_DIRECT: BF + !cpu_phys_contig (covers MLA + MHA, all modes)
     if is_blockfirst and not cpu_phys_contig:
-        return "BF_TRANSPOSE"
+        return "GATHER_DIRECT"
     if cpu_phys_contig and gpu_phys_contig and num_segments == 1:
-        return "BULK_CONTIG"
+        return "CONTIG_DIRECT"
     if not gpu_phys_contig:
-        return "STAGED_BLOCK"
+        return "GATHER_SCATTER"
     if num_segments <= threshold:
-        return "SEGMENTED_DIRECT" if cpu_phys_contig else "STAGED_MERGE"
+        return "SEGMENT_DIRECT" if cpu_phys_contig else "SEGMENT_SCATTER"
     if chunk_size_bytes > 0 and chunk_size_bytes % 8 != 0:
-        return "STAGED_MERGE"
+        return "SEGMENT_SCATTER"
     return "GATHER_SCATTER"
 
 
+# -- Main benchmark -----------------------------------------------------------
+
 def run_strategy_compare(args):
-    """Drive each CE form across both H2D and D2H, 3 CE configs each, plus
-    force-path head-to-head, for each size in args.sizes.
-    """
+    """Run all viable strategies per form, select fastest as recommendation."""
     num_gpus = args.num_gpus
     threshold = 8
     cta = 16
+    # PER_BLOCK baseline is pattern-independent. Cache by (size, layout, mode,
+    # dir) so we only time it once per unique combo.
+    baseline_cache = {}
 
-    print("=" * 96)
-    print("  CE Strategy Comparison: 5 forms x 2 dirs x 2 configs + force-path")
-    print("=" * 96)
-    print("  GPUs:        {}".format(num_gpus))
-    print("  Sizes:       {}".format(args.sizes))
-    print("  Threshold:   {}".format(threshold))
-    print("  CTA count:   {}".format(cta))
-    print("  Iters:       {}".format(args.iters))
-    print("  Configs:     {}".format(", ".join(c[0] for c in PATH_CONFIGS)))
-    print("=" * 96)
+    print("=" * 100)
+    print("  CE Strategy Auto-Selection: 5 strategies head-to-head + recommended")
+    print("=" * 100)
+    print("  GPUs:       {}".format(num_gpus))
+    print("  Sizes:      {}".format(args.sizes))
+    print("  Threshold:  {}".format(threshold))
+    print("  Iters:      {}".format(args.iters))
+    print("  Strategies: {}".format(", ".join(s[1] for s in STRATEGIES)))
+    print("=" * 100)
 
-    # results[size][(form_name, dir_name)][config_label] = median_ms
+    # results[size][(form_name, dir_name)][strategy_name] = median_ms
     all_results = defaultdict(lambda: defaultdict(dict))
 
     for size_name in args.sizes:
@@ -430,7 +378,11 @@ def run_strategy_compare(args):
 
         for pattern, layout_key, is_mla, mode, dirs, viable in PATH_FORMS:
             mla_tag = "mla" if is_mla else "mha"
-            form_name = "{}/{}/{}/{}".format(pattern, layout_key, mla_tag, mode)
+            # MHA mode is don't-care — don't show it in the form name.
+            if is_mla:
+                form_name = "{}/{}/{}/{}".format(pattern, layout_key, mla_tag, mode)
+            else:
+                form_name = "{}/{}/{}".format(pattern, layout_key, mla_tag)
             if pattern == "scattered" and num_blocks <= threshold:
                 print("  SKIP {} (num_blocks={} <= threshold={})".format(
                     form_name, num_blocks, threshold))
@@ -454,26 +406,29 @@ def run_strategy_compare(args):
             for is_h2d in dirs:
                 dir_name = "H2D" if is_h2d else "D2H"
                 key = (form_name, dir_name)
-                # Compute the path choose_path would auto-pick for this
-                # (form, dir) so we can annotate the opt row.
                 auto_path = python_choose_path(
                     pattern, layout_key, mode, is_h2d, threshold,
                     head_dim * ES, is_mla=is_mla)
                 results[key]["auto_path"] = auto_path
-                print("\n-- Form: {} | pattern={} | layout={} | mode={} | dir={} | auto={} --".format(
-                    form_name, pattern, layout_key, mode, dir_name, auto_path))
+                if is_mla:
+                    form_display = "{} | {} | mla-{}".format(pattern, layout_key, mode)
+                else:
+                    form_display = "{} | {} | mha".format(pattern, layout_key)
+                print("\n-- {} | {} | auto={} --".format(
+                    form_display, dir_name, auto_path))
 
-                # Step 1: two CE configs (baseline / opt)
-                for cfg_label, path_opt in PATH_CONFIGS:
-                    path_tag = ""
-                    if cfg_label == "opt":
-                        path_tag = " [{}]".format(auto_path)
-                    print("  {}{} ...".format(cfg_label, path_tag), end=" ",
-                          flush=True)
+                # Run baseline (PER_BLOCK, path_opt=false) — cached
+                bk = (size_name, layout_key, mode, dir_name)
+                cached_bs = baseline_cache.get(bk)
+                if cached_bs is not None:
+                    results[key]["baseline"] = cached_bs
+                    print("  baseline (cached) {:.3f} ms".format(cached_bs))
+                else:
+                    print("  baseline ...", end=" ", flush=True)
                     try:
                         tp = make_tp_group(
                             cpu_kv.data_ptr(), all_gpu, num_gpus, gpu_layout,
-                            num_layers, ce_path_opt=path_opt,
+                            num_layers, ce_path_opt=False,
                             ce_segment_threshold=threshold,
                             ce_is_mla=is_mla,
                             ce_is_blockfirst=(layout_key == "bfirst"))
@@ -481,21 +436,38 @@ def run_strategy_compare(args):
                             tp, ids, cpu_kv_sb, cpu_ly_sb, cpu_bl_sb, cpu_tp_sb,
                             num_layers, is_h2d, num_gpus, args.iters, is_mla, mode,
                             transfer_num_cta=cta)
-                        results[key][cfg_label] = med
+                        results[key]["baseline"] = med
+                        baseline_cache[bk] = med
                         print("{:.3f} ms".format(med))
                         del tp
                     except Exception as e:
                         print("FAILED: {}".format(e))
 
-                # Step 2: force each viable path (under opt), skip auto-pick
-                # (forcing to the same path as auto is redundant — opt already
-                # shows that result).
+                # Run auto (force_path=-1, choose_path decides)
+                print("  auto [{}] ...".format(auto_path), end=" ", flush=True)
+                try:
+                    tp = make_tp_group(
+                        cpu_kv.data_ptr(), all_gpu, num_gpus, gpu_layout,
+                        num_layers, ce_path_opt=True,
+                        ce_segment_threshold=threshold,
+                        ce_force_path=-1,
+                        ce_is_mla=is_mla,
+                        ce_is_blockfirst=(layout_key == "bfirst"))
+                    med = bench_one_dir(
+                        tp, ids, cpu_kv_sb, cpu_ly_sb, cpu_bl_sb, cpu_tp_sb,
+                        num_layers, is_h2d, num_gpus, args.iters, is_mla, mode,
+                        transfer_num_cta=cta)
+                    results[key]["auto"] = med
+                    print("{:.3f} ms".format(med))
+                    del tp
+                except Exception as e:
+                    print("FAILED: {}".format(e))
+
+                # Run each viable strategy (skip auto-pick — redundant)
                 for fp_id, fp_name in viable:
                     if fp_name == auto_path:
-                        results[key]["force_" + fp_name] = None  # skip
                         continue
-                    label = "force_" + fp_name
-                    print("  {} ...".format(label), end=" ", flush=True)
+                    print("  {} ...".format(fp_name), end=" ", flush=True)
                     try:
                         tp = make_tp_group(
                             cpu_kv.data_ptr(), all_gpu, num_gpus, gpu_layout,
@@ -508,11 +480,11 @@ def run_strategy_compare(args):
                             tp, ids, cpu_kv_sb, cpu_ly_sb, cpu_bl_sb, cpu_tp_sb,
                             num_layers, is_h2d, num_gpus, args.iters, is_mla, mode,
                             transfer_num_cta=cta)
-                        results[key][label] = med
+                        results[key][fp_name] = med
                         print("{:.3f} ms".format(med))
                         del tp
                     except Exception as e:
-                        results[key][label] = None
+                        results[key][fp_name] = None
                         print("FAILED: {}".format(e))
 
             del all_gpu, cpu_kv
@@ -521,127 +493,126 @@ def run_strategy_compare(args):
     for size_name in args.sizes:
         results = all_results[size_name]
         num_layers, num_blocks, head_dim = SIZES[size_name]
-        print("\n" + "=" * 96)
+        print("\n" + "=" * 100)
         print("  Results for size={} ({}L / {}B / hd={})".format(
             size_name, num_layers, num_blocks, head_dim))
-        print("=" * 96)
+        print("=" * 100)
 
         # Build the list of (form_name, dir_name) rows actually run.
         run_rows = []
         for pattern, layout_key, is_mla, mode, dirs, viable in PATH_FORMS:
             if pattern == "scattered" and num_blocks <= threshold:
                 continue
-            form_name = "{}/{}/{}".format(pattern, layout_key, mode)
+            mla_tag = "mla" if is_mla else "mha"
+            if is_mla:
+                form_name = "{}/{}/{}/{}".format(pattern, layout_key, mla_tag, mode)
+            else:
+                form_name = "{}/{}/{}".format(pattern, layout_key, mla_tag)
             for is_h2d in dirs:
                 run_rows.append((form_name, "H2D" if is_h2d else "D2H", viable))
 
-        # -- Part 1: baseline vs opt ------------------------------------------
-        # The opt column is annotated with the path choose_path auto-picked
-        # (in brackets), e.g. `opt[STAGED_MERGE]`. Confirm by checking that
-        # opt timing matches force_<auto_path> in Part 2.
-        print("\n  Part 1: Optimization Config (baseline / opt)")
-        print("  '*' = fastest of the 2 for each row.")
-        print("  opt column annotated with choose_path auto-pick, e.g. 0.434[STAGED_MERGE].")
-        hdr = "{:>18s}  {:>4s}  {:>12s}  {:>20s}  {:>12s}".format(
-            "Form", "Dir", "baseline", "opt", "base/opt")
-        print("  " + hdr)
-        print("  " + "-" * len(hdr))
-
-        for form_name, dir_name, _ in run_rows:
-            cfgs = results.get((form_name, dir_name), {})
-            base = cfgs.get("baseline")
-            opt = cfgs.get("opt")
-            auto_path = cfgs.get("auto_path", "")
-            fastest = min((v for v in (base, opt) if v is not None),
-                          default=None)
-
-            def fmt_base(v):
-                if v is None:
-                    return "{:>12s}".format("-")
-                star = "*" if (fastest is not None and v == fastest) else " "
-                return "{:>11.3f}{}".format(v, star)
-
-            if opt is None:
-                opt_str = "{:>20s}".format("-")
-            else:
-                star = "*" if (fastest is not None and opt == fastest) else " "
-                tag = "[{}]".format(auto_path) if auto_path else ""
-                opt_str = "{:>13.3f}{:<6s}".format(opt, star + tag)
-
-            speedup = "-"
-            if base and opt and opt > 0:
-                speedup = "{:.2f}x".format(base / opt)
-            print("  {:>18s}  {:>4s}  {}  {}  {:>12s}".format(
-                form_name, dir_name, fmt_base(base), opt_str, speedup))
-
-        # -- Part 2: force-path head-to-head ----------------------------------
-        print("\n  Part 2: Force-Path Head-to-Head (all under opt)")
-        print("  'auto' = choose_path pick. '*' = fastest. Proves optimality.")
-        col_w = 16
-        hdr2 = "  {:>18s}  {:>4s}  {:>{w}s}".format("Form", "Dir", "auto", w=col_w)
-        for _, pname in ALL_FORCE_PATHS:
-            hdr2 += "  {:>{w}s}".format(pname, w=col_w)
-        print(hdr2)
-        print("  " + "-" * (len(hdr2) - 2))
+        col_w = 9
+        # Header
+        hdr = "  {:>32s}  {:>4s}  {:>{w}s}".format("Form", "Dir", "base", w=col_w)
+        for _, pname in STRATEGIES:
+            hdr += "  {:>{w}s}".format(STR_ABBR[pname], w=col_w)
+        hdr += "  {:>{w}s}".format("auto", w=col_w)
+        hdr += "  {:>16s}".format("recommended")
+        hdr += " {:>2s}".format("=")
+        print(hdr)
+        print("  " + "-" * (len(hdr) - 2))
 
         auto_wins = 0
         auto_total = 0
+
         for form_name, dir_name, viable in run_rows:
             cfgs = results.get((form_name, dir_name), {})
-            auto = cfgs.get("opt")
+            auto = cfgs.get("auto")
+            baseline = cfgs.get("baseline")
             auto_path = cfgs.get("auto_path", "")
             viable_names = {pn for _, pn in viable}
-            forced_dict = {}
-            for fp_id, fp_name in ALL_FORCE_PATHS:
-                if fp_name == auto_path:
-                    forced_dict[fp_name] = "(opt)"  # skip marker
-                elif fp_name in viable_names:
-                    forced_dict[fp_name] = cfgs.get("force_" + fp_name)
-                else:
-                    forced_dict[fp_name] = None
-            all_vals = [auto] + [v for v in forced_dict.values() if isinstance(v, (int, float))]
-            fastest = min((v for v in all_vals if v is not None), default=None)
 
-            def fmt2(v):
-                if v is None:
-                    return "{:>{w}s}".format("-", w=col_w)
-                if v == "(opt)":
-                    return "{:>{w}s}".format("(opt)", w=col_w)
-                star = "*" if (fastest is not None and v == fastest) else " "
-                return "{:>{w}.3f}{}".format(v, star, w=col_w - 1)
+            # Collect all strategy timings
+            strategy_times = {}
+            for _, pname in STRATEGIES:
+                if pname == auto_path:
+                    strategy_times[pname] = auto
+                elif pname in viable_names:
+                    strategy_times[pname] = cfgs.get(pname)
+                else:
+                    strategy_times[pname] = None
+
+            # Find fastest
+            all_vals = {k: v for k, v in strategy_times.items() if v is not None}
+            if all_vals:
+                recommended = min(all_vals, key=all_vals.get)
+                fastest_val = all_vals[recommended]
+            else:
+                recommended = "-"
+                fastest_val = None
+
+            # Check if auto matches recommended
+            auto_optimal = (auto is not None and fastest_val is not None
+                            and auto == fastest_val)
 
             if auto is not None:
                 auto_total += 1
-                if auto == fastest:
+                if auto_optimal:
                     auto_wins += 1
-            line = "  {:>18s}  {:>4s}  {}".format(
-                form_name, dir_name, fmt2(auto))
-            for _, pname in ALL_FORCE_PATHS:
-                line += "  {}".format(fmt2(forced_dict.get(pname)))
+
+            # Format row
+            def fmt_val(v, is_fastest):
+                if v is None:
+                    return "{:>{w}s}".format("-", w=col_w)
+                star = "*" if is_fastest else " "
+                return "{:>{w}.3f}{}".format(v, star, w=col_w - 1)
+
+            line = "  {:>32s}  {:>4s}".format(form_name, dir_name)
+            # baseline column
+            if baseline is None:
+                line += "  {:>{w}s}".format("-", w=col_w)
+            else:
+                line += "  {:>{w}.3f} ".format(baseline, w=col_w - 1)
+            for _, pname in STRATEGIES:
+                v = strategy_times.get(pname)
+                is_fast = (v is not None and v == fastest_val)
+                line += "  {}".format(fmt_val(v, is_fast))
+
+            # auto column
+            if auto is None:
+                line += "  {:>{w}s}".format("-", w=col_w)
+            else:
+                star = "*" if auto_optimal else " "
+                line += "  {:>{w}.3f}{}".format(auto, star, w=col_w - 1)
+
+            # recommended + match
+            match_sym = "=" if auto_optimal else "!" if auto is not None else "?"
+            line += "  {:>16s}".format(recommended)
+            line += " {:>2s}".format(match_sym)
             print(line)
 
-        print("\n  " + "-" * (len(hdr2) - 2))
+        print("  " + "-" * (len(hdr) - 2))
         if auto_total:
-            print("  choose_path auto pick fastest in {}/{} rows.".format(
+            print("  choose_path auto pick optimal in {}/{} rows.".format(
                 auto_wins, auto_total))
             if auto_wins == auto_total:
                 print("  => choose_path is OPTIMAL for this size.")
             else:
-                print("  => inspect rows where auto did NOT win.")
-        print("  Note: forced paths may produce incorrect data -- timing only.")
-        print("=" * 96)
+                print("  => inspect rows marked '!' (auto not fastest).")
+        print("  '*' = fastest strategy. '=' = auto matches recommended. '!' = auto NOT optimal.")
+        print("=" * 100)
 
 
 # -- Main --------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Microbenchmark CE transfer strategy comparison "
-                    "(5 forms x 2 configs + force-path head-to-head)")
+        description="Microbenchmark CE transfer strategy auto-selection "
+                    "(5 strategies head-to-head + recommended)")
     parser.add_argument("--num-gpus", type=int, default=0,
                         help="Number of GPUs (0 = all available, default: 0)")
     parser.add_argument("--iters", type=int, default=20,
-                        help="Timing iterations per config (default: 20)")
+                        help="Timing iterations per strategy (default: 20)")
     parser.add_argument("--sizes", nargs="+", default=list(SIZES.keys()),
                         choices=list(SIZES.keys()),
                         help="Data sizes to test (default: all)")
