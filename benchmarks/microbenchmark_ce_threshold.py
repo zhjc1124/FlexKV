@@ -8,9 +8,9 @@ time and the output makes that choice explicit ("<-- best for THIS case").
 
 Background — segment_threshold semantics (authoritative):
   The CE engine's choose_path() uses segment_threshold to pick between
-  STAGED_SCATTER (segment memcpy through a staging buffer) and GATHER_SCATTER
+  STAGED_MERGE/STAGED_BLOCK (segment memcpy through a staging buffer) and GATHER_SCATTER
   (GPU index_select/copy):
-    - num_segments <= threshold -> STAGED_SCATTER
+    - num_segments <= threshold -> STAGED_MERGE/STAGED_BLOCK
                                     (or SEGMENTED_DIRECT if the dst is
                                      physically contiguous / LAYERFIRST)
     - num_segments >  threshold -> GATHER_SCATTER

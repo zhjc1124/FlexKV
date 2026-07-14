@@ -137,7 +137,7 @@ void transfer_kv_blocks(
         gpu_block_stride_in_bytes);
 
     // path_opt_enabled: PER_BLOCK baseline when off; otherwise choose_path()
-    // picks one of the four optimized strategies (see CEPath in ce_transfer.h).
+    // picks one of the five optimized strategies (see CEPath in ce_transfer.h).
     if (!ce_config.path_opt_enabled) {
       ce_transfer_per_block<Type>(
           num_blocks, start_layer_id, num_layers, kv_dim,
@@ -148,9 +148,9 @@ void transfer_kv_blocks(
           chunk_size_in_bytes, stream, is_host_to_device);
     } else {
       // BF MLA preprocess: D2D transpose (before choose_path, not via the
-      // four CEPath strategies). Triggered when BLOCKFIRST + MLA + CPU
+      // five CEPath strategies). Triggered when BLOCKFIRST + MLA + CPU
       // non-contiguous + GPU contiguous (non-sharded). Sharded D2H
-      // (!gpu_phys_contig) falls through to choose_path -> STAGED_SCATTER.
+      // (!gpu_phys_contig) falls through to choose_path -> STAGED_BLOCK.
       if (ce_config.is_blockfirst && ce_config.is_mla &&
           !analysis.cpu_phys_contig && analysis.gpu_phys_contig) {
         ce_transfer_bf_d2d_transpose<Type>(
@@ -170,8 +170,8 @@ void transfer_kv_blocks(
       // force_path: test/benchmark override (production never sets it).
       CEPath path;
       if (ce_config.force_path >= 0) {
-        TORCH_CHECK(ce_config.force_path <= 3,
-                    "force_path out of range [0,3]: ", ce_config.force_path);
+        TORCH_CHECK(ce_config.force_path <= 4,
+                    "force_path out of range [0,4]: ", ce_config.force_path);
         path = static_cast<CEPath>(ce_config.force_path);
       } else {
         path = choose_path(analysis, ce_config, chunk_size_in_bytes);
@@ -197,7 +197,8 @@ void transfer_kv_blocks(
               chunk_size_in_bytes, stream, is_host_to_device, analysis,
               ce_config);
           break;
-        case CEPath::STAGED_SCATTER:
+        case CEPath::STAGED_MERGE:
+        case CEPath::STAGED_BLOCK:
           ce_transfer_staged_scatter<Type>(
               num_blocks, start_layer_id, num_layers, kv_dim,
               gpu_block_ids, gpu_tensor_handler,

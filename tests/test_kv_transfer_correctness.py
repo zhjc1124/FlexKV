@@ -404,7 +404,7 @@ def layerwise_h2d_readback(all_gpu, cpu_kv, num_gpus, gpu_layout, num_layers,
 
     notify_mode: "hostfunc" (default, uses CUDA hostfunc callback) or
     "polling" (uses a CPU polling thread that queries cudaEventQuery per
-    batch).  Polling mode exercises the async GATHER_SCATTER/STAGED_SCATTER
+    batch).  Polling mode exercises the async GATHER_SCATTER/STAGED_MERGE/STAGED_BLOCK
     path (sync=false) that was previously deadlocked.
     """
     lw_group = make_layerwise_group(cpu_kv, all_gpu, num_gpus,
@@ -954,17 +954,17 @@ def test_invalid_mode_fallback():
 # ---------------------------------------------------------------------------
 # CE adaptive strategy tests
 #
-# The C++ CE engine selects among four execution strategies (see the CEPath
+# The C++ CE engine selects among five execution strategies (see the CEPath
 # taxonomy in csrc/ce_transfer.h) plus the BF MLA preprocess. path_opt_enabled
-# picks PER_BLOCK (baseline) vs the four optimized strategies; choose_path()
+# picks PER_BLOCK (baseline) vs the five optimized strategies; choose_path()
 # picks among the optimized ones by block-id contiguity + CPU/GPU layout:
 #   PER_BLOCK        — one memcpy per block (baseline, path_opt=False)
 #   BULK_CONTIG      — single large memcpy (contiguous ids + dst phys contig)
 #   SEGMENTED_DIRECT — per-run memcpy, dst phys contig (LAYERFIRST), no staging
-#   STAGED_SCATTER   — staging buffer + CPU scatter (dst strided / BLOCKFIRST);
-#                      two GPU-side variants selected by src_phys_contig:
-#                        STAGED_CONTIG_RUN — GPU blocks contiguous (non-sharded)
-#                        STAGED_PER_BLOCK  — GPU blocks strided (sharded D2H)
+#   STAGED_MERGE     — staging buffer + CPU scatter (dst strided / BLOCKFIRST),
+#                      GPU contiguous (non-sharded) -> merged segment memcpy
+#   STAGED_BLOCK     — staging buffer + CPU scatter (sharded D2H),
+#                      GPU non-contiguous -> per-block memcpy
 #   GATHER_SCATTER   — GPU index_select/index_copy_ (many segments > threshold)
 # BF_D2D_TRANSPOSE is a preprocess entry (checked before choose_path, not a
 # CEPath enum value): BF MLA D2D transpose when BLOCKFIRST + MLA + non-sharded.
@@ -976,8 +976,8 @@ def test_invalid_mode_fallback():
 #   scattered  — random permutation           → N segments (>8)
 #
 # Strategy is chosen automatically from strides; there is no force override.
-# Coverage of the four optimized strategies + the two STAGED_SCATTER variants
-# is asserted by test_ce_strategy_coverage below (via _expected_strategy).
+# Coverage of the five optimized strategies is asserted by
+# test_ce_strategy_coverage below (via _expected_strategy).
 #
 # ce_path_opt (baseline vs optimized) is a per-construction CETransferConfig
 # field (bindings.cpp sets cfg.path_opt_enabled from the ctor arg), NOT env-
@@ -1032,14 +1032,14 @@ CE_PATTERNS = ["contiguous", "few_seg", "scattered"]
 # segment_threshold is swept as an orthogonal dimension. threshold=8 is the
 # production default; threshold=2 is small enough that "scattered" (~N segments)
 # exceeds it for every size with num_blocks > 2, so even the small sizes
-# (nb=4/8) exercise GATHER_SCATTER / STAGED_PER_BLOCK instead of skipping.
+# (nb=4/8) exercise GATHER_SCATTER / STAGED_BLOCK instead of skipping.
 # It also tests the threshold config itself. scattered still skips only when
 # num_blocks <= threshold (i.e. it cannot form more than `threshold` segments).
 CE_SEGMENT_THRESHOLDS = [8, 2]
 
 # enable_memcpy2d is swept as an orthogonal dimension. When True and the path
-# is STAGED_SCATTER and direction is D2H, the C++ engine uses cudaMemcpy2DAsync
-# instead of staging+scatter. It has no effect on H2D or non-STAGED_SCATTER
+# is STAGED_MERGE/STAGED_BLOCK and direction is D2H, the C++ engine uses cudaMemcpy2DAsync
+# instead of staging+scatter. It has no effect on H2D or non-STAGED_MERGE/STAGED_BLOCK
 # paths (the C++ check is `if (ce_config.enable_memcpy2d && !is_host_to_device)`).
 # CE_MEMCPY2D_CONFIGS defined near top of file (before first use).
 
@@ -1072,13 +1072,14 @@ def make_block_id_pattern(pattern_name, num_blocks):
 
 def _expected_strategy(pattern_name, cpu_layout_name, is_mla, mode,
                        is_host_to_device, num_blocks=64, threshold=8):
-    """Predict which CE strategy (and STAGED_SCATTER variant) auto-selection
-    should pick, mirroring csrc/ce_transfer.cu choose_path().
+    """Predict which CE strategy auto-selection should pick, mirroring
+    csrc/ce_transfer.cu choose_path().
 
     Returns (strategy, variant) where strategy is one of
-    BULK_CONTIG / SEGMENTED_DIRECT / STAGED_SCATTER / GATHER_SCATTER /
-    PREPROCESS_BF_TRANSPOSE and variant is STAGED_CONTIG_RUN /
-    STAGED_PER_BLOCK for STAGED_SCATTER else "".
+    BULK_CONTIG / SEGMENTED_DIRECT / STAGED_MERGE / STAGED_BLOCK /
+    GATHER_SCATTER / PREPROCESS_BF_TRANSPOSE and variant is always ""
+    (STAGED_MERGE and STAGED_BLOCK are now independent CEPath values, not
+    internal variants of a single STAGED_MERGE/STAGED_BLOCK path).
 
     Key stride facts (see cpu_layout_for_mode / tp_transfer_thread_group.cpp):
       dst_phys_contig  == (cpu_block_stride == chunk_size)  -> LAYERFIRST only.
@@ -1086,13 +1087,13 @@ def _expected_strategy(pattern_name, cpu_layout_name, is_mla, mode,
         Non-sharded (all_write / rank0_only / non-MLA) always contiguous.
         sharded D2H shrinks chunk_size to a shard while gpu_block_stride stays
         the full block -> NOT contiguous. sharded H2D uses the full chunk, so
-        it IS contiguous. Hence STAGED_PER_BLOCK arises only on the sharded
-        D2H leg; the H2D leg of the same case is STAGED_CONTIG_RUN.
+        it IS contiguous. Hence STAGED_BLOCK arises only on the sharded
+        D2H leg; the H2D leg of the same case is STAGED_MERGE.
     PREPROCESS_BF_TRANSPOSE is selected when !dst_phys && BLOCKFIRST && is_mla
       && gpu_phys_contig (BF MLA rank0_only/all_write, non-sharded). It is a
       preprocess entry checked before choose_path, not a CEPath strategy.
-      Sharded D2H (!gpu_phys_contig) falls through to STAGED_SCATTER.
-      BF MHA also falls through to STAGED_SCATTER.
+      Sharded D2H (!gpu_phys_contig) falls through to STAGED_BLOCK.
+      BF MHA also falls through to STAGED_MERGE.
     segment_threshold decides the STAGED/GATHER crossover: with a small
     threshold even few_seg (4 segments) can exceed it and route to
     GATHER_SCATTER, exactly as choose_path() does.
@@ -1113,19 +1114,19 @@ def _expected_strategy(pattern_name, cpu_layout_name, is_mla, mode,
     # BULK_CONTIG: logical + physical contiguity on both sides.
     if pattern_name == "contiguous" and dst_phys and src_phys:
         return ("BULK_CONTIG", "")
-    # Sharded D2H (!gpu_phys_contig) -> always STAGED_SCATTER (PER_BLOCK).
+    # Sharded D2H (!gpu_phys_contig) -> always STAGED_BLOCK (per-block memcpy).
     if not src_phys:
-        return ("STAGED_SCATTER", "STAGED_PER_BLOCK")
-    # BF MLA preprocess: D2D transpose (before choose_path, not a four-path
+        return ("STAGED_BLOCK", "")
+    # BF MLA preprocess: D2D transpose (before choose_path, not a five-path
     # strategy). Only for MLA with gpu_phys_contig (non-sharded); sharded D2H
-    # (!gpu_phys_contig) is caught by the STAGED_SCATTER check above.
+    # (!gpu_phys_contig) is caught by the STAGED_BLOCK check above.
     if not dst_phys and is_blockfirst and is_mla and src_phys:
         return ("PREPROCESS_BF_TRANSPOSE", "")
-    # LAYERFIRST or BF MHA: few segments -> SEGMENTED_DIRECT or STAGED_SCATTER.
+    # LAYERFIRST or BF MHA: few segments -> SEGMENTED_DIRECT or STAGED_MERGE.
     if num_segments <= threshold:
         if dst_phys:
             return ("SEGMENTED_DIRECT", "")
-        return ("STAGED_SCATTER", "STAGED_CONTIG_RUN")
+        return ("STAGED_MERGE", "")
     # many segments, src contiguous -> GATHER_SCATTER
     return ("GATHER_SCATTER", "")
 
@@ -1144,12 +1145,12 @@ def test_ce_paths_roundtrip(data_config, is_mla, cpu_layout_name, pattern,
     Combos come from CE_MODE_CONFIGS: MLA sizes x {sharded, all_write,
     rank0_only}, plus non-MLA sizes once (mode is a don't-care for MHA).
     Each pattern triggers a different auto-selected CE strategy:
-      contiguous -> BULK_CONTIG (LF) / STAGED_SCATTER (BF)
-      few_seg    -> SEGMENTED_DIRECT (LF) / STAGED_SCATTER (BF)
+      contiguous -> BULK_CONTIG (LF) / STAGED_MERGE (BF)
+      few_seg    -> SEGMENTED_DIRECT (LF) / STAGED_MERGE (BF)
       scattered  -> GATHER_SCATTER (LF/BF non-sharded) /
-                    STAGED_SCATTER per-block (sharded D2H)
-    (STAGED_SCATTER picks STAGED_CONTIG_RUN vs STAGED_PER_BLOCK internally by
-    src_phys_contig; see _expected_strategy and test_ce_strategy_coverage.)
+                    STAGED_BLOCK per-block (sharded D2H)
+    (STAGED_MERGE vs STAGED_BLOCK is chosen by choose_path based on
+    gpu_phys_contig; see _expected_strategy and test_ce_strategy_coverage.)
     """
     skip_if_engine_unsupported(use_ce=True)
     num_layers, num_blocks, tpb, num_heads, head_dim = data_config
@@ -1267,7 +1268,7 @@ def test_ce_paths_layerwise_h2d(data_config, is_mla, cpu_layout_name, pattern,
     Combos come from CE_MODE_CONFIGS: MLA sizes x {sharded, all_write,
     rank0_only} plus non-MLA sizes once (mode is a don't-care for MHA).
 
-    notify_mode="polling" exercises the async GATHER_SCATTER/STAGED_SCATTER
+    notify_mode="polling" exercises the async GATHER_SCATTER/STAGED_MERGE/STAGED_BLOCK
     path (sync=false), which was previously deadlocked by internal
     cudaStreamSynchronize. hostfunc mode is already covered by the default
     in other layerwise tests, so we only sweep polling here to avoid doubling
@@ -1275,7 +1276,7 @@ def test_ce_paths_layerwise_h2d(data_config, is_mla, cpu_layout_name, pattern,
     """
     skip_if_engine_unsupported(use_ce=True)
     # memcpy2d now applies to H2D as well (symmetric to D2H): when the
-    # selected path is STAGED_SCATTER and enable_memcpy2d=True, H2D goes
+    # selected path is STAGED_MERGE/STAGED_BLOCK and enable_memcpy2d=True, H2D goes
     # through the cudaMemcpy2DAsync branch. Other paths
     # (PREPROCESS_BF_TRANSPOSE/BULK_CONTIG/SEGMENTED_DIRECT/GATHER_SCATTER) do not
     # consult enable_memcpy2d, so their behavior is unchanged.
@@ -1339,7 +1340,7 @@ def test_ce_paths_layerwise_h2d(data_config, is_mla, cpu_layout_name, pattern,
 
     # Step 2: H2D via LayerwiseTransferGroup (test target). path_opt selects
     # baseline (PER_BLOCK) vs optimized (BULK_CONTIG / SEGMENTED_DIRECT /
-    # STAGED_SCATTER / GATHER_SCATTER) on the H2D path.
+    # STAGED_MERGE / STAGED_BLOCK / GATHER_SCATTER) on the H2D path.
     # (Step 1 above intentionally keeps default config -- it only prepares the
     # reference CPU data, the swept dims apply to this H2D test target.)
     layerwise_h2d_readback(
@@ -1468,29 +1469,28 @@ def test_mla_designated_rank_d2h(data_config, designated_rank):
 
 
 def test_ce_strategy_coverage():
-    """Assert the swept parametrize space covers every optimized strategy and
-    both STAGED_SCATTER variants, and print the selection matrix.
+    """Assert the swept parametrize space covers every optimized strategy,
+    and print the selection matrix.
 
     This is still an analytical mapping (mirrors choose_path); it does not
     introspect the C++ choice at runtime — that would need the engine to
-    expose a path/variant counter. But it guarantees the test suite is not
-    silently skipping a whole strategy or the sharded per-block variant.
+    expose a path counter. But it guarantees the test suite is not
+    silently skipping a whole strategy.
     """
     skip_if_engine_unsupported(use_ce=True)
     rows = _strategy_matrix()
 
     print("\n  CE strategy selection matrix "
-          "(pattern / layout / mode / dir -> strategy[:variant]):")
+          "(pattern / layout / mode / dir -> strategy):")
     print("  " + "-" * 72)
     for label, strat, variant in rows:
         shown = strat + (":" + variant if variant else "")
         print("  {}  ->  {}".format(label, shown))
 
     strategies = {s for _, s, _ in rows}
-    variants = {v for _, _, v in rows if v}
 
     for required in ("BULK_CONTIG", "SEGMENTED_DIRECT",
-                     "STAGED_SCATTER", "GATHER_SCATTER"):
+                     "STAGED_MERGE", "STAGED_BLOCK", "GATHER_SCATTER"):
         assert required in strategies, \
             "no swept case exercises strategy {} (covered: {})".format(
                 required, sorted(strategies))
@@ -1499,11 +1499,6 @@ def test_ce_strategy_coverage():
     # Verify the preprocess path is still exercised by the swept space.
     assert "PREPROCESS_BF_TRANSPOSE" in strategies, \
         "no swept case exercises BF MLA preprocess (PREPROCESS_BF_TRANSPOSE)"
-
-    for required in ("STAGED_CONTIG_RUN", "STAGED_PER_BLOCK"):
-        assert required in variants, \
-            "no swept case exercises STAGED_SCATTER variant {} " \
-            "(covered: {})".format(required, sorted(variants))
 
 
 if __name__ == "__main__":

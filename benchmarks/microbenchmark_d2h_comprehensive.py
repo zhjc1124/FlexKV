@@ -5,7 +5,7 @@ Evaluates every combination discussed:
   Layouts: LAYERFIRST, BLOCKFIRST
   Modes: MHA, MLA rank0_only, MLA sharded, MLA all_write
   Approaches:
-    A. baseline: per-block cudaMemcpyAsync + CPU scatter (current STAGED_PER_BLOCK)
+    A. baseline: per-block cudaMemcpyAsync + CPU scatter (current STAGED_BLOCK)
     B. memcpy2d: per-(layer,segment) cudaMemcpy2DAsync, no scatter
     C. d2d_3path: D2D transpose + 3-path (contiguous memcpy / per-seg memcpy / per-block memcpy)
     D. d2d_memcpy2d: D2D transpose + cudaMemcpy2DAsync (for sharded strided)

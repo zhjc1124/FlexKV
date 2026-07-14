@@ -159,7 +159,7 @@ def main():
         enable_nvcomp=False,
         ce_segment_threshold=threshold,
         ce_path_opt=True,
-        ce_force_path=3)  # 3 = GATHER_SCATTER
+        ce_force_path=4)  # 4 = GATHER_SCATTER
 
     def do_transfer(is_h2d):
         tp.tp_group_transfer(

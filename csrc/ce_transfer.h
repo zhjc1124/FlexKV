@@ -24,18 +24,18 @@ struct CETransferConfig {
   // path_opt_enabled: master switch between the PER_BLOCK baseline (one memcpy
   // per block, the slow reference used to quantify optimization gains) and the
   // adaptive optimized strategies chosen by choose_path(). false = PER_BLOCK
-  // always; true = pick BULK_CONTIG / SEGMENTED_DIRECT / STAGED_SCATTER /
-  // GATHER_SCATTER based on block-id contiguity + CPU/GPU layout.
+  // always; true = pick BULK_CONTIG / SEGMENTED_DIRECT / STAGED_MERGE /
+  // STAGED_BLOCK / GATHER_SCATTER based on block-id contiguity + CPU/GPU layout.
   bool path_opt_enabled = true;
-  // force_path: test/benchmark only. -1 = auto (choose_path); 0-3 = force a
-  // specific CEPath (0=BULK_CONTIG, 1=SEGMENTED_DIRECT, 2=STAGED_SCATTER,
-  // 3=GATHER_SCATTER). Production MUST leave this at -1.
+  // force_path: test/benchmark only. -1 = auto (choose_path); 0-4 = force a
+  // specific CEPath (0=BULK_CONTIG, 1=SEGMENTED_DIRECT, 2=STAGED_MERGE,
+  // 3=STAGED_BLOCK, 4=GATHER_SCATTER). Production MUST leave this at -1.
   // Used by microbenchmark_ce_strategy.py to prove choose_path picks the
   // fastest strategy for each case (runs all viable paths head-to-head).
   // NOTE: BF_D2D_TRANSPOSE is no longer a CEPath enum value; it is a
   // preprocess entry checked before choose_path (see transfer.cu).
   int force_path = -1;
-  // enable_memcpy2d: when true, STAGED_SCATTER D2H uses cudaMemcpy2DAsync
+  // enable_memcpy2d: when true, STAGED_MERGE/STAGED_BLOCK D2H uses cudaMemcpy2DAsync
   // (strided D2H directly to CPU positions). Fast on NVIDIA (H20:
   // 58ms, 24 GiB/s), catastrophically slow on P800/Kunlunxin (12.8s, 0.11
   // GiB/s — the DMA engine does not handle 2D strided patterns). Default
@@ -58,8 +58,8 @@ struct CETransferConfig {
 // CE transfer strategy taxonomy
 // ============================================================================
 //
-// Every CE transfer is one of five execution strategies plus the BF MLA
-// preprocess. path_opt_enabled selects PER_BLOCK (the baseline) vs the four
+// Every CE transfer is one of six execution strategies plus the BF MLA
+// preprocess. path_opt_enabled selects PER_BLOCK (the baseline) vs the five
 // optimized strategies; among the optimized ones choose_path() picks based on
 // the CEAnalysis flags. BF_D2D_TRANSPOSE is a preprocess entry checked before
 // choose_path (see transfer.cu), not a CEPath enum value.
@@ -73,30 +73,32 @@ struct CETransferConfig {
 //   SEGMENTED_DIRECT few merged runs, dst physically contiguous: one memcpy
 //                   per contiguous run, straight CPU<->GPU. No staging, so
 //                   ping-pong does not apply.
-//   STAGED_SCATTER  dst NOT physically contiguous (BLOCKFIRST, or sharded D2H)
-//                   with few segments: copy via a pinned staging buffer, then
-//                   CPU scatter/gather to the strided destination. Uses
-//                   staging (D2H ping-pong enabled). Two internal GPU-side
-//                   variants, selected at runtime by gpu_phys_contig:
-//                     STAGED_CONTIG_RUN  GPU blocks contiguous  -> one memcpy
-//                                        per merged run between GPU and staging
-//                     STAGED_PER_BLOCK   GPU blocks NOT contiguous (sharded
-//                                        D2H) -> one memcpy per block
-//                   These are NOT top-level strategies: they share the same
-//                   staging + scatter + ping-pong machinery and differ only in
-//                   the innermost copy loop, so they live inside STAGED_SCATTER.
+//   STAGED_MERGE    BLOCKFIRST + GPU contiguous, few segments: copy via a
+//                   pinned staging buffer (merged segment memcpy), then CPU
+//                   scatter/gather to the strided destination. Uses staging
+//                   (D2H ping-pong enabled).
+//   STAGED_BLOCK    sharded D2H (GPU NOT contiguous), few segments: per-block
+//                   memcpy via a pinned staging buffer, then CPU scatter/gather.
+//                   Uses staging (D2H ping-pong disabled when both sides are
+//                   non-contiguous — per-block granularity makes event overhead
+//                   dominate).
+//   STAGED_MERGE and STAGED_BLOCK share the same ce_transfer_staged_scatter
+//   implementation (staging + scatter + ping-pong machinery); they differ only
+//   in the innermost copy loop, selected at runtime by gpu_phys_contig.
 //   GATHER_SCATTER  many scattered segments (> segment_threshold), GPU blocks
 //                   physically contiguous: GPU index_select gather (D2H) /
 //                   index_copy_ scatter (H2D) through a staging buffer. Uses
 //                   staging (D2H ping-pong enabled).
 //
-// ping-pong summary: D2H only, applies to STAGED_SCATTER and GATHER_SCATTER.
+// ping-pong summary: D2H only, applies to STAGED_MERGE, STAGED_BLOCK (when
+// not both-sides-non-contiguous), and GATHER_SCATTER.
 enum class CEPath : int {
   PER_BLOCK = -1,       // baseline (path_opt_enabled == false)
   BULK_CONTIG = 0,
   SEGMENTED_DIRECT = 1,
-  STAGED_SCATTER = 2,   // staging + CPU scatter (sharded D2H or BF few-seg)
-  GATHER_SCATTER = 3,
+  STAGED_MERGE = 2,     // BLOCKFIRST + GPU contiguous: merged segment memcpy + staging + scatter
+  STAGED_BLOCK = 3,     // sharded D2H (GPU non-contiguous): per-block memcpy + staging + scatter
+  GATHER_SCATTER = 4,
 };
 
 // ============================================================================
@@ -194,12 +196,12 @@ void ce_transfer_segmented_direct(
     const CEAnalysis &analysis, const CETransferConfig &ce_config);
 
 // ============================================================================
-// STAGED_SCATTER: pinned staging buffer + CPU scatter/gather to a strided
-//   destination. Uses staging (D2H ping-pong enabled). Chosen when dst NOT
-//   physically contiguous (BLOCKFIRST, or sharded D2H) with few segments.
-//   Internally selects a GPU-side variant at runtime by gpu_phys_contig:
-//     STAGED_CONTIG_RUN (GPU contiguous) -> merged-run memcpy GPU<->staging
-//     STAGED_PER_BLOCK  (sharded D2H)    -> per-block   memcpy GPU<->staging
+// STAGED_MERGE / STAGED_BLOCK: pinned staging buffer + CPU scatter/gather to a
+//   strided destination. Both paths share this implementation (selected by
+//   choose_path based on gpu_phys_contig). Internally selects a GPU-side copy
+//   loop at runtime by gpu_phys_contig:
+//     STAGED_MERGE  (gpu_phys_contig)     -> merged-run memcpy GPU<->staging
+//     STAGED_BLOCK  (!gpu_phys_contig)    -> per-block   memcpy GPU<->staging
 // ============================================================================
 template <BackendType Type>
 void ce_transfer_staged_scatter(
@@ -261,7 +263,7 @@ void ce_transfer_bf_d2d_transpose(
 //   physically adjacent, so we merge them into a single memcpy. When
 //   !cpu_phys_contig (BLOCKFIRST), consecutive block_ids have a stride gap
 //   between them, so each block must be scattered individually.
-//   Shared by STAGED_SCATTER and GATHER_SCATTER.
+//   Shared by STAGED_MERGE/STAGED_BLOCK and GATHER_SCATTER.
 // ============================================================================
 void scatter_to_cpu(const void *staging_buf, int64_t *cpu_ptr_int64,
                     int64_t *cpu_block_ids, int num_blocks,
@@ -275,7 +277,7 @@ void scatter_to_cpu(const void *staging_buf, int64_t *cpu_ptr_int64,
 // gather_from_cpu: gather from strided CPU positions to contiguous staging buf.
 //   H2D symmetric counterpart of scatter_to_cpu. Same parameters and merge
 //   optimization, with src/dst swapped and const-ness adjusted.
-//   Shared by STAGED_SCATTER and GATHER_SCATTER.
+//   Shared by STAGED_MERGE/STAGED_BLOCK and GATHER_SCATTER.
 // ============================================================================
 void gather_from_cpu(void *staging_buf, const int64_t *cpu_ptr_int64,
                      const int64_t *cpu_block_ids, int num_blocks,
