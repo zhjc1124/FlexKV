@@ -93,9 +93,8 @@ LAYOUTS = {
     "bfirst": KVCacheLayoutType.BLOCKFIRST,
 }
 
-# 4 strategies. MLA modes use is_mla=True; MHA uses is_mla=False.
+# 5 MLA strategies only (MHA excluded — this benchmark focuses on MLA mode comparison).
 STRATEGIES = [
-    ("MHA",         False, "sharded"),     # non-MLA, mode ignored
     ("MLA-sharded", True,  "sharded"),
     ("MLA-all_write", True, "all_write"),
     ("MLA-rank0_only", True, "rank0_only"),
