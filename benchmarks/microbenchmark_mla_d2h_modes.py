@@ -742,39 +742,6 @@ def main():
                             except Exception as e:
                                 print("FAILED: {}".format(e))
 
-                    # Request-level round-robin: rank0_only with designated_rank
-                    # rotating across GPUs each iteration (designated_rank = iter % num_gpus).
-                    if "MLA-rank0_only" in args.strategies:
-                        cpu_layout_type = LAYOUTS[layout_name]
-                        for cfg_label, path_opt in configs:
-                            dr_label = "MLA-rank_rotate"
-                            label = "{} | h2d={} | {} | {} | {} | {}".format(
-                                size_name, h2d_engine, engine_name, layout_name,
-                                dr_label, cfg_label)
-                            print("  Running: {} ...".format(label),
-                                  end=" ", flush=True)
-                            try:
-                                r = bench_one(
-                                    "MLA-rank0_only", True, "rank0_only", use_ce,
-                                    cpu_layout_type, num_gpus, num_layers,
-                                    num_blocks, head_dim, args.iters,
-                                    ce_path_opt=path_opt,
-                                    ce_segment_threshold=args.segment_threshold,
-                                    h2d_engine=h2d_engine,
-                                    rotate_designated_rank=True)
-                                r.update({
-                                    "size": size_name,
-                                    "layout": layout_name,
-                                    "strategy": dr_label,
-                                    "engine": engine_name,
-                                    "h2d_engine": h2d_engine,
-                                    "config": cfg_label,
-                                })
-                                results.append(r)
-                                print("avg={:.3f}ms".format(r["avg_ms"]))
-                            except Exception as e:
-                                print("FAILED: {}".format(e))
-
     print_results_table(results)
     print_analysis(results)
 
