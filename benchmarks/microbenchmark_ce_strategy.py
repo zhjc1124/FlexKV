@@ -356,9 +356,9 @@ def python_choose_path(pattern, layout_key, mode, is_h2d, threshold,
     else:  # scattered
         num_segments = threshold + 1  # > threshold
 
-    # BF_TRANSPOSE: checked first (BLOCKFIRST + MLA + !cpu_phys_contig).
+    # BF_TRANSPOSE: checked first (BLOCKFIRST + !cpu_phys_contig, covers MLA+MHA).
     # Covers both rank0_only/all_write and sharded D2H.
-    if is_blockfirst and is_mla and not cpu_phys_contig:
+    if is_blockfirst and not cpu_phys_contig:
         return "BF_TRANSPOSE"
     if cpu_phys_contig and gpu_phys_contig and num_segments == 1:
         return "BULK_CONTIG"

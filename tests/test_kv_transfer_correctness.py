@@ -980,7 +980,7 @@ def test_invalid_mode_fallback():
 #                      GPU non-contiguous -> per-block memcpy
 #   GATHER_SCATTER   — GPU index_select/index_copy_ (many segments > threshold)
 # BF_TRANSPOSE is CEPath(5), checked first in choose_path:
-#   BF MLA D2D transpose when BLOCKFIRST + MLA + !cpu_phys_contig.
+#   BF (BLOCKFIRST) + !cpu_phys_contig — covers both MLA and MHA.
 #   Covers both rank0_only/all_write and sharded D2H.
 #
 # We trigger each strategy by constructing block-id *permutations* of [0..N-1]
@@ -1125,9 +1125,9 @@ def _expected_strategy(pattern_name, cpu_layout_name, is_mla, mode,
         num_segments = num_blocks
 
     # choose_path() replica -----------------------------------------------
-    # BF_TRANSPOSE: BLOCKFIRST + MLA + CPU non-contiguous (checked first).
+    # BF_TRANSPOSE: BLOCKFIRST + !cpu_phys_contig (checked first, covers MLA+MHA).
     # Covers both rank0_only/all_write and sharded D2H.
-    if not dst_phys and is_blockfirst and is_mla:
+    if not dst_phys and is_blockfirst:
         return ("BF_TRANSPOSE", "")
     # BULK_CONTIG: logical + physical contiguity on both sides.
     if pattern_name == "contiguous" and dst_phys and src_phys:
