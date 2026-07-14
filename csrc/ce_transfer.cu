@@ -102,13 +102,20 @@ CEAnalysis analyze_ce_transfer(
 // self-describing name. GATHER_SCATTER (was Path 2) is unchanged.
 CEPath choose_path(const CEAnalysis &a, const CETransferConfig &ce_config,
                    int64_t chunk_size_in_bytes) {
+  // BF_TRANSPOSE: BLOCKFIRST + MLA + CPU non-contiguous.
+  // D2D transpose GPU LAYERFIRST -> dev_staging (contiguous), then direct
+  // per-segment memcpy to CPU. Covers both rank0_only/all_write and sharded.
+  // Must be checked before !gpu_phys_contig (sharded) since BF MLA sharded
+  // also benefits from transpose (12.4x vs STAGED_BLOCK).
+  if (ce_config.is_blockfirst && ce_config.is_mla && !a.cpu_phys_contig)
+    return CEPath::BF_TRANSPOSE;
+
   // BULK_CONTIG: logical + physical contiguity on both sides -> one big memcpy.
   if (a.gpu_log_contig && a.cpu_log_contig && a.cpu_phys_contig && a.gpu_phys_contig)
     return CEPath::BULK_CONTIG;
 
-  // Sharded D2H: !gpu_phys_contig (chunk shrunk to shard, stride = full chunk).
-  // Goes through STAGED_BLOCK which handles per-block memcpy and optional
-  // memcpy2d (enable_memcpy2d).
+  // Sharded D2H (LF + MLA sharded): !gpu_phys_contig (chunk shrunk to shard).
+  // Goes through STAGED_BLOCK which handles per-block memcpy.
   if (!a.gpu_phys_contig)
     return CEPath::STAGED_BLOCK;
 

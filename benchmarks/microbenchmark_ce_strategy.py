@@ -1,5 +1,5 @@
 """
-Microbenchmark: CE transfer strategy comparison (five execution forms + BF MLA preprocess).
+Microbenchmark: CE transfer strategy comparison (six CEPath strategies).
 
 Drives the C++ CE engine through each of its execution forms and compares
 two cumulative CE configs on every form, proving the optimization progression
@@ -11,8 +11,7 @@ The CE execution forms (see csrc/ce_transfer.h CEPath):
   - STAGED_MERGE      staging + CPU scatter, GPU side contiguous run (merged segment memcpy)
   - STAGED_BLOCK      staging + CPU scatter, GPU side per-block (sharded D2H)
   - GATHER_SCATTER    GPU index_select/index_copy_ pipeline (many segments)
-  BF_TRANSPOSE is a preprocess entry (not a CEPath enum value), triggered
-  before choose_path for BF MLA non-sharded cases. It cannot be force_path'd.
+  - BF_TRANSPOSE      BF MLA: D2D transpose + direct per-segment memcpy (checked first)
 
 Each form is triggered by a specific (block-id pattern, cpu_layout, mla_mode,
 direction). STAGED_BLOCK only appears on the sharded-D2H leg (the only
@@ -154,7 +153,7 @@ def make_tp_group(cpu_ptr, all_gpu, num_gpus, gpu_layout, num_layers,
                   ce_is_mla=False, ce_is_blockfirst=False):
     """TPTransferThreadGroup with CE config passed per-construction.
 
-    ce_force_path: test/benchmark only. -1 = auto (choose_path); 0-4 = force
+    ce_force_path: test/benchmark only. -1 = auto (choose_path); 0-5 = force
     a specific CEPath. Production never sets it.
     path_opt / segment_threshold go into the C++ CETransferConfig
     via ctor args (NOT env) -- matching production and the correctness tests.
@@ -273,8 +272,7 @@ def bench_one_dir(tp, ids, cpu_kv_sb, cpu_ly_sb, cpu_bl_sb, cpu_tp_sb,
 #   STAGED_MERGE(2)      always viable (staging works for any layout)
 #   STAGED_BLOCK(3)      always viable (staging works for any layout)
 #   GATHER_SCATTER(4)   needs gpu_phys_contig (no sharded D2H)
-# CEPath enum: 0=BULK_CONTIG, 1=SEGMENTED_DIRECT, 2=STAGED_MERGE, 3=STAGED_BLOCK, 4=GATHER_SCATTER
-# BF_TRANSPOSE is a preprocess entry (not a CEPath), cannot be force_path'd.
+# CEPath enum: 0=BULK_CONTIG, 1=SEGMENTED_DIRECT, 2=STAGED_MERGE, 3=STAGED_BLOCK, 4=GATHER_SCATTER, 5=BF_TRANSPOSE
 #
 # layout_key -> cpu_phys_contig: lfirst=True, bfirst=False
 # mode=sharded D2H -> gpu_phys_contig=False; otherwise True
@@ -282,12 +280,12 @@ def bench_one_dir(tp, ids, cpu_kv_sb, cpu_ly_sb, cpu_bl_sb, cpu_tp_sb,
 #
 # STAGED_BLOCK only exists in D2H+sharded (the only !gpu_phys_contig case).
 # H2D+sharded does NOT shrink chunk -> gpu_phys_contig stays true -> STAGED_MERGE.
-# BF_TRANSPOSE preprocess needs !cpu_phys_contig && is_blockfirst && is_mla && gpu_phys_contig (BF MLA non-sharded only).
+# BF_TRANSPOSE is checked first in choose_path: BLOCKFIRST + MLA + !cpu_phys_contig.
 PATH_FORMS = [
     ("BULK_CONTIG",
      "contiguous", "lfirst", True, "rank0_only",
      [True, False],  # H2D, D2H
-     [(0, "BULK_CONTIG"), (1, "SEGMENTED_DIRECT"), (2, "STAGED_MERGE"), (3, "STAGED_BLOCK"), (4, "GATHER_SCATTER")]),
+     [(0, "BULK_CONTIG"), (1, "SEGMENTED_DIRECT"), (2, "STAGED_MERGE"), (3, "STAGED_BLOCK"), (4, "GATHER_SCATTER"), (5, "BF_TRANSPOSE")]),
     ("SEGMENTED_DIRECT",
      "few_seg", "lfirst", True, "rank0_only",
      [True, False],
@@ -295,15 +293,15 @@ PATH_FORMS = [
     ("STAGED_MERGE",
      "few_seg", "bfirst", True, "rank0_only",
      [True, False],
-     [(2, "STAGED_MERGE"), (3, "STAGED_BLOCK"), (4, "GATHER_SCATTER")]),
+     [(2, "STAGED_MERGE"), (3, "STAGED_BLOCK"), (4, "GATHER_SCATTER"), (5, "BF_TRANSPOSE")]),
     ("STAGED_BLOCK",
      "scattered", "bfirst", True, "sharded",
      [False],  # D2H only: sharded D2H -> !gpu_phys_contig -> per-block memcpy
-     [(2, "STAGED_MERGE"), (3, "STAGED_BLOCK")]),
+     [(2, "STAGED_MERGE"), (3, "STAGED_BLOCK"), (5, "BF_TRANSPOSE")]),
     ("GATHER_SCATTER",
      "scattered", "bfirst", True, "rank0_only",
      [True, False],
-     [(2, "STAGED_MERGE"), (3, "STAGED_BLOCK"), (4, "GATHER_SCATTER")]),
+     [(2, "STAGED_MERGE"), (3, "STAGED_BLOCK"), (4, "GATHER_SCATTER"), (5, "BF_TRANSPOSE")]),
 ]
 
 # Two cumulative CE configs.
@@ -313,7 +311,7 @@ PATH_CONFIGS = [
     ("opt",      True),
 ]
 
-# All 5 CEPaths for Part 2's uniform column layout (not all viable for every
+# All 6 CEPaths for Part 2's uniform column layout (not all viable for every
 # form -- non-viable cells show '-').
 ALL_FORCE_PATHS = [
     (0, "BULK_CONTIG"),
@@ -321,6 +319,7 @@ ALL_FORCE_PATHS = [
     (2, "STAGED_MERGE"),
     (3, "STAGED_BLOCK"),
     (4, "GATHER_SCATTER"),
+    (5, "BF_TRANSPOSE"),
 ]
 
 

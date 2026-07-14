@@ -1077,7 +1077,7 @@ def _expected_strategy(pattern_name, cpu_layout_name, is_mla, mode,
 
     Returns (strategy, variant) where strategy is one of
     BULK_CONTIG / SEGMENTED_DIRECT / STAGED_MERGE / STAGED_BLOCK /
-    GATHER_SCATTER / PREPROCESS_BF_TRANSPOSE and variant is always ""
+    GATHER_SCATTER / BF_TRANSPOSE and variant is always ""
     (STAGED_MERGE and STAGED_BLOCK are now independent CEPath values, not
     internal variants of a single STAGED_MERGE/STAGED_BLOCK path).
 
@@ -1089,11 +1089,11 @@ def _expected_strategy(pattern_name, cpu_layout_name, is_mla, mode,
         the full block -> NOT contiguous. sharded H2D uses the full chunk, so
         it IS contiguous. Hence STAGED_BLOCK arises only on the sharded
         D2H leg; the H2D leg of the same case is STAGED_MERGE.
-    PREPROCESS_BF_TRANSPOSE is selected when !dst_phys && BLOCKFIRST && is_mla
-      && gpu_phys_contig (BF MLA rank0_only/all_write, non-sharded). It is a
-      preprocess entry checked before choose_path, not a CEPath strategy.
-      Sharded D2H (!gpu_phys_contig) falls through to STAGED_BLOCK.
-      BF MHA also falls through to STAGED_MERGE.
+    BF_TRANSPOSE is selected when !dst_phys && BLOCKFIRST && is_mla.
+      It is a CEPath strategy (enum value 5), checked first in choose_path.
+      Covers both non-sharded (rank0_only/all_write) and sharded D2H:
+      sharded D2H also benefits from transpose (12.4x vs STAGED_BLOCK).
+      BF MHA falls through to STAGED_MERGE.
     segment_threshold decides the STAGED/GATHER crossover: with a small
     threshold even few_seg (4 segments) can exceed it and route to
     GATHER_SCATTER, exactly as choose_path() does.
@@ -1111,17 +1111,16 @@ def _expected_strategy(pattern_name, cpu_layout_name, is_mla, mode,
         num_segments = num_blocks
 
     # choose_path() replica -----------------------------------------------
+    # BF_TRANSPOSE: BLOCKFIRST + MLA + CPU non-contiguous (checked first).
+    # Covers both rank0_only/all_write and sharded D2H.
+    if not dst_phys and is_blockfirst and is_mla:
+        return ("BF_TRANSPOSE", "")
     # BULK_CONTIG: logical + physical contiguity on both sides.
     if pattern_name == "contiguous" and dst_phys and src_phys:
         return ("BULK_CONTIG", "")
-    # Sharded D2H (!gpu_phys_contig) -> always STAGED_BLOCK (per-block memcpy).
+    # Sharded D2H (LF + MLA sharded, !gpu_phys_contig) -> STAGED_BLOCK.
     if not src_phys:
         return ("STAGED_BLOCK", "")
-    # BF MLA preprocess: D2D transpose (before choose_path, not a five-path
-    # strategy). Only for MLA with gpu_phys_contig (non-sharded); sharded D2H
-    # (!gpu_phys_contig) is caught by the STAGED_BLOCK check above.
-    if not dst_phys and is_blockfirst and is_mla and src_phys:
-        return ("PREPROCESS_BF_TRANSPOSE", "")
     # LAYERFIRST or BF MHA: few segments -> SEGMENTED_DIRECT or STAGED_MERGE.
     if num_segments <= threshold:
         if dst_phys:
@@ -1278,7 +1277,7 @@ def test_ce_paths_layerwise_h2d(data_config, is_mla, cpu_layout_name, pattern,
     # memcpy2d now applies to H2D as well (symmetric to D2H): when the
     # selected path is STAGED_MERGE/STAGED_BLOCK and enable_memcpy2d=True, H2D goes
     # through the cudaMemcpy2DAsync branch. Other paths
-    # (PREPROCESS_BF_TRANSPOSE/BULK_CONTIG/SEGMENTED_DIRECT/GATHER_SCATTER) do not
+    # (BF_TRANSPOSE/BULK_CONTIG/SEGMENTED_DIRECT/GATHER_SCATTER) do not
     # consult enable_memcpy2d, so their behavior is unchanged.
     num_layers, num_blocks, tpb, num_heads, head_dim = data_config
     if pattern == "scattered" and num_blocks <= segment_threshold:
@@ -1497,8 +1496,8 @@ def test_ce_strategy_coverage():
 
     # BF_TRANSPOSE is now a preprocess entry (not a CEPath strategy).
     # Verify the preprocess path is still exercised by the swept space.
-    assert "PREPROCESS_BF_TRANSPOSE" in strategies, \
-        "no swept case exercises BF MLA preprocess (PREPROCESS_BF_TRANSPOSE)"
+    assert "BF_TRANSPOSE" in strategies, \
+        "no swept case exercises BF MLA preprocess (BF_TRANSPOSE)"
 
 
 if __name__ == "__main__":

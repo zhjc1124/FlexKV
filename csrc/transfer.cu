@@ -147,34 +147,11 @@ void transfer_kv_blocks(
           cpu_block_stride_int64, cpu_startoff_inside_chunks_int64,
           chunk_size_in_bytes, stream, is_host_to_device);
     } else {
-      // BF MLA preprocess: D2D transpose (before choose_path, not via the
-      // five CEPath strategies). Triggered when BLOCKFIRST + MLA + CPU
-      // non-contiguous. Covers both non-sharded (gpu_phys_contig) and
-      // sharded D2H (!gpu_phys_contig): sharded D2H previously fell through
-      // to choose_path -> STAGED_BLOCK (per-block memcpy), but benchmark
-      // shows BF + sharded via D2D transpose is ~12.4x faster. sharded H2D
-      // is unaffected (H2D always has gpu_phys_contig == true).
-      if (ce_config.is_blockfirst && ce_config.is_mla &&
-          !analysis.cpu_phys_contig) {
-        ce_transfer_bf_transpose<Type>(
-            num_blocks, start_layer_id, num_layers, kv_dim,
-            gpu_block_ids, gpu_tensor_handler,
-            gpu_startoff_inside_chunks_int64, cpu_block_ids, cpu_ptr_int64,
-            cpu_kv_stride_int64, cpu_layer_stride_int64,
-            cpu_block_stride_int64, cpu_startoff_inside_chunks_int64,
-            chunk_size_in_bytes, stream, is_host_to_device, analysis,
-            ce_config);
-        if (sync) {
-          cudaStreamSynchronize(stream);
-        }
-        return;
-      }
-
       // force_path: test/benchmark override (production never sets it).
       CEPath path;
       if (ce_config.force_path >= 0) {
-        TORCH_CHECK(ce_config.force_path <= 4,
-                    "force_path out of range [0,4]: ", ce_config.force_path);
+        TORCH_CHECK(ce_config.force_path <= 5,
+                    "force_path out of range [0,5]: ", ce_config.force_path);
         path = static_cast<CEPath>(ce_config.force_path);
       } else {
         path = choose_path(analysis, ce_config, chunk_size_in_bytes);
@@ -222,6 +199,16 @@ void transfer_kv_blocks(
           break;
         case CEPath::GATHER_SCATTER:
           ce_transfer_gather_scatter<Type>(
+              num_blocks, start_layer_id, num_layers, kv_dim,
+              gpu_block_ids, gpu_tensor_handler,
+              gpu_startoff_inside_chunks_int64, cpu_block_ids, cpu_ptr_int64,
+              cpu_kv_stride_int64, cpu_layer_stride_int64,
+              cpu_block_stride_int64, cpu_startoff_inside_chunks_int64,
+              chunk_size_in_bytes, stream, is_host_to_device, analysis,
+              ce_config);
+          break;
+        case CEPath::BF_TRANSPOSE:
+          ce_transfer_bf_transpose<Type>(
               num_blocks, start_layer_id, num_layers, kv_dim,
               gpu_block_ids, gpu_tensor_handler,
               gpu_startoff_inside_chunks_int64, cpu_block_ids, cpu_ptr_int64,

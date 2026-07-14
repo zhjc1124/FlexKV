@@ -27,7 +27,7 @@ struct CETransferConfig {
   // always; true = pick BULK_CONTIG / SEGMENTED_DIRECT / STAGED_MERGE /
   // STAGED_BLOCK / GATHER_SCATTER based on block-id contiguity + CPU/GPU layout.
   bool path_opt_enabled = true;
-  // force_path: test/benchmark only. -1 = auto (choose_path); 0-4 = force a
+  // force_path: test/benchmark only. -1 = auto (choose_path); 0-5 = force a
   // specific CEPath (0=BULK_CONTIG, 1=SEGMENTED_DIRECT, 2=STAGED_MERGE,
   // 3=STAGED_BLOCK, 4=GATHER_SCATTER). Production MUST leave this at -1.
   // Used by microbenchmark_ce_strategy.py to prove choose_path picks the
@@ -102,6 +102,7 @@ enum class CEPath : int {
   STAGED_MERGE = 2,     // BLOCKFIRST + GPU contiguous: merged segment memcpy + staging + scatter
   STAGED_BLOCK = 3,     // sharded D2H (GPU non-contiguous): per-block memcpy + staging + scatter
   GATHER_SCATTER = 4,
+  BF_TRANSPOSE = 5,     // BF MLA: D2D transpose + direct per-segment memcpy (not via staging)
 };
 
 // ============================================================================
