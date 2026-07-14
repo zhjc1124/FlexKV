@@ -4,13 +4,19 @@ pay off vs staging+scatter?
 
 Sweeps segment run_len (contiguous blocks per segment) from 1 to N.
 For each run_len, measures D2H time with:
-  - force_path=2 (STAGED_MERGE) + enable_memcpy2d=1  -> memcpy2d branch
-  - force_path=2 (STAGED_MERGE) + enable_memcpy2d=0  -> staging+scatter
+  - enable_memcpy2d=1  -> memcpy2d branch
+  - enable_memcpy2d=0  -> staging+scatter
 
-Finds the crossover run_len where memcpy2d becomes faster.
+Modes:
+  --sharded : STAGED_BLOCK (sharded D2H, force_path=3, mla_d2h_mode=sharded)
+  default   : STAGED_MERGE (rank0_only, force_path=2, mla_d2h_mode=rank0_only)
 
 Usage:
+    # STAGED_MERGE (rank0_only)
     python benchmarks/microbenchmark_memcpy2d_threshold.py --num-gpus 8 --iters 20
+
+    # STAGED_BLOCK (sharded D2H)
+    python benchmarks/microbenchmark_memcpy2d_threshold.py --num-gpus 8 --iters 20 --sharded
 """
 
 import argparse
@@ -41,8 +47,8 @@ def make_pattern(num_blocks, run_len):
 
 
 def bench_one(num_gpus, num_layers, num_blocks, tpb, head_dim, run_len,
-              enable_memcpy2d, iters):
-    """Benchmark D2H with STAGED_MERGE (force_path=2), varying enable_memcpy2d."""
+              enable_memcpy2d, iters, sharded=False):
+    """Benchmark D2H. If sharded, uses STAGED_BLOCK (force_path=3); else STAGED_MERGE (force_path=2)."""
     is_mla = True
     kv_dim = 1
     heads = 1
@@ -63,7 +69,7 @@ def bench_one(num_gpus, num_layers, num_blocks, tpb, head_dim, run_len,
     cpu_stride_tp = cpu_stride_block // num_gpus
     chunk_size = gpu_layout.get_chunk_size() * ES
 
-    # GPU data (rank0_only: only rank0 writes, but all ranks need buffers)
+    # GPU data
     all_gpu = []
     gpu_ptrs = []
     for g in range(num_gpus):
@@ -77,6 +83,9 @@ def bench_one(num_gpus, num_layers, num_blocks, tpb, head_dim, run_len,
             gpu_ptrs.append(per_layer[l].data_ptr())
 
     cpu_kv = torch.zeros(tuple(cpu_layout.kv_shape), dtype=DTYPE, pin_memory=True)
+
+    mode = "sharded" if sharded else "rank0_only"
+    force_path = 3 if sharded else 2  # STAGED_BLOCK=3, STAGED_MERGE=2
 
     tp = TPTransferThreadGroup(
         num_gpus=num_gpus,
@@ -92,7 +101,7 @@ def bench_one(num_gpus, num_layers, num_blocks, tpb, head_dim, run_len,
         enable_nvcomp=False,
         ce_path_opt=True,
         ce_segment_threshold=999,
-        ce_force_path=2,  # STAGED_MERGE
+        ce_force_path=force_path,
         ce_enable_memcpy2d=enable_memcpy2d,
         ce_is_blockfirst=True,
         ce_is_mla=True)
@@ -109,7 +118,7 @@ def bench_one(num_gpus, num_layers, num_blocks, tpb, head_dim, run_len,
             cpu_tp_stride_in_bytes=cpu_stride_tp,
             transfer_num_cta=16, is_host_to_device=False, use_ce_transfer=True,
             layer_id=0, layer_granularity=num_layers, is_mla=True,
-            mla_d2h_mode="rank0_only")
+            mla_d2h_mode=mode)
         torch.cuda.synchronize()
 
     # Timing
@@ -124,7 +133,7 @@ def bench_one(num_gpus, num_layers, num_blocks, tpb, head_dim, run_len,
             cpu_tp_stride_in_bytes=cpu_stride_tp,
             transfer_num_cta=16, is_host_to_device=False, use_ce_transfer=True,
             layer_id=0, layer_granularity=num_layers, is_mla=True,
-            mla_d2h_mode="rank0_only")
+            mla_d2h_mode=mode)
         torch.cuda.synchronize()
         times.append((time.perf_counter() - t0) * 1000)
 
@@ -141,6 +150,8 @@ def main():
     parser.add_argument("--num-layers", type=int, default=80)
     parser.add_argument("--head-dim", type=int, default=512)
     parser.add_argument("--tpb", type=int, default=16)
+    parser.add_argument("--sharded", action="store_true",
+                        help="Test STAGED_BLOCK (sharded D2H) instead of STAGED_MERGE (rank0_only)")
     args = parser.parse_args()
 
     num_gpus = args.num_gpus
@@ -153,9 +164,10 @@ def main():
 
     chunk = args.tpb * 1 * args.head_dim * 1 * ES
     total_mb = args.num_layers * args.num_blocks * chunk / 1024 / 1024
+    mode_label = "STAGED_BLOCK (sharded)" if args.sharded else "STAGED_MERGE (rank0_only)"
 
     print("=" * 80)
-    print(f"  memcpy2d Threshold Benchmark")
+    print(f"  memcpy2d Threshold Benchmark — {mode_label}")
     print(f"  GPUs={num_gpus}, layers={args.num_layers}, blocks={args.num_blocks}, "
           f"hd={args.head_dim}, tpb={args.tpb}")
     print(f"  chunk_size={chunk} bytes, total D2H = {total_mb:.1f} MB")
@@ -170,9 +182,9 @@ def main():
         n_segs = args.num_blocks // rl
         try:
             t_m2d = bench_one(num_gpus, args.num_layers, args.num_blocks,
-                              args.tpb, args.head_dim, rl, True, args.iters)
+                              args.tpb, args.head_dim, rl, True, args.iters, args.sharded)
             t_stg = bench_one(num_gpus, args.num_layers, args.num_blocks,
-                              args.tpb, args.head_dim, rl, False, args.iters)
+                              args.tpb, args.head_dim, rl, False, args.iters, args.sharded)
         except Exception as e:
             print(f"{rl:>8} {n_segs:>6} FAILED: {e}")
             continue
@@ -190,8 +202,8 @@ def main():
         print(f"  memcpy2d becomes faster at run_len >= {crossover}")
         print(f"  Recommended memcpy2d threshold: run_len >= {crossover}")
     else:
-        print(f"  memcpy2d never faster than staging")
-        print(f"  Recommended: keep enable_memcpy2d=0")
+        print(f"  memcpy2d never faster than staging in this configuration")
+        print(f"  Recommended: keep enable_memcpy2d=0 for {mode_label}")
     print("=" * 70)
 
 
