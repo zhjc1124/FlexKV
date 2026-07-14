@@ -104,14 +104,6 @@ CEPath choose_path(const CEAnalysis &a, const CETransferConfig &ce_config,
   if (!a.gpu_phys_contig)
     return CEPath::STAGED_SCATTER;
 
-  // BF MLA rank0_only/all_write: D2D transpose helps because MLA has no head
-  // split (num_heads=1, block_stride=chunk_size). After transpose, GPU layout
-  // matches CPU BLOCKFIRST -> per-segment contiguous cudaMemcpyAsync.
-  // BF MHA (is_blockfirst && !is_mla) still has tp-strided layout after
-  // transpose, so D2D transpose does not help -> falls through to below.
-  if (!a.cpu_phys_contig && ce_config.is_blockfirst && ce_config.is_mla)
-    return CEPath::BF_D2D_TRANSPOSE;
-
   // LAYERFIRST or BF MHA: four paths by contiguity.
   // LAYERFIRST non-MLA (!cpu_phys_contig && !is_blockfirst): STAGED_SCATTER
   // (strided is head-dimension, not layer-dimension; D2D transpose can't help).

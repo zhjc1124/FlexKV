@@ -1,16 +1,18 @@
 """
-Microbenchmark: CE transfer strategy comparison (five execution forms).
+Microbenchmark: CE transfer strategy comparison (four execution forms + BF MLA preprocess).
 
-Drives the C++ CE engine through each of its FIVE execution forms and compares
+Drives the C++ CE engine through each of its execution forms and compares
 two cumulative CE configs on every form, proving the optimization progression
 baseline -> optimized per form.
 
-The five CE execution forms (see csrc/ce_transfer.h CEPath / CEStagedVariant):
+The CE execution forms (see csrc/ce_transfer.h CEPath / CEStagedVariant):
   - BULK_CONTIG       single large memcpy (contiguous ids, dst phys contiguous)
   - SEGMENTED_DIRECT  per-run memcpy, dst phys contiguous, no staging
   - STAGED_CONTIG_RUN staging + CPU scatter, GPU side contiguous run
   - STAGED_PER_BLOCK  staging + CPU scatter, GPU side per-block (sharded D2H)
   - GATHER_SCATTER    GPU index_select/index_copy_ pipeline (many segments)
+  BF_D2D_TRANSPOSE is a preprocess entry (not a CEPath enum value), triggered
+  before choose_path for BF MLA non-sharded cases. It cannot be force_path'd.
 
 Each form is triggered by a specific (block-id pattern, cpu_layout, mla_mode,
 direction). STAGED_PER_BLOCK only appears on the sharded-D2H leg (the only
@@ -152,7 +154,7 @@ def make_tp_group(cpu_ptr, all_gpu, num_gpus, gpu_layout, num_layers,
                   ce_is_mla=False, ce_is_blockfirst=False):
     """TPTransferThreadGroup with CE config passed per-construction.
 
-    ce_force_path: test/benchmark only. -1 = auto (choose_path); 0-4 = force
+    ce_force_path: test/benchmark only. -1 = auto (choose_path); 0-3 = force
     a specific CEPath. Production never sets it.
     path_opt / segment_threshold go into the C++ CETransferConfig
     via ctor args (NOT env) -- matching production and the correctness tests.
@@ -270,7 +272,8 @@ def bench_one_dir(tp, ids, cpu_kv_sb, cpu_ly_sb, cpu_bl_sb, cpu_tp_sb,
 #   SEGMENTED_DIRECT(1) needs cpu_phys_contig (lfirst)
 #   STAGED_SCATTER(2)    always viable (staging works for any layout)
 #   GATHER_SCATTER(3)   needs gpu_phys_contig (no sharded D2H)
-# CEPath enum: 0=BULK_CONTIG, 1=SEGMENTED_DIRECT, 2=STAGED_SCATTER, 3=GATHER_SCATTER, 4=BF_D2D_TRANSPOSE
+# CEPath enum: 0=BULK_CONTIG, 1=SEGMENTED_DIRECT, 2=STAGED_SCATTER, 3=GATHER_SCATTER
+# BF_D2D_TRANSPOSE is a preprocess entry (not a CEPath), cannot be force_path'd.
 #
 # layout_key -> cpu_phys_contig: lfirst=True, bfirst=False
 # mode=sharded D2H -> gpu_phys_contig=False; otherwise True
@@ -278,7 +281,7 @@ def bench_one_dir(tp, ids, cpu_kv_sb, cpu_ly_sb, cpu_bl_sb, cpu_tp_sb,
 #
 # STAGED_PER_BLOCK only exists in D2H+sharded (the only !gpu_phys_contig case).
 # H2D+sharded does NOT shrink chunk -> gpu_phys_contig stays true -> STAGED_CONTIG_RUN.
-# BF_D2D_TRANSPOSE(4) needs !cpu_phys_contig && is_blockfirst && is_mla (BF MLA only).
+# BF_D2D_TRANSPOSE preprocess needs !cpu_phys_contig && is_blockfirst && is_mla && gpu_phys_contig (BF MLA non-sharded only).
 PATH_FORMS = [
     ("BULK_CONTIG",
      "contiguous", "lfirst", True, "rank0_only",
@@ -291,7 +294,7 @@ PATH_FORMS = [
     ("STAGED_CONTIG_RUN",
      "few_seg", "bfirst", True, "rank0_only",
      [True, False],
-     [(2, "STAGED_SCATTER"), (3, "GATHER_SCATTER"), (4, "BF_D2D_TRANSPOSE")]),
+     [(2, "STAGED_SCATTER"), (3, "GATHER_SCATTER")]),
     ("STAGED_PER_BLOCK",
      "scattered", "bfirst", True, "sharded",
      [False],  # D2H only: sharded D2H -> !gpu_phys_contig -> PER_BLOCK variant
@@ -299,7 +302,7 @@ PATH_FORMS = [
     ("GATHER_SCATTER",
      "scattered", "bfirst", True, "rank0_only",
      [True, False],
-     [(2, "STAGED_SCATTER"), (3, "GATHER_SCATTER"), (4, "BF_D2D_TRANSPOSE")]),
+     [(2, "STAGED_SCATTER"), (3, "GATHER_SCATTER")]),
 ]
 
 # Two cumulative CE configs.
@@ -316,7 +319,6 @@ ALL_FORCE_PATHS = [
     (1, "SEGMENTED_DIRECT"),
     (2, "STAGED_SCATTER"),
     (3, "GATHER_SCATTER"),
-    (4, "BF_D2D_TRANSPOSE"),
 ]
 
 

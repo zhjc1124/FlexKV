@@ -27,11 +27,13 @@ struct CETransferConfig {
   // always; true = pick BULK_CONTIG / SEGMENTED_DIRECT / STAGED_SCATTER /
   // GATHER_SCATTER based on block-id contiguity + CPU/GPU layout.
   bool path_opt_enabled = true;
-  // force_path: test/benchmark only. -1 = auto (choose_path); 0-4 = force a
+  // force_path: test/benchmark only. -1 = auto (choose_path); 0-3 = force a
   // specific CEPath (0=BULK_CONTIG, 1=SEGMENTED_DIRECT, 2=STAGED_SCATTER,
-  // 3=GATHER_SCATTER, 4=BF_D2D_TRANSPOSE). Production MUST leave this at -1.
+  // 3=GATHER_SCATTER). Production MUST leave this at -1.
   // Used by microbenchmark_ce_strategy.py to prove choose_path picks the
   // fastest strategy for each case (runs all viable paths head-to-head).
+  // NOTE: BF_D2D_TRANSPOSE is no longer a CEPath enum value; it is a
+  // preprocess entry checked before choose_path (see transfer.cu).
   int force_path = -1;
   // enable_memcpy2d: when true, STAGED_SCATTER D2H uses cudaMemcpy2DAsync
   // (strided D2H directly to CPU positions). Fast on NVIDIA (H20:
@@ -42,12 +44,12 @@ struct CETransferConfig {
   bool enable_memcpy2d = false;
   // is_blockfirst: CPU KV cache layout is BLOCKFIRST (vs LAYERFIRST).
   // Set from FLEXKV_CPU_LAYOUT env var via worker.py/layerwise.py.
-  // choose_path uses this to select BF_D2D_TRANSPOSE only for actual
-  // BLOCKFIRST layouts (not LAYERFIRST non-MLA where !cpu_phys_contig
-  // is also true due to per-rank chunk_size < cpu_block_stride).
+  // The BF MLA preprocess (transfer.cu) uses this to select BF_D2D_TRANSPOSE
+  // only for actual BLOCKFIRST layouts (not LAYERFIRST non-MLA where
+  // !cpu_phys_contig is also true due to per-rank chunk_size < cpu_block_stride).
   bool is_blockfirst = false;
   // is_mla: whether the model uses MLA (kv_dim=1, no head split).
-  // BF_D2D_TRANSPOSE is only selected when is_blockfirst && is_mla
+  // BF_D2D_TRANSPOSE preprocess is only triggered when is_blockfirst && is_mla
   // (BF MHA has tp-strided layout that D2D transpose cannot fix).
   bool is_mla = false;
 };
@@ -56,9 +58,11 @@ struct CETransferConfig {
 // CE transfer strategy taxonomy
 // ============================================================================
 //
-// Every CE transfer is one of six execution strategies. path_opt_enabled
-// selects PER_BLOCK (the baseline) vs the five optimized strategies; among the
-// optimized ones choose_path() picks based on the CEAnalysis flags.
+// Every CE transfer is one of five execution strategies plus the BF MLA
+// preprocess. path_opt_enabled selects PER_BLOCK (the baseline) vs the four
+// optimized strategies; among the optimized ones choose_path() picks based on
+// the CEAnalysis flags. BF_D2D_TRANSPOSE is a preprocess entry checked before
+// choose_path (see transfer.cu), not a CEPath enum value.
 //
 //   PER_BLOCK       baseline: one cudaMemcpyAsync per block. No merging, no
 //                   staging. Correct for every layout; slowest. Only used when
@@ -93,7 +97,6 @@ enum class CEPath : int {
   SEGMENTED_DIRECT = 1,
   STAGED_SCATTER = 2,   // staging + CPU scatter (sharded D2H or BF few-seg)
   GATHER_SCATTER = 3,
-  BF_D2D_TRANSPOSE = 4, // BF MLA: D2D transpose + 3-path cudaMemcpyAsync
 };
 
 // ============================================================================
@@ -230,13 +233,15 @@ void ce_transfer_gather_scatter(
     const CEAnalysis &analysis, const CETransferConfig &ce_config);
 
 // ============================================================================
-// BF_D2D_TRANSPOSE: BF MLA (rank0_only/all_write) D2H/H2D.
-//   D2D transpose (LAYERFIRST->BLOCKFIRST) via index_select + transpose +
-//   contiguous, then per-segment cudaMemcpyAsync (contiguous/segmented/per-block)
-//   matching the transposed BLOCKFIRST layout. No CPU scatter needed for
-//   contiguous/few_seg; per-block for scattered. D2D SM overhead <1ms (large).
-//   Only selected when is_blockfirst && is_mla (BF MHA has tp-strided layout
-//   that D2D transpose cannot fix).
+// BF_D2D_TRANSPOSE (preprocess entry, NOT a CEPath enum value):
+//   BF MLA (rank0_only/all_write) D2H/H2D. Called from transfer.cu BEFORE
+//   choose_path() when is_blockfirst && is_mla && !cpu_phys_contig &&
+//   gpu_phys_contig. D2D transpose (LAYERFIRST->BLOCKFIRST) via index_select +
+//   transpose + contiguous, then per-segment cudaMemcpyAsync
+//   (contiguous/segmented/per-block) matching the transposed BLOCKFIRST layout.
+//   No CPU scatter needed for contiguous/few_seg; per-block for scattered.
+//   D2D SM overhead <1ms (large). Only triggered when is_blockfirst && is_mla
+//   (BF MHA has tp-strided layout that D2D transpose cannot fix).
 // ============================================================================
 template <BackendType Type>
 void ce_transfer_bf_d2d_transpose(

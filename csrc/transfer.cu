@@ -147,11 +147,31 @@ void transfer_kv_blocks(
           cpu_block_stride_int64, cpu_startoff_inside_chunks_int64,
           chunk_size_in_bytes, stream, is_host_to_device);
     } else {
+      // BF MLA preprocess: D2D transpose (before choose_path, not via the
+      // four CEPath strategies). Triggered when BLOCKFIRST + MLA + CPU
+      // non-contiguous + GPU contiguous (non-sharded). Sharded D2H
+      // (!gpu_phys_contig) falls through to choose_path -> STAGED_SCATTER.
+      if (ce_config.is_blockfirst && ce_config.is_mla &&
+          !analysis.cpu_phys_contig && analysis.gpu_phys_contig) {
+        ce_transfer_bf_d2d_transpose<Type>(
+            num_blocks, start_layer_id, num_layers, kv_dim,
+            gpu_block_ids, gpu_tensor_handler,
+            gpu_startoff_inside_chunks_int64, cpu_block_ids, cpu_ptr_int64,
+            cpu_kv_stride_int64, cpu_layer_stride_int64,
+            cpu_block_stride_int64, cpu_startoff_inside_chunks_int64,
+            chunk_size_in_bytes, stream, is_host_to_device, analysis,
+            ce_config);
+        if (sync) {
+          cudaStreamSynchronize(stream);
+        }
+        return;
+      }
+
       // force_path: test/benchmark override (production never sets it).
       CEPath path;
       if (ce_config.force_path >= 0) {
-        TORCH_CHECK(ce_config.force_path <= 4,
-                    "force_path out of range [0,4]: ", ce_config.force_path);
+        TORCH_CHECK(ce_config.force_path <= 3,
+                    "force_path out of range [0,3]: ", ce_config.force_path);
         path = static_cast<CEPath>(ce_config.force_path);
       } else {
         path = choose_path(analysis, ce_config, chunk_size_in_bytes);
@@ -196,20 +216,6 @@ void transfer_kv_blocks(
               cpu_block_stride_int64, cpu_startoff_inside_chunks_int64,
               chunk_size_in_bytes, stream, is_host_to_device, analysis,
               ce_config);
-          break;
-        case CEPath::BF_D2D_TRANSPOSE:
-          ce_transfer_bf_d2d_transpose<Type>(
-              num_blocks, start_layer_id, num_layers, kv_dim,
-              gpu_block_ids, gpu_tensor_handler,
-              gpu_startoff_inside_chunks_int64, cpu_block_ids, cpu_ptr_int64,
-              cpu_kv_stride_int64, cpu_layer_stride_int64,
-              cpu_block_stride_int64, cpu_startoff_inside_chunks_int64,
-              chunk_size_in_bytes, stream, is_host_to_device, analysis,
-              ce_config);
-          break;
-        case CEPath::PER_BLOCK:
-          // Not produced by choose_path(); handled by the !path_opt_enabled
-          // branch above. Listed for switch exhaustiveness.
           break;
       }
     }  // end else (path_opt_enabled)

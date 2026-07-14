@@ -954,10 +954,10 @@ def test_invalid_mode_fallback():
 # ---------------------------------------------------------------------------
 # CE adaptive strategy tests
 #
-# The C++ CE engine selects among five execution strategies (see the CEPath
-# taxonomy in csrc/ce_transfer.h). path_opt_enabled picks PER_BLOCK (baseline)
-# vs the four optimized strategies; choose_path() picks among the optimized
-# ones by block-id contiguity + CPU/GPU layout:
+# The C++ CE engine selects among four execution strategies (see the CEPath
+# taxonomy in csrc/ce_transfer.h) plus the BF MLA preprocess. path_opt_enabled
+# picks PER_BLOCK (baseline) vs the four optimized strategies; choose_path()
+# picks among the optimized ones by block-id contiguity + CPU/GPU layout:
 #   PER_BLOCK        — one memcpy per block (baseline, path_opt=False)
 #   BULK_CONTIG      — single large memcpy (contiguous ids + dst phys contig)
 #   SEGMENTED_DIRECT — per-run memcpy, dst phys contig (LAYERFIRST), no staging
@@ -966,6 +966,8 @@ def test_invalid_mode_fallback():
 #                        STAGED_CONTIG_RUN — GPU blocks contiguous (non-sharded)
 #                        STAGED_PER_BLOCK  — GPU blocks strided (sharded D2H)
 #   GATHER_SCATTER   — GPU index_select/index_copy_ (many segments > threshold)
+# BF_D2D_TRANSPOSE is a preprocess entry (checked before choose_path, not a
+# CEPath enum value): BF MLA D2D transpose when BLOCKFIRST + MLA + non-sharded.
 #
 # We trigger each strategy by constructing block-id *permutations* of [0..N-1]
 # so that every block is still transferred (round-trip correctness preserved):
@@ -1075,8 +1077,8 @@ def _expected_strategy(pattern_name, cpu_layout_name, is_mla, mode,
 
     Returns (strategy, variant) where strategy is one of
     BULK_CONTIG / SEGMENTED_DIRECT / STAGED_SCATTER / GATHER_SCATTER /
-    BF_D2D_TRANSPOSE and variant is STAGED_CONTIG_RUN / STAGED_PER_BLOCK
-    for STAGED_SCATTER else "".
+    PREPROCESS_BF_TRANSPOSE and variant is STAGED_CONTIG_RUN /
+    STAGED_PER_BLOCK for STAGED_SCATTER else "".
 
     Key stride facts (see cpu_layout_for_mode / tp_transfer_thread_group.cpp):
       dst_phys_contig  == (cpu_block_stride == chunk_size)  -> LAYERFIRST only.
@@ -1086,8 +1088,11 @@ def _expected_strategy(pattern_name, cpu_layout_name, is_mla, mode,
         the full block -> NOT contiguous. sharded H2D uses the full chunk, so
         it IS contiguous. Hence STAGED_PER_BLOCK arises only on the sharded
         D2H leg; the H2D leg of the same case is STAGED_CONTIG_RUN.
-    BF_D2D_TRANSPOSE is selected when !dst_phys && BLOCKFIRST && is_mla
-      (BF MLA rank0_only/all_write). BF MHA falls through to STAGED_SCATTER.
+    PREPROCESS_BF_TRANSPOSE is selected when !dst_phys && BLOCKFIRST && is_mla
+      && gpu_phys_contig (BF MLA rank0_only/all_write, non-sharded). It is a
+      preprocess entry checked before choose_path, not a CEPath strategy.
+      Sharded D2H (!gpu_phys_contig) falls through to STAGED_SCATTER.
+      BF MHA also falls through to STAGED_SCATTER.
     segment_threshold decides the STAGED/GATHER crossover: with a small
     threshold even few_seg (4 segments) can exceed it and route to
     GATHER_SCATTER, exactly as choose_path() does.
@@ -1111,10 +1116,11 @@ def _expected_strategy(pattern_name, cpu_layout_name, is_mla, mode,
     # Sharded D2H (!gpu_phys_contig) -> always STAGED_SCATTER (PER_BLOCK).
     if not src_phys:
         return ("STAGED_SCATTER", "STAGED_PER_BLOCK")
-    # BF MLA (rank0_only/all_write): D2D transpose path.
-    # Only for MLA (BF MHA has tp-strided layout that D2D can't fix).
-    if not dst_phys and is_blockfirst and is_mla:
-        return ("BF_D2D_TRANSPOSE", "")
+    # BF MLA preprocess: D2D transpose (before choose_path, not a four-path
+    # strategy). Only for MLA with gpu_phys_contig (non-sharded); sharded D2H
+    # (!gpu_phys_contig) is caught by the STAGED_SCATTER check above.
+    if not dst_phys and is_blockfirst and is_mla and src_phys:
+        return ("PREPROCESS_BF_TRANSPOSE", "")
     # LAYERFIRST or BF MHA: few segments -> SEGMENTED_DIRECT or STAGED_SCATTER.
     if num_segments <= threshold:
         if dst_phys:
@@ -1271,7 +1277,7 @@ def test_ce_paths_layerwise_h2d(data_config, is_mla, cpu_layout_name, pattern,
     # memcpy2d now applies to H2D as well (symmetric to D2H): when the
     # selected path is STAGED_SCATTER and enable_memcpy2d=True, H2D goes
     # through the cudaMemcpy2DAsync branch. Other paths
-    # (BF_D2D_TRANSPOSE/BULK_CONTIG/SEGMENTED_DIRECT/GATHER_SCATTER) do not
+    # (PREPROCESS_BF_TRANSPOSE/BULK_CONTIG/SEGMENTED_DIRECT/GATHER_SCATTER) do not
     # consult enable_memcpy2d, so their behavior is unchanged.
     num_layers, num_blocks, tpb, num_heads, head_dim = data_config
     if pattern == "scattered" and num_blocks <= segment_threshold:
@@ -1484,10 +1490,15 @@ def test_ce_strategy_coverage():
     variants = {v for _, _, v in rows if v}
 
     for required in ("BULK_CONTIG", "SEGMENTED_DIRECT",
-                     "STAGED_SCATTER", "GATHER_SCATTER", "BF_D2D_TRANSPOSE"):
+                     "STAGED_SCATTER", "GATHER_SCATTER"):
         assert required in strategies, \
             "no swept case exercises strategy {} (covered: {})".format(
                 required, sorted(strategies))
+
+    # BF_D2D_TRANSPOSE is now a preprocess entry (not a CEPath strategy).
+    # Verify the preprocess path is still exercised by the swept space.
+    assert "PREPROCESS_BF_TRANSPOSE" in strategies, \
+        "no swept case exercises BF MLA preprocess (PREPROCESS_BF_TRANSPOSE)"
 
     for required in ("STAGED_CONTIG_RUN", "STAGED_PER_BLOCK"):
         assert required in variants, \
