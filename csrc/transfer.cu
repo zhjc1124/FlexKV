@@ -156,7 +156,7 @@ void transfer_kv_blocks(
       // is unaffected (H2D always has gpu_phys_contig == true).
       if (ce_config.is_blockfirst && ce_config.is_mla &&
           !analysis.cpu_phys_contig) {
-        ce_transfer_bf_d2d_transpose<Type>(
+        ce_transfer_bf_transpose<Type>(
             num_blocks, start_layer_id, num_layers, kv_dim,
             gpu_block_ids, gpu_tensor_handler,
             gpu_startoff_inside_chunks_int64, cpu_block_ids, cpu_ptr_int64,

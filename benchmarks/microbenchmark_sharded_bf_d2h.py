@@ -20,7 +20,7 @@ Approaches:
   3. baseline   : per-(layer,block) cudaMemcpyAsync + CPU scatter
   4. d2d_transpose: PyTorch D2D transpose (index_select + permute + contiguous)
                   to per-rank contiguous BLOCKFIRST staging, then one big
-                  cudaMemcpyAsync D2H per rank. Mirrors ce_transfer_bf_d2d_transpose
+                  cudaMemcpyAsync D2H per rank. Mirrors ce_transfer_bf_transpose
                   (csrc/ce_transfer.cu) but for the sharded case, in Python.
 
 Usage:
@@ -292,7 +292,7 @@ print("   time=%8.1f ms  bw=%6.2f GiB/s  calls=%d (L%d×B%d×G%d)" %
 # ============================================================
 # 4. d2d_transpose: PyTorch D2D transpose (index_select + permute +
 #    contiguous) to per-rank contiguous BLOCKFIRST staging, then one big
-#    cudaMemcpyAsync D2H per rank. Mirrors ce_transfer_bf_d2d_transpose
+#    cudaMemcpyAsync D2H per rank. Mirrors ce_transfer_bf_transpose
 #    (csrc/ce_transfer.cu) but for the sharded case, implemented in Python.
 #
 # Idea: sharded D2H currently goes through STAGED_BLOCK (per-block memcpy)

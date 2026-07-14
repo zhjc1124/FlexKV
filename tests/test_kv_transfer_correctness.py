@@ -966,7 +966,7 @@ def test_invalid_mode_fallback():
 #   STAGED_BLOCK     — staging buffer + CPU scatter (sharded D2H),
 #                      GPU non-contiguous -> per-block memcpy
 #   GATHER_SCATTER   — GPU index_select/index_copy_ (many segments > threshold)
-# BF_D2D_TRANSPOSE is a preprocess entry (checked before choose_path, not a
+# BF_TRANSPOSE is a preprocess entry (checked before choose_path, not a
 # CEPath enum value): BF MLA D2D transpose when BLOCKFIRST + MLA + non-sharded.
 #
 # We trigger each strategy by constructing block-id *permutations* of [0..N-1]
@@ -1495,7 +1495,7 @@ def test_ce_strategy_coverage():
             "no swept case exercises strategy {} (covered: {})".format(
                 required, sorted(strategies))
 
-    # BF_D2D_TRANSPOSE is now a preprocess entry (not a CEPath strategy).
+    # BF_TRANSPOSE is now a preprocess entry (not a CEPath strategy).
     # Verify the preprocess path is still exercised by the swept space.
     assert "PREPROCESS_BF_TRANSPOSE" in strategies, \
         "no swept case exercises BF MLA preprocess (PREPROCESS_BF_TRANSPOSE)"

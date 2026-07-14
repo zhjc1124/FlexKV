@@ -11,7 +11,7 @@ The CE execution forms (see csrc/ce_transfer.h CEPath):
   - STAGED_MERGE      staging + CPU scatter, GPU side contiguous run (merged segment memcpy)
   - STAGED_BLOCK      staging + CPU scatter, GPU side per-block (sharded D2H)
   - GATHER_SCATTER    GPU index_select/index_copy_ pipeline (many segments)
-  BF_D2D_TRANSPOSE is a preprocess entry (not a CEPath enum value), triggered
+  BF_TRANSPOSE is a preprocess entry (not a CEPath enum value), triggered
   before choose_path for BF MLA non-sharded cases. It cannot be force_path'd.
 
 Each form is triggered by a specific (block-id pattern, cpu_layout, mla_mode,
@@ -274,7 +274,7 @@ def bench_one_dir(tp, ids, cpu_kv_sb, cpu_ly_sb, cpu_bl_sb, cpu_tp_sb,
 #   STAGED_BLOCK(3)      always viable (staging works for any layout)
 #   GATHER_SCATTER(4)   needs gpu_phys_contig (no sharded D2H)
 # CEPath enum: 0=BULK_CONTIG, 1=SEGMENTED_DIRECT, 2=STAGED_MERGE, 3=STAGED_BLOCK, 4=GATHER_SCATTER
-# BF_D2D_TRANSPOSE is a preprocess entry (not a CEPath), cannot be force_path'd.
+# BF_TRANSPOSE is a preprocess entry (not a CEPath), cannot be force_path'd.
 #
 # layout_key -> cpu_phys_contig: lfirst=True, bfirst=False
 # mode=sharded D2H -> gpu_phys_contig=False; otherwise True
@@ -282,7 +282,7 @@ def bench_one_dir(tp, ids, cpu_kv_sb, cpu_ly_sb, cpu_bl_sb, cpu_tp_sb,
 #
 # STAGED_BLOCK only exists in D2H+sharded (the only !gpu_phys_contig case).
 # H2D+sharded does NOT shrink chunk -> gpu_phys_contig stays true -> STAGED_MERGE.
-# BF_D2D_TRANSPOSE preprocess needs !cpu_phys_contig && is_blockfirst && is_mla && gpu_phys_contig (BF MLA non-sharded only).
+# BF_TRANSPOSE preprocess needs !cpu_phys_contig && is_blockfirst && is_mla && gpu_phys_contig (BF MLA non-sharded only).
 PATH_FORMS = [
     ("BULK_CONTIG",
      "contiguous", "lfirst", True, "rank0_only",

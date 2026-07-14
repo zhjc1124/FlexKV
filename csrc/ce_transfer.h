@@ -32,7 +32,7 @@ struct CETransferConfig {
   // 3=STAGED_BLOCK, 4=GATHER_SCATTER). Production MUST leave this at -1.
   // Used by microbenchmark_ce_strategy.py to prove choose_path picks the
   // fastest strategy for each case (runs all viable paths head-to-head).
-  // NOTE: BF_D2D_TRANSPOSE is no longer a CEPath enum value; it is a
+  // NOTE: BF_TRANSPOSE is no longer a CEPath enum value; it is a
   // preprocess entry checked before choose_path (see transfer.cu).
   int force_path = -1;
   // enable_memcpy2d: when true, STAGED_MERGE/STAGED_BLOCK D2H uses cudaMemcpy2DAsync
@@ -44,12 +44,12 @@ struct CETransferConfig {
   bool enable_memcpy2d = false;
   // is_blockfirst: CPU KV cache layout is BLOCKFIRST (vs LAYERFIRST).
   // Set from FLEXKV_CPU_LAYOUT env var via worker.py/layerwise.py.
-  // The BF MLA preprocess (transfer.cu) uses this to select BF_D2D_TRANSPOSE
+  // The BF MLA preprocess (transfer.cu) uses this to select BF_TRANSPOSE
   // only for actual BLOCKFIRST layouts (not LAYERFIRST non-MLA where
   // !cpu_phys_contig is also true due to per-rank chunk_size < cpu_block_stride).
   bool is_blockfirst = false;
   // is_mla: whether the model uses MLA (kv_dim=1, no head split).
-  // BF_D2D_TRANSPOSE preprocess is only triggered when is_blockfirst && is_mla
+  // BF_TRANSPOSE preprocess is only triggered when is_blockfirst && is_mla
   // (BF MHA has tp-strided layout that D2D transpose cannot fix).
   bool is_mla = false;
 };
@@ -61,7 +61,7 @@ struct CETransferConfig {
 // Every CE transfer is one of six execution strategies plus the BF MLA
 // preprocess. path_opt_enabled selects PER_BLOCK (the baseline) vs the five
 // optimized strategies; among the optimized ones choose_path() picks based on
-// the CEAnalysis flags. BF_D2D_TRANSPOSE is a preprocess entry checked before
+// the CEAnalysis flags. BF_TRANSPOSE is a preprocess entry checked before
 // choose_path (see transfer.cu), not a CEPath enum value.
 //
 //   PER_BLOCK       baseline: one cudaMemcpyAsync per block. No merging, no
@@ -126,7 +126,7 @@ struct CESegment {
 //
 // Note: gpu_log_contig / cpu_log_contig are no longer used by choose_path
 // (BULK_CONTIG now uses num_segments == 1). They remain in use by
-// ce_transfer_gather_scatter and ce_transfer_bf_d2d_transpose to decide
+// ce_transfer_gather_scatter and ce_transfer_bf_transpose to decide
 // whether GPU index_select / index_copy_ is needed, so they are still
 // computed by analyze_ce_transfer.
 struct CEAnalysis {
@@ -267,7 +267,7 @@ void ce_transfer_gather_scatter(
     const CEAnalysis &analysis, const CETransferConfig &ce_config);
 
 // ============================================================================
-// BF_D2D_TRANSPOSE (preprocess entry, NOT a CEPath enum value):
+// BF_TRANSPOSE (preprocess entry, NOT a CEPath enum value):
 //   BF MLA (rank0_only/all_write) D2H/H2D. Called from transfer.cu BEFORE
 //   choose_path() when is_blockfirst && is_mla && !cpu_phys_contig &&
 //   gpu_phys_contig. D2D transpose (LAYERFIRST->BLOCKFIRST) via index_select +
@@ -278,7 +278,7 @@ void ce_transfer_gather_scatter(
 //   (BF MHA has tp-strided layout that D2D transpose cannot fix).
 // ============================================================================
 template <BackendType Type>
-void ce_transfer_bf_d2d_transpose(
+void ce_transfer_bf_transpose(
     int num_blocks, int start_layer_id, int num_layers, int kv_dim,
     int64_t *gpu_block_ids, GTensorHandler gpu_tensor_handler,
     int64_t gpu_startoff_inside_chunks_int64,

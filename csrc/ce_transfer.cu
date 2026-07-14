@@ -381,7 +381,7 @@ void ce_transfer_segmented_direct(
 //
 // Ping-pong is NOT in:
 //   - BULK_CONTIG / SEGMENTED_DIRECT (no staging buffer at all)
-//   - BF_D2D_TRANSPOSE (no staging after transpose -- direct per-segment memcpy)
+//   - BF_TRANSPOSE (no staging after transpose -- direct per-segment memcpy)
 //   - scatter_to_cpu / gather_from_cpu themselves (ping-pong wraps AROUND them
 //     in the main per-(layer,kv) loop, not inside the scatter/gather function)
 
@@ -1127,7 +1127,7 @@ void ce_transfer_gather_scatter(
 }
 
 // ============================================================================
-// BF_D2D_TRANSPOSE: BF non-sharded (rank0_only/MHA) D2H/H2D.
+// BF_TRANSPOSE: BF non-sharded (rank0_only/MHA) D2H/H2D.
 //   D2D transpose (LAYERFIRST→BLOCKFIRST) via index_select + transpose +
 //   contiguous, then per-segment cudaMemcpyAsync matching the transposed
 //   BLOCKFIRST layout. Works for both kv_dim=1 (MLA) and kv_dim=2 (MHA):
@@ -1137,7 +1137,7 @@ void ce_transfer_gather_scatter(
 // ============================================================================
 
 template <BackendType Type>
-void ce_transfer_bf_d2d_transpose(
+void ce_transfer_bf_transpose(
     int num_blocks, int start_layer_id, int num_layers, int kv_dim,
     int64_t *gpu_block_ids, GTensorHandler gpu_tensor_handler,
     int64_t gpu_startoff_inside_chunks_int64,
@@ -1148,7 +1148,7 @@ void ce_transfer_bf_d2d_transpose(
     cudaStream_t stream, bool is_host_to_device,
     const CEAnalysis &analysis, const CETransferConfig &ce_config) {
   TORCH_CHECK(chunk_size_in_bytes % sizeof(int64_t) == 0,
-              "BF_D2D_TRANSPOSE requires chunk_size % 8 == 0");
+              "BF_TRANSPOSE requires chunk_size % 8 == 0");
   const int64_t elems_per_block = chunk_size_in_bytes / sizeof(int64_t);
   const size_t buf_bytes = (size_t)num_blocks * (size_t)chunk_size_in_bytes;
   const int64_t total_iters = (int64_t)num_layers * kv_dim;
@@ -1383,7 +1383,7 @@ FLEXKV_INST_ALL_BACKENDS(FLEXKV_INST_STG, ce_transfer_segmented_direct)
 FLEXKV_INST_ALL_BACKENDS(FLEXKV_INST_STG, ce_transfer_staged_merge)
 FLEXKV_INST_ALL_BACKENDS(FLEXKV_INST_STG, ce_transfer_staged_block)
 FLEXKV_INST_ALL_BACKENDS(FLEXKV_INST_STG, ce_transfer_gather_scatter)
-FLEXKV_INST_ALL_BACKENDS(FLEXKV_INST_STG, ce_transfer_bf_d2d_transpose)
+FLEXKV_INST_ALL_BACKENDS(FLEXKV_INST_STG, ce_transfer_bf_transpose)
 
 #undef FLEXKV_INST_NOSTG
 #undef FLEXKV_INST_STG
