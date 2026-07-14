@@ -283,38 +283,44 @@ def bench_one_dir(tp, ids, cpu_kv_sb, cpu_ly_sb, cpu_bl_sb, cpu_tp_sb,
 # All pattern × layout combos (rank0_only) + sharded D2H special case.
 # No form names — pattern/layout/mode are shown directly in output.
 # Tuple: (pattern, layout_key, is_mla, mode, dirs, viable_force_paths)
-ALL_FORCE_PATHS_LIST = [
-    (0, "BULK_CONTIG"), (1, "SEGMENTED_DIRECT"), (2, "STAGED_MERGE"),
-    (3, "STAGED_BLOCK"), (4, "GATHER_SCATTER"), (5, "BF_TRANSPOSE"),
-]
+
+# Safe force paths per layout:
+# - BULK_CONTIG, SEGMENTED_DIRECT, STAGED_MERGE, STAGED_BLOCK: safe everywhere
+#   (ptr_at + memcpy, no stride assumptions that could segfault)
+# - GATHER_SCATTER: only LF — uses from_blob WITHOUT stride (assumes GPU block
+#   stride == elems_per_block). BF layout breaks this assumption → segfault.
+# - BF_TRANSPOSE: only BF — uses from_blob WITH explicit stride calculated
+#   from ptr_at pointer diff. LF layout has different stride → segfault.
+_BASE_SAFE = [(0, "BULK_CONTIG"), (1, "SEGMENTED_DIRECT"),
+              (2, "STAGED_MERGE"), (3, "STAGED_BLOCK")]
+_LF_SAFE = _BASE_SAFE + [(4, "GATHER_SCATTER")]
+_BF_SAFE = _BASE_SAFE + [(5, "BF_TRANSPOSE")]
 
 # Full matrix: 3 patterns × 2 layouts × 3 modes (mla-rank0_only, mla-sharded, mha).
 # mla-sharded is D2H-only (H2D sharded has gpu_phys_contig=true, not sharded).
 # mha has no sharded mode (sharded is MLA-only); mode is don't-care for MHA.
-_ALL = ALL_FORCE_PATHS_LIST  # all 6 paths viable; invalid ones show FAILED
-
 PATH_FORMS = [
     # --- mla + rank0_only (H2D + D2H) ---
-    ("contiguous", "lfirst", True,  "rank0_only", [True, False], _ALL),
-    ("contiguous", "bfirst", True,  "rank0_only", [True, False], _ALL),
-    ("few_seg",    "lfirst", True,  "rank0_only", [True, False], _ALL),
-    ("few_seg",    "bfirst", True,  "rank0_only", [True, False], _ALL),
-    ("scattered",  "lfirst", True,  "rank0_only", [True, False], _ALL),
-    ("scattered",  "bfirst", True,  "rank0_only", [True, False], _ALL),
+    ("contiguous", "lfirst", True,  "rank0_only", [True, False], _LF_SAFE),
+    ("contiguous", "bfirst", True,  "rank0_only", [True, False], _BF_SAFE),
+    ("few_seg",    "lfirst", True,  "rank0_only", [True, False], _LF_SAFE),
+    ("few_seg",    "bfirst", True,  "rank0_only", [True, False], _BF_SAFE),
+    ("scattered",  "lfirst", True,  "rank0_only", [True, False], _LF_SAFE),
+    ("scattered",  "bfirst", True,  "rank0_only", [True, False], _BF_SAFE),
     # --- mla + sharded (D2H only) ---
-    ("contiguous", "lfirst", True,  "sharded",    [False], _ALL),
-    ("contiguous", "bfirst", True,  "sharded",    [False], _ALL),
-    ("few_seg",    "lfirst", True,  "sharded",    [False], _ALL),
-    ("few_seg",    "bfirst", True,  "sharded",    [False], _ALL),
-    ("scattered",  "lfirst", True,  "sharded",    [False], _ALL),
-    ("scattered",  "bfirst", True,  "sharded",    [False], _ALL),
+    ("contiguous", "lfirst", True,  "sharded",    [False], _LF_SAFE),
+    ("contiguous", "bfirst", True,  "sharded",    [False], _BF_SAFE),
+    ("few_seg",    "lfirst", True,  "sharded",    [False], _LF_SAFE),
+    ("few_seg",    "bfirst", True,  "sharded",    [False], _BF_SAFE),
+    ("scattered",  "lfirst", True,  "sharded",    [False], _LF_SAFE),
+    ("scattered",  "bfirst", True,  "sharded",    [False], _BF_SAFE),
     # --- mha (H2D + D2H, mode=rank0_only but don't-care) ---
-    ("contiguous", "lfirst", False, "rank0_only", [True, False], _ALL),
-    ("contiguous", "bfirst", False, "rank0_only", [True, False], _ALL),
-    ("few_seg",    "lfirst", False, "rank0_only", [True, False], _ALL),
-    ("few_seg",    "bfirst", False, "rank0_only", [True, False], _ALL),
-    ("scattered",  "lfirst", False, "rank0_only", [True, False], _ALL),
-    ("scattered",  "bfirst", False, "rank0_only", [True, False], _ALL),
+    ("contiguous", "lfirst", False, "rank0_only", [True, False], _LF_SAFE),
+    ("contiguous", "bfirst", False, "rank0_only", [True, False], _BF_SAFE),
+    ("few_seg",    "lfirst", False, "rank0_only", [True, False], _LF_SAFE),
+    ("few_seg",    "bfirst", False, "rank0_only", [True, False], _BF_SAFE),
+    ("scattered",  "lfirst", False, "rank0_only", [True, False], _LF_SAFE),
+    ("scattered",  "bfirst", False, "rank0_only", [True, False], _BF_SAFE),
 ]
 
 # Two cumulative CE configs.
