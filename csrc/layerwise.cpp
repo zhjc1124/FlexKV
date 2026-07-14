@@ -599,11 +599,6 @@ void LayerwiseTransferGroup::layerwise_transfer(
     int layers_this_batch =
         std::min(layer_granularity, num_layers - start_layer);
 
-    if (batch_idx == 0) {
-      fprintf(stderr, "[LWDBG] batch loop start: num_batches=%d num_blocks=%d\n", num_batches, num_blocks);
-      fflush(stderr);
-    }
-
     batch_start_layers[batch_idx] = start_layer;
     batch_layers_count[batch_idx] = layers_this_batch;
 
