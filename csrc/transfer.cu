@@ -207,37 +207,16 @@ void transfer_kv_blocks(
               chunk_size_in_bytes, stream, is_host_to_device, analysis,
               ce_config);
           break;
-        case CEPath::BF_TRANSPOSE: {
-          // BF_TRANSPOSE allocates dev_staging = num_blocks * total_iters *
-          // chunk_size. For large configs (e.g. 512 blocks × 80 layers) this
-          // can exceed available GPU memory. Fallback to STAGED_MERGE (which
-          // uses a smaller per-layer staging buffer) if dev_staging would be
-          // too large.
-          int64_t total_iters_bf = (int64_t)num_layers * kv_dim;
-          size_t dev_staging_bytes = (size_t)num_blocks *
-              (size_t)total_iters_bf * (size_t)chunk_size_in_bytes;
-          const size_t BF_TRANSPOSE_MAX_STAGING = 256 * 1024 * 1024;  // 256MB
-          if (dev_staging_bytes > BF_TRANSPOSE_MAX_STAGING) {
-            ce_transfer_staged_merge<Type>(
-                num_blocks, start_layer_id, num_layers, kv_dim,
-                gpu_block_ids, gpu_tensor_handler,
-                gpu_startoff_inside_chunks_int64, cpu_block_ids, cpu_ptr_int64,
-                cpu_kv_stride_int64, cpu_layer_stride_int64,
-                cpu_block_stride_int64, cpu_startoff_inside_chunks_int64,
-                chunk_size_in_bytes, stream, is_host_to_device, analysis,
-                ce_config);
-          } else {
-            ce_transfer_bf_transpose<Type>(
-                num_blocks, start_layer_id, num_layers, kv_dim,
-                gpu_block_ids, gpu_tensor_handler,
-                gpu_startoff_inside_chunks_int64, cpu_block_ids, cpu_ptr_int64,
-                cpu_kv_stride_int64, cpu_layer_stride_int64,
-                cpu_block_stride_int64, cpu_startoff_inside_chunks_int64,
-                chunk_size_in_bytes, stream, is_host_to_device, analysis,
-                ce_config);
-          }
+        case CEPath::BF_TRANSPOSE:
+          ce_transfer_bf_transpose<Type>(
+              num_blocks, start_layer_id, num_layers, kv_dim,
+              gpu_block_ids, gpu_tensor_handler,
+              gpu_startoff_inside_chunks_int64, cpu_block_ids, cpu_ptr_int64,
+              cpu_kv_stride_int64, cpu_layer_stride_int64,
+              cpu_block_stride_int64, cpu_startoff_inside_chunks_int64,
+              chunk_size_in_bytes, stream, is_host_to_device, analysis,
+              ce_config);
           break;
-        }
       }
     }  // end else (path_opt_enabled)
   } else {

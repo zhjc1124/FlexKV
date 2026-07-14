@@ -18,6 +18,7 @@ Run:
 
 import pytest
 import torch
+import gc
 
 from flexkv.c_ext import TPTransferThreadGroup, LayerwiseTransferGroup
 from flexkv.common.config import GLOBAL_CONFIG_FROM_ENV
@@ -34,6 +35,18 @@ pytestmark = pytest.mark.skipif(
     NUM_GPUS < 2,
     reason=f"Need at least 2 GPUs, found {NUM_GPUS}"
 )
+
+
+@pytest.fixture(autouse=True)
+def _cleanup_gpu_mem():
+    """Force GC + empty_cache after each test to prevent GPU memory
+    fragmentation from accumulated PyTorch tensors and C++ thread_local
+    cached buffers (get_cached_device_buffer / get_cached_hugepage_buffer)
+    that are only freed when their owning thread exits."""
+    yield
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 def _probe_engine(use_ce):
