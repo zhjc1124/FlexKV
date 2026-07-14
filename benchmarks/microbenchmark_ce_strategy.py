@@ -441,8 +441,13 @@ def run_strategy_compare(args):
                     except Exception as e:
                         print("FAILED: {}".format(e))
 
-                # Step 2: force each viable path (under opt)
+                # Step 2: force each viable path (under opt), skip auto-pick
+                # (forcing to the same path as auto is redundant — opt already
+                # shows that result).
                 for fp_id, fp_name in viable:
+                    if fp_name == auto_path:
+                        results[key]["force_" + fp_name] = None  # skip
+                        continue
                     label = "force_" + fp_name
                     print("  {} ...".format(label), end=" ", flush=True)
                     try:
@@ -537,17 +542,24 @@ def run_strategy_compare(args):
         for form_name, dir_name, viable in run_rows:
             cfgs = results.get((form_name, dir_name), {})
             auto = cfgs.get("opt")
+            auto_path = cfgs.get("auto_path", "")
             viable_names = {pn for _, pn in viable}
             forced_dict = {}
             for fp_id, fp_name in ALL_FORCE_PATHS:
-                forced_dict[fp_name] = (cfgs.get("force_" + fp_name)
-                                        if fp_name in viable_names else None)
-            all_vals = [auto] + [v for v in forced_dict.values() if v is not None]
+                if fp_name == auto_path:
+                    forced_dict[fp_name] = "(opt)"  # skip marker
+                elif fp_name in viable_names:
+                    forced_dict[fp_name] = cfgs.get("force_" + fp_name)
+                else:
+                    forced_dict[fp_name] = None
+            all_vals = [auto] + [v for v in forced_dict.values() if isinstance(v, (int, float))]
             fastest = min((v for v in all_vals if v is not None), default=None)
 
             def fmt2(v):
                 if v is None:
                     return "{:>{w}s}".format("-", w=col_w)
+                if v == "(opt)":
+                    return "{:>{w}s}".format("(opt)", w=col_w)
                 star = "*" if (fastest is not None and v == fastest) else " "
                 return "{:>{w}.3f}{}".format(v, star, w=col_w - 1)
 
