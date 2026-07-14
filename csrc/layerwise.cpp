@@ -434,10 +434,6 @@ void LayerwiseTransferGroup::layerwise_transfer(
   notify_mode_ = (notify_mode == "polling") ? NotifyMode::POLLING
                                             : NotifyMode::HOSTFUNC;
 
-  fprintf(stderr, "[LWDBG] layerwise_transfer enter: notify=%s is_mla=%d num_layers=%d layer_gran=%d\n",
-          notify_mode.c_str(), (int)is_mla, num_layers, layer_granularity);
-  fflush(stderr);
-
   // Set current counter ID for eventfd notification
   current_counter_id_ = counter_id;
 
@@ -746,10 +742,6 @@ void LayerwiseTransferGroup::layerwise_transfer(
       for (int i = 0; i < num_gpus_; ++i) {
         cudaSetDevice(gpu_device_ids_[i]);
         cudaEventRecord(poll_batches_[batch_idx].per_gpu_events[i], streams_[i]);
-      }
-      if (batch_idx == 0 || batch_idx == num_batches - 1) {
-        fprintf(stderr, "[LWDBG] batch %d/%d events recorded\n", batch_idx, num_batches - 1);
-        fflush(stderr);
       }
     } else {
       // NVTX: current range ends in callback, next range starts in callback
