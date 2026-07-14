@@ -78,10 +78,10 @@ LAYOUTS = {
 }
 
 # (label, is_mla, mode)
-# MHA: non-MLA, mode ignored. MLA: rank0_only (CE on) or sharded.
+# MHA: non-MLA, mode ignored. MLA: rank_rotate (best mode) or sharded.
 STRATEGIES = [
     ("MHA",             False, "sharded"),
-    ("MLA-rank0_only",   True, "rank0_only"),
+    ("MLA-rank_rotate",  True, "rank_rotate"),
     ("MLA-sharded",      True, "sharded"),
 ]
 

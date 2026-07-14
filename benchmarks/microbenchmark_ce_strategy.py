@@ -316,17 +316,17 @@ _LF_OTHER_MHA  = [(1, "SEGMENTED_DIRECT")] + _BASE
 # BF (any pattern/mla/mode): no BULK/SEG_DIRECT (cpu_phys_contig=false), no GATHER (segfault)
 _BF = _BASE + [(5, "BF_TRANSPOSE")]
 
-# Full matrix: 3 patterns × 2 layouts × 3 modes (mla-rank0_only, mla-sharded, mha).
+# Full matrix: 3 patterns × 2 layouts × 3 modes (mla-rank_rotate, mla-sharded, mha).
 # mla-sharded is D2H-only (H2D sharded has gpu_phys_contig=true, not sharded).
 # mha has no sharded mode (sharded is MLA-only); mode is don't-care for MHA.
 PATH_FORMS = [
-    # --- mla + rank0_only (H2D + D2H) ---
-    ("contiguous", "lfirst", True,  "rank0_only", [True, False], _LF_CONTIG_MLA),
-    ("contiguous", "bfirst", True,  "rank0_only", [True, False], _BF),
-    ("few_seg",    "lfirst", True,  "rank0_only", [True, False], _LF_OTHER_MLA),
-    ("few_seg",    "bfirst", True,  "rank0_only", [True, False], _BF),
-    ("scattered",  "lfirst", True,  "rank0_only", [True, False], _LF_OTHER_MLA),
-    ("scattered",  "bfirst", True,  "rank0_only", [True, False], _BF),
+    # --- mla + rank_rotate (H2D + D2H) ---
+    ("contiguous", "lfirst", True,  "rank_rotate", [True, False], _LF_CONTIG_MLA),
+    ("contiguous", "bfirst", True,  "rank_rotate", [True, False], _BF),
+    ("few_seg",    "lfirst", True,  "rank_rotate", [True, False], _LF_OTHER_MLA),
+    ("few_seg",    "bfirst", True,  "rank_rotate", [True, False], _BF),
+    ("scattered",  "lfirst", True,  "rank_rotate", [True, False], _LF_OTHER_MLA),
+    ("scattered",  "bfirst", True,  "rank_rotate", [True, False], _BF),
     # --- mla + sharded (D2H only) ---
     ("contiguous", "lfirst", True,  "sharded",    [False], _LF_SHARDED),
     ("contiguous", "bfirst", True,  "sharded",    [False], _BF),
