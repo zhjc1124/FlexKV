@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Sharded BF D2H benchmark: 3 approaches on NVIDIA & P800.
+Sharded BF D2H benchmark: 4 approaches on NVIDIA & P800.
 
-Pure ctypes, no torch. Auto-detects CUDA runtime library.
+ctypes for CUDA runtime; PyTorch for the D2D transpose variant (#4).
+Auto-detects CUDA runtime library.
 
 Layout (MLA sharded, BLOCKFIRST CPU interleave):
   GPU:  [num_layers, num_blocks, full_chunk]   (LAYERFIRST)
@@ -17,6 +18,10 @@ Approaches:
   2. contig+merge: per-GPU contiguous cudaMemcpyAsync + CPU interleave merge
                   (D2D transpose cost measured separately on H20, estimated on P800)
   3. baseline   : per-(layer,block) cudaMemcpyAsync + CPU scatter
+  4. d2d_transpose: PyTorch D2D transpose (index_select + permute + contiguous)
+                  to per-rank contiguous BLOCKFIRST staging, then one big
+                  cudaMemcpyAsync D2H per rank. Mirrors ce_transfer_bf_d2d_transpose
+                  (csrc/ce_transfer.cu) but for the sharded case, in Python.
 
 Usage:
   python benchmarks/microbenchmark_sharded_bf_d2h.py
@@ -24,6 +29,12 @@ Usage:
 """
 import ctypes, time, random, os, functools
 print = functools.partial(print, flush=True)
+
+try:
+    import torch
+    TORCH_AVAILABLE = True
+except ImportError:
+    TORCH_AVAILABLE = False
 
 # ---- auto-detect CUDA runtime ----
 LIB_PATHS = [
@@ -92,8 +103,16 @@ check(cuda.cudaSetDevice(0), "setDevice")
 
 # ---- alloc ----
 # GPU: [NUM_LAYERS, NUM_BLOCKS, FULL_CHUNK] (LAYERFIRST)
-d_kv = ctypes.c_void_p()
-check(cuda.cudaMalloc(c_void_p_p(d_kv), NUM_BLOCKS * NUM_LAYERS * FULL_CHUNK), "malloc gpu")
+# Allocate via PyTorch so variant #4 (d2d_transpose) can use index_select /
+# permute / contiguous directly. The raw CUDA pointer is exposed as d_kv for
+# the ctypes-based variants (#1-#3).
+if TORCH_AVAILABLE:
+    d_kv_t = torch.empty((NUM_LAYERS, NUM_BLOCKS, FULL_CHUNK // DTYPE),
+                         dtype=torch.float16, device="cuda:0")
+    d_kv = ctypes.c_void_p(d_kv_t.data_ptr())
+else:
+    d_kv = ctypes.c_void_p()
+    check(cuda.cudaMalloc(c_void_p_p(d_kv), NUM_BLOCKS * NUM_LAYERS * FULL_CHUNK), "malloc gpu")
 
 # CPU interleave target: [N_SELECT, NUM_LAYERS, NUM_GPUS, SHARD_SIZE]
 h_interleave = ctypes.c_void_p()
@@ -271,6 +290,82 @@ print("   time=%8.1f ms  bw=%6.2f GiB/s  calls=%d (L%d×B%d×G%d)" %
       (t_base, bw_base, NUM_LAYERS * N_SELECT * NUM_GPUS, NUM_LAYERS, N_SELECT, NUM_GPUS))
 
 # ============================================================
+# 4. d2d_transpose: PyTorch D2D transpose (index_select + permute +
+#    contiguous) to per-rank contiguous BLOCKFIRST staging, then one big
+#    cudaMemcpyAsync D2H per rank. Mirrors ce_transfer_bf_d2d_transpose
+#    (csrc/ce_transfer.cu) but for the sharded case, implemented in Python.
+#
+# Idea: sharded D2H currently goes through STAGED_BLOCK (per-block memcpy)
+# because !gpu_phys_contig. If we first D2D-transpose the sharded data into
+# a per-rank contiguous BLOCKFIRST staging buffer, we can then do ONE big
+# D2H per rank (much fewer API calls, better DMA throughput).
+#
+# Per rank gi:
+#   src   = d_kv_t[:, selected, gi*shard : (gi+1)*shard]   [NL, NS, shard]
+#   stage = src.permute(1, 0, 2).contiguous()               [NS, NL, shard]
+#   D2H   = stage -> h_regions[gi]  (one big cudaMemcpyAsync)
+# ============================================================
+t_d2d = 0.0
+t_d2d_d2h = 0.0
+bw_d2d_d2h = 0.0
+if TORCH_AVAILABLE:
+    # Pre-build the block-id index tensor on GPU for index_select.
+    selected_t = torch.tensor(selected, dtype=torch.long, device="cuda:0")
+    shard_elems = SHARD_SIZE // DTYPE  # fp16 elements per shard
+
+    def op_d2d_transpose_only():
+        """D2D transpose only (no D2H). Returns list of staging tensors.
+        Kept separate so we can time D2D and D2H independently."""
+        stagings = []
+        for gi in range(NUM_GPUS):
+            shard_start = gi * shard_elems
+            shard_end = (gi + 1) * shard_elems
+            # Advanced indexing: d_kv_t[:, selected_t, shard_start:shard_end]
+            # -> [NUM_LAYERS, N_SELECT, shard_elems] (gathered, new allocation)
+            src = d_kv_t[:, selected_t, shard_start:shard_end]
+            # Transpose to BLOCKFIRST [N_SELECT, NUM_LAYERS, shard_elems] and
+            # make contiguous (matches h_regions[gi] layout).
+            staging = src.permute(1, 0, 2).contiguous()
+            stagings.append(staging)
+        torch.cuda.synchronize()
+        return stagings
+
+    def op_d2d_transpose_full():
+        """D2D transpose + one big D2H per rank."""
+        stagings = op_d2d_transpose_only()
+        for gi in range(NUM_GPUS):
+            check(cuda.cudaMemcpyAsync(
+                h_regions[gi], ctypes.c_void_p(stagings[gi].data_ptr()),
+                TOTAL_PER_GPU, DTH, stream), "d2d_transpose d2h")
+        check(cuda.cudaStreamSynchronize(stream), "d2d_transpose sync")
+        # Keep staging tensors alive until D2H completes (sync above).
+        del stagings
+
+    # Time D2D only (transpose cost, no D2H).
+    t_d2d = 1e9
+    for _ in range(REPEAT):
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        stagings = op_d2d_transpose_only()
+        t1 = time.perf_counter()
+        t_d2d = min(t_d2d, (t1 - t0) * 1000.0)
+        del stagings
+
+    # Time full (D2D + D2H).
+    t_d2d_d2h, bw_d2d_d2h = time_fn(op_d2d_transpose_full, TOTAL_ALL)
+
+    print("\n4. d2d_transpose (PyTorch D2D + one-shot D2H per rank):")
+    print("   D2D transpose:     time=%8.1f ms  (index_select + permute + contiguous)" % t_d2d)
+    print("   D2H (oneshot/rank): time=%8.1f ms  bw=%6.2f GiB/s  calls=%d" %
+          (t_d2d_d2h - t_d2d, TOTAL_ALL / t_d2d_d2h / GiB * 1000 if t_d2d_d2h > 0 else 0,
+           NUM_GPUS))
+    print("   Total (D2D + D2H): time=%8.1f ms  bw=%6.2f GiB/s" %
+          (t_d2d_d2h, bw_d2d_d2h))
+    print("   Total (+ merge):   time=%8.1f ms" % (t_d2d_d2h + t_merge))
+else:
+    print("\n4. d2d_transpose: SKIPPED (PyTorch not available)")
+
+# ============================================================
 # Summary
 # ============================================================
 print("\n" + "=" * 90)
@@ -282,15 +377,27 @@ print("  %-45s %10.1f %10.2f %10d" % ("1. memcpy2d (strided 2D)", t, bw, NUM_LAY
 print("  %-45s %10.1f %10.2f %10d" % ("2a. contig D2H (per-layer-seg) + merge", t_d2h + t_merge, TOTAL_ALL/(t_d2h+t_merge)/GiB*1000 if t_d2h+t_merge>0 else 0, NUM_LAYERS * len(segments) * NUM_GPUS))
 print("  %-45s %10.1f %10.2f %10d" % ("2b. contig D2H (oneshot) + merge + D2D", t_d2h_1shot + t_merge + 1, 0, NUM_GPUS + 1))
 print("  %-45s %10.1f %10.2f %10d" % ("3. baseline (per-block)", t_base, bw_base, NUM_LAYERS * N_SELECT * NUM_GPUS))
+if TORCH_AVAILABLE:
+    print("  %-45s %10.1f %10.2f %10d" % ("4a. d2d_transpose (D2D + D2H)", t_d2d_d2h, bw_d2d_d2h, NUM_GPUS))
+    print("  %-45s %10.1f %10.2f %10d" % ("4b. d2d_transpose (D2D + D2H + merge)", t_d2d_d2h + t_merge, TOTAL_ALL/(t_d2d_d2h+t_merge)/GiB*1000 if t_d2d_d2h+t_merge>0 else 0, NUM_GPUS))
 print("-" * 90)
 print("  Note: 2b adds ~1ms D2D (H20 measured), P800 D2D cost TBD")
+print("  Note: 4 uses PyTorch D2D (index_select + permute + contiguous)")
 print("  memcpy2d vs baseline: %.1fx" % (t_base / t if t > 0 else 0))
 print("  contig+merge vs baseline: %.1fx" % (t_base / (t_d2h + t_merge) if t_d2h + t_merge > 0 else 0))
+if TORCH_AVAILABLE and t_d2d_d2h > 0:
+    print("  d2d_transpose vs baseline: %.1fx" % (t_base / t_d2d_d2h))
+    print("  d2d_transpose (+merge) vs baseline: %.1fx" % (t_base / (t_d2d_d2h + t_merge) if t_d2d_d2h + t_merge > 0 else 0))
 print("=" * 90)
 
 # cleanup
 check(cuda.cudaStreamDestroy(stream), "stream destroy")
-check(cuda.cudaFree(d_kv), "free gpu")
+if TORCH_AVAILABLE:
+    # d_kv was allocated by PyTorch — let it manage the lifetime.
+    del d_kv_t
+    torch.cuda.empty_cache()
+else:
+    check(cuda.cudaFree(d_kv), "free gpu")
 check(cuda.cudaFreeHost(h_interleave), "free cpu interleave")
 for r in h_regions:
     check(cuda.cudaFreeHost(r), "free cpu region")

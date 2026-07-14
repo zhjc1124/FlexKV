@@ -67,9 +67,8 @@ struct CETransferConfig {
 //   PER_BLOCK       baseline: one cudaMemcpyAsync per block. No merging, no
 //                   staging. Correct for every layout; slowest. Only used when
 //                   path_opt_enabled == false.
-//   BULK_CONTIG     block ids fully contiguous on both sides AND dst is
-//                   physically contiguous (LAYERFIRST, non-sharded): a single
-//                   large memcpy per (layer, kv). No staging.
+//   BULK_CONTIG     cpu_phys_contig && gpu_phys_contig && num_segments == 1:
+//                   a single large memcpy per (layer, kv). No staging.
 //   SEGMENTED_DIRECT few merged runs, dst physically contiguous: one memcpy
 //                   per contiguous run, straight CPU<->GPU. No staging, so
 //                   ping-pong does not apply.
@@ -82,9 +81,13 @@ struct CETransferConfig {
 //                   Uses staging (D2H ping-pong disabled when both sides are
 //                   non-contiguous — per-block granularity makes event overhead
 //                   dominate).
-//   STAGED_MERGE and STAGED_BLOCK share the same ce_transfer_staged_scatter
-//   implementation (staging + scatter + ping-pong machinery); they differ only
-//   in the innermost copy loop, selected at runtime by gpu_phys_contig.
+//   STAGED_MERGE and STAGED_BLOCK used to share a single ce_transfer_staged_scatter
+//   implementation that selected the inner copy loop at runtime by
+//   gpu_phys_contig; they are now split into two self-describing functions
+//   (ce_transfer_staged_merge / ce_transfer_staged_block) that share the
+//   staging buffer allocator (get_cached_hugepage_buffer), scatter_to_cpu /
+//   gather_from_cpu, and the cached ping-pong event helper
+//   (get_cached_event_pair).
 //   GATHER_SCATTER  many scattered segments (> segment_threshold), GPU blocks
 //                   physically contiguous: GPU index_select gather (D2H) /
 //                   index_copy_ scatter (H2D) through a staging buffer. Uses
@@ -120,6 +123,12 @@ struct CESegment {
 //        and gpu_* flags for the actual destination. This prevents the
 //        silent data-corruption bug that would arise from treating src=CPU
 //        when the field is named "src" but actually means GPU.
+//
+// Note: gpu_log_contig / cpu_log_contig are no longer used by choose_path
+// (BULK_CONTIG now uses num_segments == 1). They remain in use by
+// ce_transfer_gather_scatter and ce_transfer_bf_d2d_transpose to decide
+// whether GPU index_select / index_copy_ is needed, so they are still
+// computed by analyze_ce_transfer.
 struct CEAnalysis {
   bool gpu_log_contig;   // gpu_block_ids[k+1] == gpu_block_ids[k]+1
   bool cpu_log_contig;   // cpu_block_ids[k+1] == cpu_block_ids[k]+1
@@ -165,7 +174,7 @@ void ce_transfer_per_block(
 
 // ============================================================================
 // BULK_CONTIG: single large memcpy per (layer, kv_dim). No staging.
-//   Requires: gpu_log_contig && cpu_log_contig && cpu_phys_contig && gpu_phys_contig
+//   Requires: cpu_phys_contig && gpu_phys_contig && num_segments == 1
 // ============================================================================
 template <BackendType Type>
 void ce_transfer_bulk_contig(
@@ -196,15 +205,38 @@ void ce_transfer_segmented_direct(
     const CEAnalysis &analysis, const CETransferConfig &ce_config);
 
 // ============================================================================
-// STAGED_MERGE / STAGED_BLOCK: pinned staging buffer + CPU scatter/gather to a
-//   strided destination. Both paths share this implementation (selected by
-//   choose_path based on gpu_phys_contig). Internally selects a GPU-side copy
-//   loop at runtime by gpu_phys_contig:
-//     STAGED_MERGE  (gpu_phys_contig)     -> merged-run memcpy GPU<->staging
-//     STAGED_BLOCK  (!gpu_phys_contig)    -> per-block   memcpy GPU<->staging
+// STAGED_MERGE: pinned staging buffer + merged-segment memcpy + CPU
+//   scatter/gather to a strided destination. Chosen by choose_path when
+//   gpu_phys_contig (GPU blocks physically contiguous -> one memcpy per
+//   contiguous run of block ids). Ping-pong: D2H layer-level (always enabled
+//   for D2H; is_per_block is always false since gpu_phys_contig is true).
+//   enable_memcpy2d: when true, D2H/H2D uses cudaMemcpy2DAsync per segment
+//   (strided GPU<->CPU directly, bypassing staging + scatter/gather).
 // ============================================================================
 template <BackendType Type>
-void ce_transfer_staged_scatter(
+void ce_transfer_staged_merge(
+    int num_blocks, int start_layer_id, int num_layers, int kv_dim,
+    int64_t *gpu_block_ids, GTensorHandler gpu_tensor_handler,
+    int64_t gpu_startoff_inside_chunks_int64,
+    int64_t *cpu_block_ids, int64_t *cpu_ptr_int64,
+    int64_t cpu_kv_stride_int64, int64_t cpu_layer_stride_int64,
+    int64_t cpu_block_stride_int64,
+    int64_t cpu_startoff_inside_chunks_int64, int64_t chunk_size_in_bytes,
+    cudaStream_t stream, bool is_host_to_device,
+    const CEAnalysis &analysis, const CETransferConfig &ce_config);
+
+// ============================================================================
+// STAGED_BLOCK: pinned staging buffer + per-block memcpy + CPU scatter/gather.
+//   Chosen by choose_path when !gpu_phys_contig (sharded D2H: GPU block stride
+//   != chunk_size). One memcpy per block (no segment merging possible).
+//   Ping-pong: D2H disabled when both sides non-contiguous
+//   (!gpu_phys_contig && !cpu_phys_contig -> per-block granularity makes event
+//   overhead dominate); enabled when D2H && cpu_phys_contig.
+//   enable_memcpy2d: when true, D2H/H2D uses cudaMemcpy2DAsync per segment
+//   (strided GPU<->CPU directly, bypassing staging + scatter/gather).
+// ============================================================================
+template <BackendType Type>
+void ce_transfer_staged_block(
     int num_blocks, int start_layer_id, int num_layers, int kv_dim,
     int64_t *gpu_block_ids, GTensorHandler gpu_tensor_handler,
     int64_t gpu_startoff_inside_chunks_int64,

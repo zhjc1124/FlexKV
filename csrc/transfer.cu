@@ -198,8 +198,17 @@ void transfer_kv_blocks(
               ce_config);
           break;
         case CEPath::STAGED_MERGE:
+          ce_transfer_staged_merge<Type>(
+              num_blocks, start_layer_id, num_layers, kv_dim,
+              gpu_block_ids, gpu_tensor_handler,
+              gpu_startoff_inside_chunks_int64, cpu_block_ids, cpu_ptr_int64,
+              cpu_kv_stride_int64, cpu_layer_stride_int64,
+              cpu_block_stride_int64, cpu_startoff_inside_chunks_int64,
+              chunk_size_in_bytes, stream, is_host_to_device, analysis,
+              ce_config);
+          break;
         case CEPath::STAGED_BLOCK:
-          ce_transfer_staged_scatter<Type>(
+          ce_transfer_staged_block<Type>(
               num_blocks, start_layer_id, num_layers, kv_dim,
               gpu_block_ids, gpu_tensor_handler,
               gpu_startoff_inside_chunks_int64, cpu_block_ids, cpu_ptr_int64,

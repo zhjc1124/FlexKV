@@ -324,6 +324,36 @@ ALL_FORCE_PATHS = [
 ]
 
 
+def python_choose_path(pattern, layout_key, mode, is_h2d, threshold,
+                       chunk_size_bytes):
+    """Mirror of C++ choose_path (ce_transfer.cu). Returns the CEPath name
+    that choose_path would pick for the given (pattern, layout, mode, dir).
+
+    Used to annotate the opt (auto) row with the path choose_path selected,
+    so the reader can confirm opt == force_<auto_path> timing.
+    """
+    cpu_phys_contig = (layout_key == "lfirst")
+    # Sharded D2H shrinks GPU chunk -> gpu_phys_contig == False.
+    gpu_phys_contig = not (mode == "sharded" and not is_h2d)
+    # num_segments: contiguous=1, few_seg=4, scattered=many(>threshold)
+    if pattern == "contiguous":
+        num_segments = 1
+    elif pattern == "few_seg":
+        num_segments = 4
+    else:  # scattered
+        num_segments = threshold + 1  # > threshold
+
+    if cpu_phys_contig and gpu_phys_contig and num_segments == 1:
+        return "BULK_CONTIG"
+    if not gpu_phys_contig:
+        return "STAGED_BLOCK"
+    if num_segments <= threshold:
+        return "SEGMENTED_DIRECT" if cpu_phys_contig else "STAGED_MERGE"
+    if chunk_size_bytes > 0 and chunk_size_bytes % 8 != 0:
+        return "STAGED_MERGE"
+    return "GATHER_SCATTER"
+
+
 def run_strategy_compare(args):
     """Drive each CE form across both H2D and D2H, 3 CE configs each, plus
     force-path head-to-head, for each size in args.sizes.
@@ -379,12 +409,22 @@ def run_strategy_compare(args):
             for is_h2d in dirs:
                 dir_name = "H2D" if is_h2d else "D2H"
                 key = (form_name, dir_name)
-                print("\n-- Form: {} | pattern={} | layout={} | mode={} | dir={} --".format(
-                    form_name, pattern, layout_key, mode, dir_name))
+                # Compute the path choose_path would auto-pick for this
+                # (form, dir) so we can annotate the opt row.
+                auto_path = python_choose_path(
+                    pattern, layout_key, mode, is_h2d, threshold,
+                    head_dim * ES)
+                results[key]["auto_path"] = auto_path
+                print("\n-- Form: {} | pattern={} | layout={} | mode={} | dir={} | auto={} --".format(
+                    form_name, pattern, layout_key, mode, dir_name, auto_path))
 
                 # Step 1: two CE configs (baseline / opt)
                 for cfg_label, path_opt in PATH_CONFIGS:
-                    print("  {} ...".format(cfg_label), end=" ", flush=True)
+                    path_tag = ""
+                    if cfg_label == "opt":
+                        path_tag = " [{}]".format(auto_path)
+                    print("  {}{} ...".format(cfg_label, path_tag), end=" ",
+                          flush=True)
                     try:
                         tp = make_tp_group(
                             cpu_kv.data_ptr(), all_gpu, num_gpus, gpu_layout,
@@ -445,9 +485,13 @@ def run_strategy_compare(args):
                 run_rows.append((form_name, "H2D" if is_h2d else "D2H", viable))
 
         # -- Part 1: baseline vs opt ------------------------------------------
+        # The opt column is annotated with the path choose_path auto-picked
+        # (in brackets), e.g. `opt[STAGED_MERGE]`. Confirm by checking that
+        # opt timing matches force_<auto_path> in Part 2.
         print("\n  Part 1: Optimization Config (baseline / opt)")
         print("  '*' = fastest of the 2 for each row.")
-        hdr = "{:>18s}  {:>4s}  {:>12s}  {:>12s}  {:>12s}".format(
+        print("  opt column annotated with choose_path auto-pick, e.g. 0.434[STAGED_MERGE].")
+        hdr = "{:>18s}  {:>4s}  {:>12s}  {:>20s}  {:>12s}".format(
             "Form", "Dir", "baseline", "opt", "base/opt")
         print("  " + hdr)
         print("  " + "-" * len(hdr))
@@ -456,20 +500,28 @@ def run_strategy_compare(args):
             cfgs = results.get((form_name, dir_name), {})
             base = cfgs.get("baseline")
             opt = cfgs.get("opt")
+            auto_path = cfgs.get("auto_path", "")
             fastest = min((v for v in (base, opt) if v is not None),
                           default=None)
 
-            def fmt(v):
+            def fmt_base(v):
                 if v is None:
                     return "{:>12s}".format("-")
                 star = "*" if (fastest is not None and v == fastest) else " "
                 return "{:>11.3f}{}".format(v, star)
 
+            if opt is None:
+                opt_str = "{:>20s}".format("-")
+            else:
+                star = "*" if (fastest is not None and opt == fastest) else " "
+                tag = "[{}]".format(auto_path) if auto_path else ""
+                opt_str = "{:>13.3f}{:<6s}".format(opt, star + tag)
+
             speedup = "-"
             if base and opt and opt > 0:
                 speedup = "{:.2f}x".format(base / opt)
             print("  {:>18s}  {:>4s}  {}  {}  {:>12s}".format(
-                form_name, dir_name, fmt(base), fmt(opt), speedup))
+                form_name, dir_name, fmt_base(base), opt_str, speedup))
 
         # -- Part 2: force-path head-to-head ----------------------------------
         print("\n  Part 2: Force-Path Head-to-Head (all under opt)")

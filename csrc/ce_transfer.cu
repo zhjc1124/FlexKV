@@ -8,7 +8,7 @@
  * Five optimized paths selected by choose_path() based on block-id contiguity
  * analysis (see ce_transfer.h CEPath enum):
  *
- *   BULK_CONTIG (0):     gpu_log_contig && cpu_log_contig && cpu_phys_contig.
+ *   BULK_CONTIG (0):     cpu_phys_contig && gpu_phys_contig && num_segments==1.
  *                         Single large cudaMemcpyAsync per (layer, kv_dim).
  *                         Optimal — O(1) API calls. No staging, no ping-pong.
  *
@@ -23,8 +23,12 @@
  *                         Pinned staging buffer + per-block memcpy + CPU
  *                         scatter/gather. Ping-pong disabled when both sides
  *                         non-contiguous (per-block granularity).
- *   Both STAGED_MERGE and STAGED_BLOCK share ce_transfer_staged_scatter; the
- *   inner copy loop is selected at runtime by gpu_phys_contig.
+ *   STAGED_MERGE and STAGED_BLOCK used to share a single
+ *   ce_transfer_staged_scatter that branched on gpu_phys_contig at runtime;
+ *   they are now split into ce_transfer_staged_merge (merged segment memcpy,
+ *   requires gpu_phys_contig) and ce_transfer_staged_block (per-block memcpy,
+ *   !gpu_phys_contig). Both share get_cached_hugepage_buffer /
+ *   scatter_to_cpu / gather_from_cpu / get_cached_event_pair.
  *
  *   GATHER_SCATTER (4):  Many scattered segments (num_segments > threshold).
  *                         GPU index_select gather + single D2H/H2D + CPU
@@ -98,8 +102,11 @@ CEAnalysis analyze_ce_transfer(
 // self-describing name. GATHER_SCATTER (was Path 2) is unchanged.
 CEPath choose_path(const CEAnalysis &a, const CETransferConfig &ce_config,
                    int64_t chunk_size_in_bytes) {
-  // BULK_CONTIG: logical + physical contiguity on both sides -> one big memcpy.
-  if (a.gpu_log_contig && a.cpu_log_contig && a.cpu_phys_contig && a.gpu_phys_contig)
+  // BULK_CONTIG: physical contiguity on both sides AND a single contiguous
+  // run of block ids (num_segments == 1 subsumes gpu_log_contig &&
+  // cpu_log_contig: num_segments stays 1 only when every step is +1 on both
+  // sides). -> one big memcpy.
+  if (a.cpu_phys_contig && a.gpu_phys_contig && a.num_segments == 1)
     return CEPath::BULK_CONTIG;
 
   // Sharded D2H: !gpu_phys_contig (chunk shrunk to shard, stride = full chunk).
@@ -475,18 +482,20 @@ void gather_from_cpu(void *staging_buf, const int64_t *cpu_ptr_int64,
 }
 
 // ============================================================================
-// STAGED_MERGE / STAGED_BLOCK: pinned staging buffer + CPU scatter/gather to a
-//   strided destination (BLOCKFIRST, or sharded D2H). Both paths share this
-//   implementation; choose_path selects STAGED_MERGE when gpu_phys_contig and
-//   STAGED_BLOCK when !gpu_phys_contig. The inner copy loop is selected at
-//   runtime by analysis.gpu_phys_contig:
-//     STAGED_MERGE  (gpu_phys_contig)  -> merged-run memcpy GPU<->staging
-//     STAGED_BLOCK  (!gpu_phys_contig) -> per-block   memcpy GPU<->staging
-//   (sharded D2H is the only !gpu_phys_contig case.)
+// STAGED_MERGE: pinned staging buffer + merged-segment memcpy + CPU
+//   scatter/gather to a strided destination (BLOCKFIRST, or any strided CPU
+//   layout with GPU contiguous). Requires gpu_phys_contig (GPU block stride ==
+//   chunk_size) so consecutive GPU blocks within a segment are physically
+//   adjacent -> one cudaMemcpyAsync per contiguous run of block ids.
+//   Ping-pong: D2H layer-level (always enabled for D2H; is_per_block is
+//   always false since gpu_phys_contig is true).
+//   enable_memcpy2d branch (at entry): when true, use cudaMemcpy2DAsync per
+//   segment (strided GPU<->CPU directly, bypassing staging + scatter/gather).
+//   Fast on NVIDIA (DMA engine handles 2D), very slow on P800/Kunlunxin.
 // ============================================================================
 
 template <BackendType Type>
-void ce_transfer_staged_scatter(
+void ce_transfer_staged_merge(
     int num_blocks, int start_layer_id, int num_layers, int kv_dim,
     int64_t *gpu_block_ids, GTensorHandler gpu_tensor_handler,
     int64_t gpu_startoff_inside_chunks_int64,
@@ -548,18 +557,209 @@ void ce_transfer_staged_scatter(
   }
 
   // ---- staging buffer + CPU scatter/gather ----
-  // GPU-side copy loop: contiguous GPU blocks let us merge each segment into
-  // one memcpy (STAGED_MERGE); sharded D2H (!gpu_phys_contig) forces one
-  // memcpy per block (STAGED_BLOCK). Both share the staging buffer, CPU
-  // scatter/gather and ping-pong machinery below. The inline
-  // if (analysis.gpu_phys_contig) branches below select the variant.
+  // STAGED_MERGE: gpu_phys_contig is true (required by choose_path), so
+  // is_per_block is always false. Ping-pong enabled for all D2H.
   size_t layer_buf_size = (size_t)num_blocks * chunk_size_in_bytes;
-  // D2H ping-pong: double-buffer the host staging buffer so CPU scatter of
-  // layer L overlaps with GPU D2H of layer L+1. H2D has no ping-pong (CPU
-  // gather is too fast to benefit from overlap).
-  // Also disable for STAGED_BLOCK (both sides non-contig) -- per-block
-  // granularity makes event overhead dominate at large num_blocks.
-  bool is_per_block = !analysis.gpu_phys_contig && !analysis.cpu_phys_contig;
+  bool need_pingpong = !is_host_to_device;
+
+  void *host_base = get_cached_hugepage_buffer(need_pingpong ? layer_buf_size * 2
+                                                       : layer_buf_size);
+  void *host_bufs[2] = {
+      host_base,
+      need_pingpong ? (char *)host_base + layer_buf_size : nullptr};
+  // Cached ping-pong events (per device, thread_local -- see get_cached_event_pair).
+  bool events_created = false;
+  cudaEvent_t *pingpong_events = get_cached_event_pair(need_pingpong, events_created);
+
+  const int64_t total_iters = (int64_t)num_layers * kv_dim;
+  for (int64_t it = 0; it < total_iters; ++it) {
+    int i = (int)(it / kv_dim);
+    int j = (int)(it % kv_dim);
+    int idx = need_pingpong ? (int)(it & 1) : 0;
+    int prev_idx = idx ^ 1;
+    void *buf = host_bufs[idx];
+
+    if (!is_host_to_device) {
+      // ---- D2H ----
+      // D2H all segments into staging (merged segment memcpy: gpu_phys_contig)
+      int64_t seg_offset = 0;
+      for (const auto &seg : analysis.segments) {
+        int64_t seg_size = (int64_t)seg.run_len * chunk_size_in_bytes;
+        int64_t *gpu_ptr = ptr_at<Type>(gpu_tensor_handler,
+                                        i + start_layer_id, j,
+                                        gpu_block_ids[seg.start_k]);
+        int64_t *gpu_ptr_off =
+            reinterpret_cast<int64_t *>(gpu_ptr) +
+            gpu_startoff_inside_chunks_int64;
+        cudaMemcpyAsync((char *)buf + seg_offset, gpu_ptr_off, seg_size,
+                        cudaMemcpyDeviceToHost, stream);
+        FLEXKV_GPU_CPU_TRANSFER(false, seg_size);
+        seg_offset += seg_size;
+      }
+      if (need_pingpong) {
+        cudaEventRecord(pingpong_events[idx], stream);
+        // CPU scatter previous layer
+        if (it >= 1) {
+          cudaEventSynchronize(pingpong_events[prev_idx]);
+          int pi = (int)((it - 1) / kv_dim);
+          int pj = (int)((it - 1) % kv_dim);
+          // scatter from host_bufs[prev_idx] to strided dst
+          scatter_to_cpu(host_bufs[prev_idx], cpu_ptr_int64,
+                         cpu_block_ids, num_blocks,
+                         cpu_block_stride_int64,
+                         cpu_startoff_inside_chunks_int64,
+                         chunk_size_in_bytes, pi, pj,
+                         cpu_kv_stride_int64, cpu_layer_stride_int64,
+                         start_layer_id, analysis.cpu_phys_contig);
+        }
+      } else {
+        cudaStreamSynchronize(stream);
+        // scatter current layer
+        scatter_to_cpu(buf, cpu_ptr_int64,
+                       cpu_block_ids, num_blocks,
+                       cpu_block_stride_int64,
+                       cpu_startoff_inside_chunks_int64,
+                       chunk_size_in_bytes, i, j,
+                       cpu_kv_stride_int64, cpu_layer_stride_int64,
+                       start_layer_id, analysis.cpu_phys_contig);
+      }
+    } else {
+      // ---- H2D (no ping-pong: CPU gather is too fast to benefit) ----
+      // Gather all segments into buf, then H2D all, then drain.
+      // `buf` is pinned to host_bufs[0] and reused every iteration.
+      gather_from_cpu(buf, cpu_ptr_int64,
+                      cpu_block_ids, num_blocks,
+                      cpu_block_stride_int64,
+                      cpu_startoff_inside_chunks_int64,
+                      chunk_size_in_bytes, i, j,
+                      cpu_kv_stride_int64, cpu_layer_stride_int64,
+                      start_layer_id, analysis.cpu_phys_contig);
+      // H2D all segments from staging (merged segment memcpy: gpu_phys_contig)
+      int64_t off = 0;
+      for (const auto &seg : analysis.segments) {
+        int64_t seg_size = (int64_t)seg.run_len * chunk_size_in_bytes;
+        int64_t *gpu_ptr = ptr_at<Type>(gpu_tensor_handler,
+                                        i + start_layer_id, j,
+                                        gpu_block_ids[seg.start_k]);
+        int64_t *gpu_ptr_off =
+            reinterpret_cast<int64_t *>(gpu_ptr) +
+            gpu_startoff_inside_chunks_int64;
+        cudaMemcpyAsync(gpu_ptr_off, (char *)buf + off, seg_size,
+                        cudaMemcpyHostToDevice, stream);
+        FLEXKV_GPU_CPU_TRANSFER(true, seg_size);
+        off += seg_size;
+      }
+      // The async H2D memcpy's above are still reading `buf` when the
+      // next iteration's CPU gather overwrites it. Drain the stream so
+      // `buf` is safe to overwrite next iteration.
+      cudaStreamSynchronize(stream);
+    }
+  }
+  // Drain last ping-pong slot (D2H)
+  if (!is_host_to_device && need_pingpong && total_iters >= 1) {
+    int64_t last = total_iters - 1;
+    int last_idx = (int)(last & 1);
+    cudaEventSynchronize(pingpong_events[last_idx]);
+    int li = (int)(last / kv_dim);
+    int lj = (int)(last % kv_dim);
+    scatter_to_cpu(host_bufs[last_idx], cpu_ptr_int64,
+                   cpu_block_ids, num_blocks,
+                   cpu_block_stride_int64,
+                   cpu_startoff_inside_chunks_int64,
+                   chunk_size_in_bytes, li, lj,
+                   cpu_kv_stride_int64, cpu_layer_stride_int64,
+                   start_layer_id, analysis.cpu_phys_contig);
+  }
+  // NOTE: ping-pong events are cached (get_cached_event_pair) and NOT
+  // destroyed here. All GPU work has been sync'd within the loop (via
+  // per-slot cudaEventSynchronize) and at the end (via final flush or
+  // cudaStreamSynchronize), so the events are safe to reuse in the next call.
+}
+
+// ============================================================================
+// STAGED_BLOCK: pinned staging buffer + per-block memcpy + CPU scatter/gather.
+//   Chosen by choose_path when !gpu_phys_contig (sharded D2H: GPU block stride
+//   != chunk_size, so consecutive GPU blocks within a segment are NOT
+//   physically adjacent -> one cudaMemcpyAsync per block).
+//   Ping-pong: D2H disabled when both sides non-contiguous
+//   (!gpu_phys_contig && !cpu_phys_contig -> is_per_block = !cpu_phys_contig
+//   here since !gpu_phys_contig is given); enabled when D2H && cpu_phys_contig.
+//   enable_memcpy2d branch (at entry): when true, use cudaMemcpy2DAsync per
+//   segment (strided GPU<->CPU directly, bypassing staging + scatter/gather).
+// ============================================================================
+
+template <BackendType Type>
+void ce_transfer_staged_block(
+    int num_blocks, int start_layer_id, int num_layers, int kv_dim,
+    int64_t *gpu_block_ids, GTensorHandler gpu_tensor_handler,
+    int64_t gpu_startoff_inside_chunks_int64,
+    int64_t *cpu_block_ids, int64_t *cpu_ptr_int64,
+    int64_t cpu_kv_stride_int64, int64_t cpu_layer_stride_int64,
+    int64_t cpu_block_stride_int64,
+    int64_t cpu_startoff_inside_chunks_int64, int64_t chunk_size_in_bytes,
+    cudaStream_t stream, bool is_host_to_device,
+    const CEAnalysis &analysis, const CETransferConfig &ce_config) {
+
+  // ---- memcpy2d branch (bidirectional, NVIDIA-specific optimization) ----
+  // When enable_memcpy2d=TRUE, use cudaMemcpy2DAsync per segment to do a
+  // strided GPU<->CPU transfer directly, bypassing the staging buffer +
+  // sync + CPU scatter/gather. Fast on NVIDIA (DMA engine handles 2D),
+  // extremely slow on P800/Kunlunxin. Default off (FLEXKV_ENABLE_MEMCPY2D=0).
+  // Direction (is_host_to_device) selects src/dst/pitch/kind:
+  //   D2H: GPU src (contiguous within segment) -> CPU dst (strided)
+  //   H2D: CPU src (strided) -> GPU dst (contiguous within segment)
+  // For STAGED_BLOCK (sharded D2H), gpu_pitch (computed from pointer diff)
+  // is the full GPU block stride (>= chunk_size), and width=chunk_size
+  // (shard) — memcpy2D strides through the GPU source correctly.
+  if (ce_config.enable_memcpy2d) {
+    cudaMemcpyKind kind = is_host_to_device ? cudaMemcpyHostToDevice
+                                            : cudaMemcpyDeviceToHost;
+    const int64_t total_iters = (int64_t)num_layers * kv_dim;
+    for (int64_t it = 0; it < total_iters; ++it) {
+      int i = (int)(it / kv_dim);
+      int j = (int)(it % kv_dim);
+      for (const auto &seg : analysis.segments) {
+        // GPU pointer: ptr_at for the first block in this segment. Within a
+        // segment gpu_block_ids are contiguous (step=1), so the GPU block
+        // stride (pitch) is the pointer diff of two adjacent blocks.
+        int64_t *gpu_ptr_first = ptr_at<Type>(gpu_tensor_handler,
+                                              i + start_layer_id, j,
+                                              gpu_block_ids[seg.start_k]);
+        int64_t *gpu_ptr_next = ptr_at<Type>(gpu_tensor_handler,
+                                             i + start_layer_id, j,
+                                             gpu_block_ids[seg.start_k] + 1);
+        size_t gpu_pitch = (size_t)((char *)gpu_ptr_next - (char *)gpu_ptr_first);
+        void *gpu_ptr = (char *)gpu_ptr_first +
+            gpu_startoff_inside_chunks_int64 * sizeof(int64_t);
+        // CPU pointer: strided, first block in segment.
+        int64_t *cpu_base = cpu_ptr_int64 +
+            (i + start_layer_id) * cpu_layer_stride_int64 +
+            j * cpu_kv_stride_int64 + cpu_startoff_inside_chunks_int64;
+        void *cpu_ptr = cpu_base + cpu_block_ids[seg.start_k] * cpu_block_stride_int64;
+        size_t cpu_pitch = (size_t)cpu_block_stride_int64 * sizeof(int64_t);
+
+        // Select src/dst/pitch by direction.
+        void *dst = is_host_to_device ? gpu_ptr : cpu_ptr;
+        void *src = is_host_to_device ? cpu_ptr : gpu_ptr;
+        size_t dpitch = is_host_to_device ? gpu_pitch : cpu_pitch;
+        size_t spitch = is_host_to_device ? cpu_pitch : gpu_pitch;
+
+        cudaMemcpy2DAsync(dst, dpitch, src, spitch,
+                          chunk_size_in_bytes, seg.run_len, kind, stream);
+        FLEXKV_GPU_CPU_TRANSFER(is_host_to_device, chunk_size_in_bytes * seg.run_len);
+      }
+    }
+    cudaStreamSynchronize(stream);
+    return;
+  }
+
+  // ---- staging buffer + CPU scatter/gather ----
+  // STAGED_BLOCK: gpu_phys_contig is false (required by choose_path).
+  // is_per_block = !gpu_phys_contig && !cpu_phys_contig = !cpu_phys_contig
+  // (since !gpu_phys_contig is given). Ping-pong enabled for D2H only when
+  // CPU side is contiguous (is_per_block = false).
+  size_t layer_buf_size = (size_t)num_blocks * chunk_size_in_bytes;
+  bool is_per_block = !analysis.cpu_phys_contig;
   bool need_pingpong = !is_host_to_device && !is_per_block;
 
   void *host_base = get_cached_hugepage_buffer(need_pingpong ? layer_buf_size * 2
@@ -581,39 +781,21 @@ void ce_transfer_staged_scatter(
 
     if (!is_host_to_device) {
       // ---- D2H ----
-      // D2H all segments into staging
+      // D2H all segments into staging (per-block memcpy: !gpu_phys_contig)
       int64_t seg_offset = 0;
-      if (analysis.gpu_phys_contig) {
-        // GPU blocks contiguous: continuous segment memcpy
-        for (const auto &seg : analysis.segments) {
-          int64_t seg_size = (int64_t)seg.run_len * chunk_size_in_bytes;
+      for (const auto &seg : analysis.segments) {
+        for (int b = 0; b < seg.run_len; ++b) {
           int64_t *gpu_ptr = ptr_at<Type>(gpu_tensor_handler,
                                           i + start_layer_id, j,
-                                          gpu_block_ids[seg.start_k]);
+                                          gpu_block_ids[seg.start_k + b]);
           int64_t *gpu_ptr_off =
               reinterpret_cast<int64_t *>(gpu_ptr) +
               gpu_startoff_inside_chunks_int64;
-          cudaMemcpyAsync((char *)buf + seg_offset, gpu_ptr_off, seg_size,
+          cudaMemcpyAsync((char *)buf + seg_offset, gpu_ptr_off,
+                          chunk_size_in_bytes,
                           cudaMemcpyDeviceToHost, stream);
-          FLEXKV_GPU_CPU_TRANSFER(false, seg_size);
-          seg_offset += seg_size;
-        }
-      } else {
-        // GPU blocks not contiguous (sharded D2H): per-block memcpy
-        for (const auto &seg : analysis.segments) {
-          for (int b = 0; b < seg.run_len; ++b) {
-            int64_t *gpu_ptr = ptr_at<Type>(gpu_tensor_handler,
-                                            i + start_layer_id, j,
-                                            gpu_block_ids[seg.start_k + b]);
-            int64_t *gpu_ptr_off =
-                reinterpret_cast<int64_t *>(gpu_ptr) +
-                gpu_startoff_inside_chunks_int64;
-            cudaMemcpyAsync((char *)buf + seg_offset, gpu_ptr_off,
-                            chunk_size_in_bytes,
-                            cudaMemcpyDeviceToHost, stream);
-            FLEXKV_GPU_CPU_TRANSFER(false, chunk_size_in_bytes);
-            seg_offset += chunk_size_in_bytes;
-          }
+          FLEXKV_GPU_CPU_TRANSFER(false, chunk_size_in_bytes);
+          seg_offset += chunk_size_in_bytes;
         }
       }
       if (need_pingpong) {
@@ -654,37 +836,21 @@ void ce_transfer_staged_scatter(
                       chunk_size_in_bytes, i, j,
                       cpu_kv_stride_int64, cpu_layer_stride_int64,
                       start_layer_id, analysis.cpu_phys_contig);
-      // H2D all segments from staging
+      // H2D all segments from staging (per-block memcpy: !gpu_phys_contig)
       int64_t off = 0;
-      if (analysis.gpu_phys_contig) {
-        for (const auto &seg : analysis.segments) {
-          int64_t seg_size = (int64_t)seg.run_len * chunk_size_in_bytes;
+      for (const auto &seg : analysis.segments) {
+        for (int b = 0; b < seg.run_len; ++b) {
           int64_t *gpu_ptr = ptr_at<Type>(gpu_tensor_handler,
                                           i + start_layer_id, j,
-                                          gpu_block_ids[seg.start_k]);
+                                          gpu_block_ids[seg.start_k + b]);
           int64_t *gpu_ptr_off =
               reinterpret_cast<int64_t *>(gpu_ptr) +
               gpu_startoff_inside_chunks_int64;
-          cudaMemcpyAsync(gpu_ptr_off, (char *)buf + off, seg_size,
+          cudaMemcpyAsync(gpu_ptr_off, (char *)buf + off,
+                          chunk_size_in_bytes,
                           cudaMemcpyHostToDevice, stream);
-          FLEXKV_GPU_CPU_TRANSFER(true, seg_size);
-          off += seg_size;
-        }
-      } else {
-        for (const auto &seg : analysis.segments) {
-          for (int b = 0; b < seg.run_len; ++b) {
-            int64_t *gpu_ptr = ptr_at<Type>(gpu_tensor_handler,
-                                            i + start_layer_id, j,
-                                            gpu_block_ids[seg.start_k + b]);
-            int64_t *gpu_ptr_off =
-                reinterpret_cast<int64_t *>(gpu_ptr) +
-                gpu_startoff_inside_chunks_int64;
-            cudaMemcpyAsync(gpu_ptr_off, (char *)buf + off,
-                            chunk_size_in_bytes,
-                            cudaMemcpyHostToDevice, stream);
-            FLEXKV_GPU_CPU_TRANSFER(true, chunk_size_in_bytes);
-            off += chunk_size_in_bytes;
-          }
+          FLEXKV_GPU_CPU_TRANSFER(true, chunk_size_in_bytes);
+          off += chunk_size_in_bytes;
         }
       }
       // The async H2D memcpy's above are still reading `buf` when the
@@ -1221,8 +1387,8 @@ void ce_transfer_bf_d2d_transpose(
 //   NOSTG  = (int, int, int, int, int64_t*, GTensorHandler, int64_t,
 //             int64_t*, int64_t*, int64_t x5, cudaStream_t, bool)
 //   STG    = NOSTG + (const CEAnalysis&, const CETransferConfig&)
-// per_block / bulk_contig use NOSTG; segmented_direct / staged_scatter /
-// gather_scatter use STG.
+// per_block / bulk_contig use NOSTG; segmented_direct / staged_merge /
+// staged_block / gather_scatter use STG.
 
 #define FLEXKV_INST_NOSTG(FN, BK)                                            \
   template void FN<BackendType::BK>(                                         \
@@ -1248,7 +1414,8 @@ void ce_transfer_bf_d2d_transpose(
 FLEXKV_INST_ALL_BACKENDS(FLEXKV_INST_NOSTG, ce_transfer_per_block)
 FLEXKV_INST_ALL_BACKENDS(FLEXKV_INST_NOSTG, ce_transfer_bulk_contig)
 FLEXKV_INST_ALL_BACKENDS(FLEXKV_INST_STG, ce_transfer_segmented_direct)
-FLEXKV_INST_ALL_BACKENDS(FLEXKV_INST_STG, ce_transfer_staged_scatter)
+FLEXKV_INST_ALL_BACKENDS(FLEXKV_INST_STG, ce_transfer_staged_merge)
+FLEXKV_INST_ALL_BACKENDS(FLEXKV_INST_STG, ce_transfer_staged_block)
 FLEXKV_INST_ALL_BACKENDS(FLEXKV_INST_STG, ce_transfer_gather_scatter)
 FLEXKV_INST_ALL_BACKENDS(FLEXKV_INST_STG, ce_transfer_bf_d2d_transpose)
 
