@@ -137,7 +137,7 @@ ENGINES = [
     pytest.param("ce", True, id="ce"),
 ]
 
-MLA_MODES = ["sharded", "all_write", "rank0_only", "round_robin", "rank_rr"]
+MLA_MODES = ["sharded", "all_write", "rank0_only", "layer_parallel", "rank_rotate"]
 
 CE_MEMCPY2D_CONFIGS = [False, True]
 
@@ -1023,7 +1023,7 @@ _MHA_SIZES = [
 CE_MODE_CONFIGS = (
     [pytest.param(cfg, True, mode, id=f"mla_{mode}-{sid}")
      for (cfg, sid) in _MLA_SIZES
-     for mode in ("sharded", "all_write", "rank0_only", "round_robin", "rank_rr")]
+     for mode in ("sharded", "all_write", "rank0_only", "layer_parallel", "rank_rotate")]
     + [pytest.param(cfg, False, "sharded", id=f"non_mla-{sid}")
        for (cfg, sid) in _MHA_SIZES]
 )
@@ -1383,8 +1383,8 @@ def _strategy_matrix():
     layouts = ["LAYERFIRST", "BLOCKFIRST"]
     # (is_mla, mode) combos as produced by CE_MODE_CONFIGS.
     mode_combos = [(True, "sharded"), (True, "all_write"),
-                   (True, "rank0_only"), (True, "round_robin"),
-                   (True, "rank_rr"), (False, "sharded")]
+                   (True, "rank0_only"), (True, "layer_parallel"),
+                   (True, "rank_rotate"), (False, "sharded")]
     # Representative block counts from the size matrix: a small one (skips
     # scattered at threshold=8) and a large one.
     block_counts = [4, 64]

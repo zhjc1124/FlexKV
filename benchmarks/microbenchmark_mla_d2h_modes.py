@@ -99,8 +99,8 @@ STRATEGIES = [
     ("MLA-sharded", True,  "sharded"),
     ("MLA-all_write", True, "all_write"),
     ("MLA-rank0_only", True, "rank0_only"),
-    ("MLA-round_robin", True, "round_robin"),
-    ("MLA-rank_rr",    True, "rank_rr"),
+    ("MLA-layer_parallel", True, "layer_parallel"),
+    ("MLA-rank_rotate",    True, "rank_rotate"),
 ]
 
 # CE optimization config, as two cumulative levels. Only meaningful for the
@@ -747,7 +747,7 @@ def main():
                     if "MLA-rank0_only" in args.strategies:
                         cpu_layout_type = LAYOUTS[layout_name]
                         for cfg_label, path_opt in configs:
-                            dr_label = "MLA-rank_rr"
+                            dr_label = "MLA-rank_rotate"
                             label = "{} | h2d={} | {} | {} | {} | {}".format(
                                 size_name, h2d_engine, engine_name, layout_name,
                                 dr_label, cfg_label)
