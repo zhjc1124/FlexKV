@@ -47,7 +47,7 @@ def make_pattern(num_blocks, run_len):
 
 
 def bench_one(num_gpus, num_layers, num_blocks, tpb, head_dim, run_len,
-              enable_memcpy2d, iters, sharded=False):
+              enable_memcpy2d, iters, sharded=False, layout="BLOCKFIRST"):
     """Benchmark D2H. If sharded, uses STAGED_BLOCK (force_path=3); else STAGED_MERGE (force_path=2)."""
     is_mla = True
     kv_dim = 1
@@ -59,7 +59,7 @@ def bench_one(num_gpus, num_layers, num_blocks, tpb, head_dim, run_len,
         tokens_per_block=tpb, num_head=heads, head_size=head_dim, is_mla=is_mla)
 
     cpu_layout = KVCacheLayout(
-        type=KVCacheLayoutType.BLOCKFIRST,
+        type=KVCacheLayoutType[layout.upper()],
         num_layer=num_layers, num_block=num_blocks,
         tokens_per_block=tpb, num_head=heads, head_size=head_dim, is_mla=is_mla)
 
@@ -103,7 +103,7 @@ def bench_one(num_gpus, num_layers, num_blocks, tpb, head_dim, run_len,
         ce_segment_threshold=999,
         ce_force_path=force_path,
         ce_enable_memcpy2d=enable_memcpy2d,
-        ce_is_blockfirst=True,
+        ce_is_blockfirst=(layout.upper() == "BLOCKFIRST"),
         ce_is_mla=True)
 
     block_ids = make_pattern(num_blocks, run_len)
@@ -152,6 +152,9 @@ def main():
     parser.add_argument("--tpb", type=int, default=16)
     parser.add_argument("--sharded", action="store_true",
                         help="Test STAGED_BLOCK (sharded D2H) instead of STAGED_MERGE (rank0_only)")
+    parser.add_argument("--layout", type=str, default="BLOCKFIRST",
+                        choices=["BLOCKFIRST", "LAYERFIRST"],
+                        help="CPU layout (default: BLOCKFIRST)")
     args = parser.parse_args()
 
     num_gpus = args.num_gpus
@@ -167,7 +170,7 @@ def main():
     mode_label = "STAGED_BLOCK (sharded)" if args.sharded else "STAGED_MERGE (rank0_only)"
 
     print("=" * 80)
-    print(f"  memcpy2d Threshold Benchmark — {mode_label}")
+    print(f"  memcpy2d Threshold Benchmark — {mode_label} — {args.layout}")
     print(f"  GPUs={num_gpus}, layers={args.num_layers}, blocks={args.num_blocks}, "
           f"hd={args.head_dim}, tpb={args.tpb}")
     print(f"  chunk_size={chunk} bytes, total D2H = {total_mb:.1f} MB")
@@ -182,9 +185,11 @@ def main():
         n_segs = args.num_blocks // rl
         try:
             t_m2d = bench_one(num_gpus, args.num_layers, args.num_blocks,
-                              args.tpb, args.head_dim, rl, True, args.iters, args.sharded)
+                              args.tpb, args.head_dim, rl, True, args.iters,
+                              args.sharded, args.layout)
             t_stg = bench_one(num_gpus, args.num_layers, args.num_blocks,
-                              args.tpb, args.head_dim, rl, False, args.iters, args.sharded)
+                              args.tpb, args.head_dim, rl, False, args.iters,
+                              args.sharded, args.layout)
         except Exception as e:
             print(f"{rl:>8} {n_segs:>6} FAILED: {e}")
             continue
