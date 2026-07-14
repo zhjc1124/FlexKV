@@ -1251,26 +1251,26 @@ void ce_transfer_bf_transpose(
         FLEXKV_GPU_CPU_TRANSFER(false, seg_bytes);
       }
     } else {
-      // Per-layer batch: block_bytes != cpu_block_stride. Scatter from staging
-      // [num_blocks, total_iters, elems] to CPU [block, layer, kv, chunk] with
-      // explicit block/layer/kv offsets (mirrors scatter_to_cpu).
-      for (int b = 0; b < num_blocks; ++b) {
-        int64_t cb = cpu_block_ids[b];
-        for (int64_t it = 0; it < total_iters; ++it) {
-          int li = (int)(it / kv_dim);
-          int kj = (int)(it % kv_dim);
-          int64_t *cpu_dst = cpu_ptr_int64 +
-              cb * cpu_block_stride_int64 +
-              (li + start_layer_id) * cpu_layer_stride_int64 +
-              kj * cpu_kv_stride_int64 +
-              cpu_startoff_inside_chunks_int64;
-          void *src = (char *)dev_staging +
-              (int64_t)b * total_iters * chunk_size_in_bytes +
-              it * chunk_size_in_bytes;
-          cudaMemcpyAsync(cpu_dst, src, chunk_size_in_bytes,
+      // Per-layer batch (layer_parallel): block_bytes != cpu_block_stride.
+      // Use per-segment cudaMemcpy2DAsync instead of per-block per-(layer,kv).
+      // BF layout [block, layer, kv, chunk]: L/N layers are contiguous within
+      // each block (width = total_iters * chunk_size). Blocks are strided by
+      // cpu_block_stride (full L layers). Reduces num_blocks * total_iters
+      // memcpy calls to num_segments 2D copies.
+      size_t width = (size_t)total_iters * chunk_size_in_bytes;
+      size_t spitch = (size_t)cpu_block_stride_int64 * sizeof(int64_t);
+      for (const auto &seg : analysis.segments) {
+        int64_t seg_start_block = cpu_block_ids[seg.start_k];
+        int64_t *cpu_dst = cpu_ptr_int64 +
+            seg_start_block * cpu_block_stride_int64 +
+            start_layer_id * cpu_layer_stride_int64 +
+            cpu_startoff_inside_chunks_int64;
+        void *src = (char *)dev_staging +
+            (int64_t)seg.start_k * total_iters * chunk_size_in_bytes;
+        cudaMemcpy2DAsync(cpu_dst, spitch, src, width,
+                          width, (size_t)seg.run_len,
                           cudaMemcpyDeviceToHost, stream);
-          FLEXKV_GPU_CPU_TRANSFER(false, chunk_size_in_bytes);
-        }
+        FLEXKV_GPU_CPU_TRANSFER(false, width * seg.run_len);
       }
     }
     cudaStreamSynchronize(stream);
@@ -1298,26 +1298,22 @@ void ce_transfer_bf_transpose(
         FLEXKV_GPU_CPU_TRANSFER(true, seg_bytes);
       }
     } else {
-      // Per-layer batch: block_bytes != cpu_block_stride. Gather from CPU
-      // [block, layer, kv, chunk] to staging [num_blocks, total_iters, elems]
-      // with explicit block/layer/kv offsets.
-      for (int b = 0; b < num_blocks; ++b) {
-        int64_t cb = cpu_block_ids[b];
-        for (int64_t it = 0; it < total_iters; ++it) {
-          int li = (int)(it / kv_dim);
-          int kj = (int)(it % kv_dim);
-          const int64_t *cpu_src = cpu_ptr_int64 +
-              cb * cpu_block_stride_int64 +
-              (li + start_layer_id) * cpu_layer_stride_int64 +
-              kj * cpu_kv_stride_int64 +
-              cpu_startoff_inside_chunks_int64;
-          void *dst = (char *)dev_staging +
-              (int64_t)b * total_iters * chunk_size_in_bytes +
-              it * chunk_size_in_bytes;
-          cudaMemcpyAsync(dst, cpu_src, chunk_size_in_bytes,
+      // Per-layer batch (layer_parallel): use per-segment cudaMemcpy2DAsync.
+      // Symmetric to D2H: src=CPU(strided), dst=dev_staging(contiguous).
+      size_t width = (size_t)total_iters * chunk_size_in_bytes;
+      size_t spitch = (size_t)cpu_block_stride_int64 * sizeof(int64_t);
+      for (const auto &seg : analysis.segments) {
+        int64_t seg_start_block = cpu_block_ids[seg.start_k];
+        const int64_t *cpu_src = cpu_ptr_int64 +
+            seg_start_block * cpu_block_stride_int64 +
+            start_layer_id * cpu_layer_stride_int64 +
+            cpu_startoff_inside_chunks_int64;
+        void *dst = (char *)dev_staging +
+            (int64_t)seg.start_k * total_iters * chunk_size_in_bytes;
+        cudaMemcpy2DAsync(dst, width, cpu_src, spitch,
+                          width, (size_t)seg.run_len,
                           cudaMemcpyHostToDevice, stream);
-          FLEXKV_GPU_CPU_TRANSFER(true, chunk_size_in_bytes);
-        }
+        FLEXKV_GPU_CPU_TRANSFER(true, width * seg.run_len);
       }
     }
 
