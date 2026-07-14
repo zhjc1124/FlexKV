@@ -108,8 +108,7 @@ STRATEGIES = [
 # progression baseline -> optimized.
 #   (label, path_opt)
 CE_CONFIGS = [
-    ("baseline",   False),   # PER_BLOCK, no optimization
-    ("opt",        True),    # optimized strategies
+    ("opt",        True),    # optimized strategies only (baseline too slow, skipped)
 ]
 
 WARMUP_ITERS = 3
@@ -529,16 +528,9 @@ def print_results_table(results):
 
 
 def print_analysis(results):
-    """Prove the CE optimization progression baseline -> opt.
-
-    Organized as (size, h2d_engine) two-dimensional blocks: within each block,
-    every (layout, strategy) combination shows baseline / opt
-    side by side with speedup vs baseline and the fastest marked. A global
-    verdict tallies how often opt wins across all blocks.
-    """
+    """Show fastest CE opt result per (size, strategy)."""
     print("\n" + "=" * 96)
-    print("CE optimization analysis (D2H+H2D round-trip): baseline vs opt")
-    print("  two-dimensional primary axis: (size, h2d_engine)")
+    print("CE optimization summary (D2H+H2D round-trip, opt only)")
     print("=" * 96)
 
     ce_results = [r for r in results if r["engine"] == "CE"]
@@ -546,74 +538,16 @@ def print_analysis(results):
         print("  (no CE results — nothing to analyze)")
         return
 
-    # group key: (size, h2d, layout, strategy)
-    def gkey(r):
-        return (r["size"], r.get("h2d_engine", "tp"), r["layout"], r["strategy"])
-
-    groups = defaultdict(dict)
-    for r in ce_results:
-        groups[gkey(r)][r.get("config", "-")] = r["avg_ms"]
-
-    opt_wins = 0
-    opt_total = 0
-
-    # Outer loop: (size, h2d) blocks
-    block_keys = sorted(set((k[0], k[1]) for k in groups.keys()))
-    for (size, h2d) in block_keys:
-        print("\n  === size={} | h2d={} ===".format(size, h2d))
-        print("  {:<7} {:<16} {:>10} {:>10}  {}".format(
-            "layout", "strategy", "baseline", "opt",
-            "opt vs base"))
-        print("  " + "-" * 68)
-        # Inner: (layout, strategy) rows within this block
-        block_groups = {k: v for k, v in groups.items()
-                        if k[0] == size and k[1] == h2d}
-        for key in sorted(block_groups.keys()):
-            _, _, layout, strat = key
-            cfgs = groups[key]
-            base = cfgs.get("baseline")
-            opt = cfgs.get("opt")
-            fastest = min((v for v in (base, opt) if v is not None),
-                          default=None)
-
-            def fmt(v):
-                if v is None:
-                    return "{:>10}".format("-")
-                star = "*" if (v == fastest) else " "
-                return "{:>9.3f}{}".format(v, star)
-
-            speedup = ""
-            if base and opt:
-                speedup = "{:.2f}x".format(base / opt)
-                opt_total += 1
-                if opt == fastest:
-                    opt_wins += 1
-
-            print("  {:<7} {:<16} {} {}  {:>10}".format(
-                layout, strat, fmt(base), fmt(opt), speedup))
-
-    # --- Global verdict ---
-    print("\n  " + "-" * 68)
-    if opt_total:
-        print("  opt was the fastest config in {}/{} CE groups ({:.0f}%).".format(
-            opt_wins, opt_total, 100.0 * opt_wins / opt_total))
-        if opt_wins == opt_total:
-            print("  => optimized paths are uniformly the best CE config.")
-        else:
-            print("  => optimized paths win in most cases; inspect the "
-                  "groups above where it does not (usually tiny transfers where "
-                  "staging overhead dominates).")
-
-    # --- Fastest overall per (size, strategy), across layout+config+h2d ---
-    print("\n  Fastest CE config per (size, strategy):")
+    # Fastest overall per (size, strategy), across layout+h2d
+    print("\n  Fastest CE opt per (size, strategy):")
     print("  " + "-" * 68)
     per = defaultdict(list)
     for r in ce_results:
         per[(r["size"], r["strategy"])].append(r)
     for (size, strat) in sorted(per.keys()):
         best = min(per[(size, strat)], key=lambda r: r["avg_ms"])
-        print("    {:<8} {:<16} -> {} / {} / h2d={} : {:.3f} ms".format(
-            size, strat, best["layout"], best.get("config", "-"),
+        print("    {:<8} {:<16} -> {} / h2d={} : {:.3f} ms".format(
+            size, strat, best["layout"],
             best.get("h2d_engine", "tp"), best["avg_ms"]))
 
     print("\n  Note: Performance depends on hardware (NUMA topology, PCIe/NVLink")
