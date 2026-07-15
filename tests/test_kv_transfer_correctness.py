@@ -1136,7 +1136,18 @@ def _expected_strategy(pattern_name, cpu_layout_name, is_mla, mode,
     # (non-sharded). Sharded D2H breaks gpu_phys_contig, so the compact-staging
     # direct memcpy is invalid; those route to GATHER_SCATTER (which CPU-scatters
     # each shard to its exact offset). Covers rank0_only/all_write/layer_parallel.
+    # Exception (commit eab52a2a3): bfirst + MLA + D2H + !full_block
+    # (layer_parallel / rank_rotate) -> SEGMENT_SCATTER, which is 30%-8.9x
+    # faster than GATHER_DIRECT for the lighter staging+scatter path.
+    # is_full_block == (all layers*kv_dim transferred in one call);
+    # rank0_only / all_write store the full CPU block per rank -> full_block;
+    # layer_parallel / rank_rotate / sharded store a shard -> !full_block.
+    # (Sharded is handled by the `not src_phys` branch below and never reaches
+    # here because its gpu_phys_contig is false.)
+    is_full_block = mode in ("rank0_only", "all_write")
     if not dst_phys and is_blockfirst and src_phys:
+        if not is_host_to_device and is_mla and not is_full_block:
+            return ("SEGMENT_SCATTER", "")
         return ("GATHER_DIRECT", "")
     # CONTIG_DIRECT: logical + physical contiguity on both sides.
     if pattern_name == "contiguous" and dst_phys and src_phys:
