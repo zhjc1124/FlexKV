@@ -825,7 +825,12 @@ void ce_transfer_gather_scatter(
 
   // memcpy2d bypasses host staging entirely (cudaMemcpy2DAsync does strided
   // dev_buf<->CPU directly). No host_buf, no ping-pong, no scatter/gather.
-  if (ce_config.enable_memcpy2d) {
+  // MUST be gated on the same scattered condition as the memcpy2d branch
+  // (guard at line 862): when scattered blocks skip the memcpy2d branch and
+  // fall through to the staging path, host_buf is still required (H2D gather
+  // / D2H scatter). An unconditional disable here leaves the staging path
+  // with host_buf=nullptr -> segfault on scattered + memcpy2d=on.
+  if (ce_config.enable_memcpy2d && analysis.num_segments <= ce_config.segment_threshold) {
     need_host_buf = false;
   }
 
