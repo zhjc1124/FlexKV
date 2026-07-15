@@ -296,6 +296,12 @@ _LF_MHA = _MERGE  # only SEGMENT_SCATTER
 # BF (any pattern/mla/mode): SEGMENT_SCATTER + GATHER_DIRECT
 _BF = _MERGE + [(4, "GATHER_DIRECT")]
 
+# BF + sharded: GATHER_SCATTER only (mirrors LF_SHARDED). SEGMENT_SCATTER and
+# GATHER_DIRECT both require gpu_phys_contig (sharded breaks it): GATHER_DIRECT's
+# compact staging misplaces (layer,kv)>0 within each block, SEGMENT_SCATTER's
+# merged-segment memcpy assumes contiguous GPU blocks.
+_BF_SHARDED = [(3, "GATHER_SCATTER")]
+
 # Full matrix: 3 patterns x 2 layouts x 3 mla modes (rank0_only, layer_parallel,
 # sharded) + 3 patterns x 2 layouts x 1 mha (mode is don't-care, not shown).
 PATH_FORMS = [
@@ -315,11 +321,11 @@ PATH_FORMS = [
     ("scattered",  "bfirst", True,  "layer_parallel", [True, False], _BF),
     # --- mla + sharded (D2H only) ---
     ("contiguous", "lfirst", True,  "sharded",        [False], _LF_SHARDED),
-    ("contiguous", "bfirst", True,  "sharded",        [False], _BF),
+    ("contiguous", "bfirst", True,  "sharded",        [False], _BF_SHARDED),
     ("few_seg",    "lfirst", True,  "sharded",        [False], _LF_SHARDED),
-    ("few_seg",    "bfirst", True,  "sharded",        [False], _BF),
+    ("few_seg",    "bfirst", True,  "sharded",        [False], _BF_SHARDED),
     ("scattered",  "lfirst", True,  "sharded",        [False], _LF_SHARDED),
-    ("scattered",  "bfirst", True,  "sharded",        [False], _BF),
+    ("scattered",  "bfirst", True,  "sharded",        [False], _BF_SHARDED),
     # --- mha (H2D + D2H, mode is don't-care) ---
     ("contiguous", "lfirst", False, "rank0_only",     [True, False], _LF_MHA),
     ("contiguous", "bfirst", False, "rank0_only",     [True, False], _BF),
@@ -347,8 +353,9 @@ def python_choose_path(pattern, layout_key, mode, is_h2d, threshold,
     else:
         num_segments = threshold + 1
 
-    # GATHER_DIRECT: BF + !cpu_phys_contig (covers MLA + MHA, all modes)
-    if is_blockfirst and not cpu_phys_contig:
+    # GATHER_DIRECT: BF + !cpu_phys_contig + GPU physically contiguous
+    # (non-sharded). Sharded D2H breaks gpu_phys_contig -> GATHER_SCATTER.
+    if is_blockfirst and not cpu_phys_contig and gpu_phys_contig:
         return "GATHER_DIRECT"
     if cpu_phys_contig and gpu_phys_contig and num_segments == 1:
         return "CONTIG_DIRECT"

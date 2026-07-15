@@ -48,8 +48,9 @@ struct CETransferConfig {
   // to per-rank chunk_size < cpu_block_stride).
   bool is_blockfirst = false;
   // is_mla: whether the model uses MLA (kv_dim=1, no head split).
-  // GATHER_DIRECT is checked first in choose_path for all BLOCKFIRST +
-  // !cpu_phys_contig cases (covers both MLA and MHA).
+  // GATHER_DIRECT is selected by choose_path for BLOCKFIRST + !cpu_phys_contig
+  // + GPU physically contiguous (non-sharded). Sharded BLOCKFIRST routes to
+  // GATHER_SCATTER instead. Covers both MLA and MHA when non-sharded.
   bool is_mla = false;
 };
 
@@ -95,7 +96,7 @@ enum class CEPath : int {
   SEGMENT_DIRECT = 1,   // segmented source -> direct per-segment memcpy
   SEGMENT_SCATTER = 2,  // segmented source -> staging + CPU scatter
   GATHER_SCATTER = 3,   // GPU gather -> staging + CPU scatter
-  GATHER_DIRECT = 4,    // GPU gather + D2D transform -> direct memcpy (BF only)
+  GATHER_DIRECT = 4,    // GPU gather + D2D transform -> direct memcpy (BF, non-sharded only)
 };
 
 // ============================================================================
@@ -240,10 +241,13 @@ void ce_transfer_gather_scatter(
     const CEAnalysis &analysis, const CETransferConfig &ce_config);
 
 // ============================================================================
-// GATHER_DIRECT (CEPath enum value 4, checked first in choose_path):
-//   BF (BLOCKFIRST) + !cpu_phys_contig (covers both MLA and MHA).
-//   Called from choose_path() when is_blockfirst && !cpu_phys_contig.
-//   gpu_phys_contig. D2D gather via index_select_out directly into 3D dev_staging
+// GATHER_DIRECT (CEPath enum value 4, checked before !gpu_phys_contig in choose_path):
+//   BF (BLOCKFIRST) + !cpu_phys_contig + GPU physically contiguous (non-sharded).
+//   Called from choose_path() when is_blockfirst && !cpu_phys_contig && gpu_phys_contig.
+//   Sharded D2H breaks gpu_phys_contig (chunk shrinks to shard) and routes to
+//   GATHER_SCATTER instead, because the compact-staging direct memcpy misplaces
+//   (layer,kv)>0 within each block (CPU BF stride is full_chunk, staging is shard).
+//   D2D gather via index_select_out directly into 3D dev_staging
 //   (LAYERFIRST->BLOCKFIRST layout), then per-segment cudaMemcpyAsync
 //   (contiguous/segmented/per-block) matching the transposed BLOCKFIRST layout.
 //   No CPU scatter needed for contiguous/few_seg; per-block for scattered.

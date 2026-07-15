@@ -979,9 +979,10 @@ def test_invalid_mode_fallback():
 #   GATHER_SCATTER     — staging buffer + CPU scatter (sharded D2H),
 #                      GPU non-contiguous -> per-block memcpy
 #   GATHER_SCATTER   — GPU index_select/index_copy_ (many segments > threshold)
-# GATHER_DIRECT is CEPath(4), checked first in choose_path:
-#   BF (BLOCKFIRST) + !cpu_phys_contig — covers both MLA and MHA.
-#   Covers both rank0_only/all_write and sharded D2H.
+# GATHER_DIRECT is CEPath(4), checked before !gpu_phys_contig in choose_path:
+#   BF (BLOCKFIRST) + !cpu_phys_contig + GPU physically contiguous (non-sharded)
+#   — covers both MLA and MHA. Sharded D2H breaks gpu_phys_contig and routes to
+#   GATHER_SCATTER instead.
 #
 # We trigger each strategy by constructing block-id *permutations* of [0..N-1]
 # so that every block is still transferred (round-trip correctness preserved):
@@ -1103,8 +1104,9 @@ def _expected_strategy(pattern_name, cpu_layout_name, is_mla, mode,
         Non-sharded: always contiguous.
         sharded D2H: chunk shrinks to shard -> NOT contiguous.
         sharded H2D: full chunk -> contiguous.
-    GATHER_DIRECT is selected when !dst_phys && BLOCKFIRST (covers both MLA
-      and MHA). It is CEPath enum value 4, checked first in choose_path.
+    GATHER_DIRECT is selected when !dst_phys && BLOCKFIRST && GPU physically
+      contiguous (non-sharded). Sharded BLOCKFIRST routes to GATHER_SCATTER.
+      It is CEPath enum value 4, checked before !gpu_phys_contig in choose_path.
     segment_threshold decides the SEGMENT/GATHER crossover: with a small
       threshold even few_seg (4 segments) can exceed it and route to
       GATHER_SCATTER, exactly as choose_path() does.
@@ -1123,9 +1125,11 @@ def _expected_strategy(pattern_name, cpu_layout_name, is_mla, mode,
         num_segments = num_blocks
 
     # choose_path() replica -----------------------------------------------
-    # GATHER_DIRECT: BLOCKFIRST + !cpu_phys_contig (checked first, covers MLA+MHA).
-    # Covers both rank0_only/all_write and sharded D2H.
-    if not dst_phys and is_blockfirst:
+    # GATHER_DIRECT: BLOCKFIRST + !cpu_phys_contig + GPU physically contiguous
+    # (non-sharded). Sharded D2H breaks gpu_phys_contig, so the compact-staging
+    # direct memcpy is invalid; those route to GATHER_SCATTER (which CPU-scatters
+    # each shard to its exact offset). Covers rank0_only/all_write/layer_parallel.
+    if not dst_phys and is_blockfirst and src_phys:
         return ("GATHER_DIRECT", "")
     # CONTIG_DIRECT: logical + physical contiguity on both sides.
     if pattern_name == "contiguous" and dst_phys and src_phys:

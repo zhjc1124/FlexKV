@@ -98,11 +98,17 @@ CEAnalysis analyze_ce_transfer(
 // self-describing name. GATHER_SCATTER (was Path 2) is unchanged.
 CEPath choose_path(const CEAnalysis &a, const CETransferConfig &ce_config,
                    int64_t chunk_size_in_bytes) {
-  // GATHER_DIRECT: BLOCKFIRST + CPU non-contiguous (covers both MLA and MHA).
-  // D2D transpose GPU LAYERFIRST -> dev_staging (contiguous), then direct
-  // per-segment memcpy to CPU. Covers both rank0_only/all_write and sharded.
-  // Must be checked before !gpu_phys_contig (sharded) since BF sharded
-  if (ce_config.is_blockfirst && !a.cpu_phys_contig)
+  // GATHER_DIRECT: BLOCKFIRST + CPU non-contiguous + GPU physically contiguous
+  // (non-sharded). D2D transpose GPU LAYERFIRST -> dev_staging (contiguous),
+  // then a direct per-segment memcpy to CPU. The compact-staging trick needs
+  // the GPU block to be physically contiguous (full chunk per block) so the
+  // staging block stride equals the CPU block stride. Sharded D2H shrinks the
+  // GPU chunk to a shard (gpu_phys_contig=false), so a contiguous copy would
+  // misplace every (layer,kv)>0 within each block (CPU BF stride is full_chunk,
+  // staging stride is shard_size); route those to GATHER_SCATTER instead (it
+  // CPU-scatters each shard to its exact offset). Checked before
+  // !gpu_phys_contig but only when GPU is also contiguous.
+  if (ce_config.is_blockfirst && !a.cpu_phys_contig && a.gpu_phys_contig)
     return CEPath::GATHER_DIRECT;
 
   // CONTIG_DIRECT: logical + physical contiguity on both sides -> one big memcpy.
@@ -993,7 +999,7 @@ void ce_transfer_gather_scatter(
 }
 
 // ============================================================================
-// GATHER_DIRECT: BF non-sharded (rank0_only/MHA) D2H/H2D.
+// GATHER_DIRECT: BF non-sharded (any mla mode / MHA) D2H/H2D.
 //   D2D transpose (LAYERFIRST→BLOCKFIRST) via index_select + transpose +
 //   contiguous, then per-segment cudaMemcpyAsync matching the transposed
 //   BLOCKFIRST layout. Works for both kv_dim=1 (MLA) and kv_dim=2 (MHA):
