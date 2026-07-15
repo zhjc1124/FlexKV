@@ -261,7 +261,8 @@ STR_ABBR = {
 
 # Paths that consume FLEXKV_ENABLE_MEMCPY2D (cudaMemcpy2DAsync). Only these two
 # are affected by the flag; the others ignore it. Used by --memcpy2d on.
-AFFECTED_PATHS = {2, 4}  # SEGMENT_SCATTER, GATHER_DIRECT
+# NOTE: must use string names (not int IDs) — checked via `fp_name in AFFECTED_PATHS`.
+AFFECTED_PATHS = {"SEGMENT_SCATTER", "GATHER_DIRECT"}  # path 2, path 4
 # Column abbreviation for the memcpy2d=1 variant of an affected path.
 STR_ABBR_2D = {
     "SEGMENT_SCATTER": "S_SCT2",
