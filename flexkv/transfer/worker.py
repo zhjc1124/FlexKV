@@ -362,7 +362,7 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
         # multi-GPU tp_group_transfer / layerwise_transfer paths.
         self.ce_path_opt = GLOBAL_CONFIG_FROM_ENV.transfer_path_opt
         self.ce_segment_threshold = GLOBAL_CONFIG_FROM_ENV.transfer_segment_threshold
-        self.ce_enable_memcpy2d = GLOBAL_CONFIG_FROM_ENV.enable_memcpy2d
+        self.ce_enable_memcpy2d = GLOBAL_CONFIG_FROM_ENV.enable_ce_memcpy2d
 
         self._compressor = compressor or NullCompressionStrategy()
         self._compressor.attach(self)
@@ -542,7 +542,7 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
             gpu_device_ids,
             ce_segment_threshold=GLOBAL_CONFIG_FROM_ENV.transfer_segment_threshold,
             ce_path_opt=GLOBAL_CONFIG_FROM_ENV.transfer_path_opt,
-            ce_enable_memcpy2d=GLOBAL_CONFIG_FROM_ENV.enable_memcpy2d,
+            ce_enable_memcpy2d=GLOBAL_CONFIG_FROM_ENV.enable_ce_memcpy2d,
             ce_is_blockfirst=(cpu_kv_layout.type == KVCacheLayoutType.BLOCKFIRST),
             ce_is_mla=self.is_mla,
         )

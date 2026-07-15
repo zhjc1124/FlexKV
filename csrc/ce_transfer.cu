@@ -530,7 +530,8 @@ void ce_transfer_segment_scatter(
   // When enable_memcpy2d=TRUE, use cudaMemcpy2DAsync per segment to do a
   // strided GPU<->CPU transfer directly, bypassing the staging buffer +
   // sync + CPU scatter/gather. Fast on NVIDIA (DMA engine handles 2D),
-  // extremely slow on P800/Kunlunxin. Default off (FLEXKV_ENABLE_MEMCPY2D=0).
+  // extremely slow on P800/Kunlunxin. Default ON for NVIDIA
+  // (FLEXKV_ENABLE_CE_MEMCPY2D=1); set 0 on P800/Kunlunxin.
   // Direction (is_host_to_device) selects src/dst/pitch/kind:
   //   D2H: GPU src (contiguous within segment) -> CPU dst (strided)
   //   H2D: CPU src (strided) -> GPU dst (contiguous within segment)

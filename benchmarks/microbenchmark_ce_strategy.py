@@ -21,10 +21,10 @@ fastest is marked as 'recommended'. If choose_path's auto-pick matches the
 recommended, choose_path is optimal for that form; otherwise it should be
 investigated.
 
-memcpy2d (FLEXKV_ENABLE_MEMCPY2D=1) affects path 2 SEGMENT_SCATTER, path 3
+memcpy2d (FLEXKV_ENABLE_CE_MEMCPY2D=1) affects path 2 SEGMENT_SCATTER, path 3
 GATHER_SCATTER, and path 4 GATHER_DIRECT (D2H + H2D). Pass --memcpy2d on to
 additionally time those paths with cudaMemcpy2DAsync and print a focused
-benefit block (speedup = off / on). Keep it off (default) on P800/Kunlunxin
+benefit block (speedup = off / on). Keep it off on P800/Kunlunxin (set FLEXKV_ENABLE_CE_MEMCPY2D=0 there)
 where memcpy2d is ~200x slower; it only helps on NVIDIA H20.
 
 Usage:
@@ -259,7 +259,7 @@ STR_ABBR = {
     "GATHER_DIRECT": "G_DIR",
 }
 
-# Paths that consume FLEXKV_ENABLE_MEMCPY2D (cudaMemcpy2DAsync). These three
+# Paths that consume FLEXKV_ENABLE_CE_MEMCPY2D (cudaMemcpy2DAsync). These three
 # are affected by the flag; the others ignore it. Used by --memcpy2d on.
 # NOTE: must use string names (not int IDs) — checked via `fp_name in AFFECTED_PATHS`.
 AFFECTED_PATHS = {"SEGMENT_SCATTER", "GATHER_SCATTER", "GATHER_DIRECT"}  # path 2, 3, 4
@@ -509,7 +509,7 @@ def run_strategy_compare(args):
                 # Run each viable strategy (skip auto-pick — redundant).
                 # When --memcpy2d on, the two affected paths (SEGMENT_SCATTER,
                 # GATHER_DIRECT) are also timed with cudaMemcpy2DAsync so the
-                # benefit of FLEXKV_ENABLE_MEMCPY2D can be measured head-to-head.
+                # benefit of FLEXKV_ENABLE_CE_MEMCPY2D can be measured head-to-head.
                 # The off variant of the auto-picked path is already timed by
                 # the 'auto' run, so we skip that one to avoid redundancy.
                 viable = correct_paths_for(layout_key, is_mla, pattern, mode,
@@ -683,11 +683,11 @@ def run_strategy_compare(args):
 
 def print_memcpy2d_benefit(results, run_rows):
     """Focused block: for the two memcpy2d-affected paths (SEGMENT_SCATTER,
-    GATHER_DIRECT), show off vs on (FLEXKV_ENABLE_MEMCPY2D=1) timing and the
+    GATHER_DIRECT), show off vs on (FLEXKV_ENABLE_CE_MEMCPY2D=1) timing and the
     speedup (off / on). Surfaces whether memcpy2d has any benefit per form.
     """
     print("\n" + "=" * 100)
-    print("  memcpy2d benefit (FLEXKV_ENABLE_MEMCPY2D=1) — affected paths only")
+    print("  memcpy2d benefit (FLEXKV_ENABLE_CE_MEMCPY2D=1) — affected paths only")
     print("=" * 100)
     print("  speedup = off / on  (>1: memcpy2d FASTER, <1: SLOWER)")
     affected_order = [p for p in ["SEGMENT_SCATTER", "GATHER_SCATTER", "GATHER_DIRECT"]
@@ -891,7 +891,7 @@ def main():
     parser.add_argument("--memcpy2d", choices=["off", "on"], default="off",
                         help="When 'on', also time SEGMENT_SCATTER (path 2), "
                              "GATHER_SCATTER (path 3), and GATHER_DIRECT (path 4) "
-                             "with cudaMemcpy2DAsync (FLEXKV_ENABLE_MEMCPY2D=1) "
+                             "with cudaMemcpy2DAsync (FLEXKV_ENABLE_CE_MEMCPY2D=1) "
                              "and print a benefit block. "
                              "Off by default (P800 is ~200x slower).")
     args = parser.parse_args()

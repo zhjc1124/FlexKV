@@ -299,7 +299,7 @@ def make_tp_group(cpu_ptr, all_gpu, num_gpus, gpu_layout, num_layers,
     if ce_path_opt is None:
         ce_path_opt = GLOBAL_CONFIG_FROM_ENV.transfer_path_opt
     if ce_enable_memcpy2d is None:
-        ce_enable_memcpy2d = GLOBAL_CONFIG_FROM_ENV.enable_memcpy2d
+        ce_enable_memcpy2d = GLOBAL_CONFIG_FROM_ENV.enable_ce_memcpy2d
     if ce_is_blockfirst is None:
         ce_is_blockfirst = (GLOBAL_CONFIG_FROM_ENV.cpu_layout_type == KVCacheLayoutType.BLOCKFIRST)
     if ce_is_mla is None:
@@ -351,7 +351,7 @@ def make_layerwise_group(cpu_ptr_unused, all_gpu, num_gpus, gpu_layout, num_laye
     if ce_path_opt is None:
         ce_path_opt = GLOBAL_CONFIG_FROM_ENV.transfer_path_opt
     if ce_enable_memcpy2d is None:
-        ce_enable_memcpy2d = GLOBAL_CONFIG_FROM_ENV.enable_memcpy2d
+        ce_enable_memcpy2d = GLOBAL_CONFIG_FROM_ENV.enable_ce_memcpy2d
     if ce_is_blockfirst is None:
         ce_is_blockfirst = (GLOBAL_CONFIG_FROM_ENV.cpu_layout_type == KVCacheLayoutType.BLOCKFIRST)
     if ce_is_mla is None:

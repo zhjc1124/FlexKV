@@ -407,6 +407,28 @@ class CacheConfig:
             f", num_ssd_blocks={self.num_ssd_blocks})"
         )
 
+def _resolve_ce_memcpy2d_enabled():
+    """Resolve the CE memcpy2d toggle from env (default ON for NVIDIA).
+
+    Renamed from FLEXKV_ENABLE_MEMCPY2D -> FLEXKV_ENABLE_CE_MEMCPY2D so the CE
+    scope is explicit. The old name is still honored (with a DeprecationWarning)
+    for one release so existing launch scripts don't silently flip behavior.
+    P800/Kunlunxin must set it to 0 (~200x slower there).
+    """
+    val = os.getenv('FLEXKV_ENABLE_CE_MEMCPY2D')
+    if val is None:
+        val = os.getenv('FLEXKV_ENABLE_MEMCPY2D')
+        if val is not None:
+            import warnings
+            warnings.warn(
+                "FLEXKV_ENABLE_MEMCPY2D is deprecated; use FLEXKV_ENABLE_CE_MEMCPY2D "
+                "to control the CE memcpy2d toggle.",
+                DeprecationWarning, stacklevel=2)
+    if val is None:
+        return True
+    return bool(int(val))
+
+
 GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
     # Multi-instance configuration
     instance_num=int(os.getenv('FLEXKV_INSTANCE_NUM', 1)),
@@ -441,10 +463,11 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
     transfer_segment_threshold=int(os.getenv('FLEXKV_TRANSFER_SEGMENT_THRESHOLD', 8)),
     # Path optimization: 0=baseline (per-block memcpy), 1=five-path auto-select
     transfer_path_opt=bool(int(os.getenv('FLEXKV_TRANSFER_PATH_OPT', 1))),
-    # CE memcpy2d: use cudaMemcpy2DAsync for strided D2H/H2D in SEGMENT_SCATTER / GATHER_DIRECT.
-    # Fast on NVIDIA H20 (58ms), extremely slow on P800 (12.8s). Default off
-    # (use staging buffer + CPU scatter fallback).
-    enable_memcpy2d=bool(int(os.getenv('FLEXKV_ENABLE_MEMCPY2D', 0))),
+    # CE memcpy2d: use cudaMemcpy2DAsync for strided D2H/H2D in SEGMENT_SCATTER /
+    # GATHER_SCATTER / GATHER_DIRECT. Fast on NVIDIA H20 (~58ms), extremely slow
+    # on P800/Kunlunxin (~12.8s, ~200x). Default ON for NVIDIA
+    # (FLEXKV_ENABLE_CE_MEMCPY2D=1); set to 0 on P800/Kunlunxin.
+    enable_ce_memcpy2d=_resolve_ce_memcpy2d_enabled(),
 
     iouring_entries=int(os.getenv('FLEXKV_IOURING_ENTRIES', 512)),
     iouring_flags=int(os.getenv('FLEXKV_IOURING_FLAGS', 0)),

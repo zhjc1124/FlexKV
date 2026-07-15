@@ -318,7 +318,7 @@ class LayerwiseTransferWorker(TransferWorkerBase):
             self.indexer_ssd_files,
             ce_segment_threshold=GLOBAL_CONFIG_FROM_ENV.transfer_segment_threshold,
             ce_path_opt=GLOBAL_CONFIG_FROM_ENV.transfer_path_opt,
-            ce_enable_memcpy2d=GLOBAL_CONFIG_FROM_ENV.enable_memcpy2d,
+            ce_enable_memcpy2d=GLOBAL_CONFIG_FROM_ENV.enable_ce_memcpy2d,
             ce_is_blockfirst=(cpu_kv_layout.type == KVCacheLayoutType.BLOCKFIRST),
             ce_is_mla=self.is_mla)
         flexkv_logger.info(f"[LayerwiseWorker] __init__ completed successfully, worker_id={worker_id}")

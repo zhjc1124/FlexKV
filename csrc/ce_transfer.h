@@ -40,7 +40,7 @@ struct CETransferConfig {
   // 58ms, 24 GiB/s), catastrophically slow on P800/Kunlunxin (12.8s, 0.11
   // GiB/s — the DMA engine does not handle 2D strided patterns). Default
   // false: use staging buffer + CPU scatter (works on all platforms).
-  // Set to 1 on NVIDIA via FLEXKV_ENABLE_MEMCPY2D=1.
+  // Set to 1 on NVIDIA via FLEXKV_ENABLE_CE_MEMCPY2D=1.
   bool enable_memcpy2d = false;
   // is_blockfirst: CPU KV cache layout is BLOCKFIRST (vs LAYERFIRST).
   // Set from FLEXKV_CPU_LAYOUT env var via worker.py/layerwise.py.
