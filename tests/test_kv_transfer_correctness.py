@@ -1051,10 +1051,11 @@ CE_PATTERNS = ["contiguous", "few_seg", "scattered"]
 # num_blocks <= threshold (i.e. it cannot form more than `threshold` segments).
 CE_SEGMENT_THRESHOLDS = [8, 2]
 
-# enable_memcpy2d is swept as an orthogonal dimension. When True and the path
-# is SEGMENT_SCATTER and direction is D2H, the C++ engine uses cudaMemcpy2DAsync
-# instead of staging+scatter. It has no effect on H2D or non-SEGMENT_SCATTER
-# paths (the C++ check is `if (ce_config.enable_memcpy2d && !is_host_to_device)`).
+# enable_memcpy2d is swept as an orthogonal dimension. When True, the C++ engine
+# uses cudaMemcpy2DAsync for strided direct transfer (both D2H and H2D) instead of
+# staging + scatter/gather. It applies to path 2 SEGMENT_SCATTER and path 4
+# GATHER_DIRECT only; other paths (CONTIG_DIRECT / SEGMENT_DIRECT / GATHER_SCATTER)
+# ignore it (the C++ check is `if (ce_config.enable_memcpy2d)` with no direction guard).
 # CE_MEMCPY2D_CONFIGS defined near top of file (before first use).
 
 

@@ -439,9 +439,9 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
 
     # CE adaptive path configuration (passed to C++ via CETransferConfig)
     transfer_segment_threshold=int(os.getenv('FLEXKV_TRANSFER_SEGMENT_THRESHOLD', 8)),
-    # Path optimization: 0=baseline (per-block memcpy), 1=six-path auto-select
+    # Path optimization: 0=baseline (per-block memcpy), 1=five-path auto-select
     transfer_path_opt=bool(int(os.getenv('FLEXKV_TRANSFER_PATH_OPT', 1))),
-    # CE memcpy2d: use cudaMemcpy2DAsync for strided D2H in STAGED_MERGE.
+    # CE memcpy2d: use cudaMemcpy2DAsync for strided D2H/H2D in SEGMENT_SCATTER / GATHER_DIRECT.
     # Fast on NVIDIA H20 (58ms), extremely slow on P800 (12.8s). Default off
     # (use staging buffer + CPU scatter fallback).
     enable_memcpy2d=bool(int(os.getenv('FLEXKV_ENABLE_MEMCPY2D', 0))),
