@@ -969,7 +969,7 @@ def test_invalid_mode_fallback():
 #
 # The C++ CE engine selects among five execution strategies (see the CEPath
 # taxonomy in csrc/ce_transfer.h). path_opt_enabled
-# picks PER_BLOCK (baseline) vs the six optimized strategies; choose_path()
+# picks PER_BLOCK (baseline) vs the five optimized strategies; choose_path()
 # picks among the optimized ones by block-id contiguity + CPU/GPU layout:
 #   PER_BLOCK        — one memcpy per block (baseline, path_opt=False)
 #   CONTIG_DIRECT      — single large memcpy (contiguous ids + dst phys contig)
@@ -990,7 +990,7 @@ def test_invalid_mode_fallback():
 #   scattered  — random permutation           → N segments (>8)
 #
 # Strategy is chosen automatically from strides; there is no force override.
-# Coverage of the six optimized strategies is asserted by
+# Coverage of the five optimized strategies is asserted by
 # test_ce_strategy_coverage below (via _expected_strategy).
 #
 # ce_path_opt (baseline vs optimized) is a per-construction CETransferConfig

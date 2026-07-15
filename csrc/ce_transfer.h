@@ -57,10 +57,10 @@ struct CETransferConfig {
 // CE transfer strategy taxonomy
 // ============================================================================
 //
-// Every CE transfer is one of six execution strategies. path_opt_enabled
-// selects PER_BLOCK (the baseline) vs the six optimized strategies; among
-// the optimized ones choose_path() picks based on the CEAnalysis flags.
-// GATHER_DIRECT is checked first in choose_path (CEPath enum value 5).
+// Every CE transfer uses one of five optimized strategies (chosen by
+// choose_path()) or falls back to PER_BLOCK (the baseline, when
+// path_opt_enabled == false). GATHER_DIRECT is checked first in
+// choose_path (CEPath enum value 4).
 //
 //   PER_BLOCK       baseline: one cudaMemcpyAsync per block. No merging, no
 //                   staging. Correct for every layout; slowest. Only used when
@@ -240,7 +240,7 @@ void ce_transfer_gather_scatter(
     const CEAnalysis &analysis, const CETransferConfig &ce_config);
 
 // ============================================================================
-// GATHER_DIRECT (CEPath enum value 5, checked first in choose_path):
+// GATHER_DIRECT (CEPath enum value 4, checked first in choose_path):
 //   BF (BLOCKFIRST) + !cpu_phys_contig (covers both MLA and MHA).
 //   Called from choose_path() when is_blockfirst && !cpu_phys_contig.
 //   gpu_phys_contig. D2D gather via index_select_out directly into 3D dev_staging

@@ -137,7 +137,7 @@ void transfer_kv_blocks(
         gpu_block_stride_in_bytes);
 
     // path_opt_enabled: PER_BLOCK baseline when off; otherwise choose_path()
-    // picks one of the six optimized strategies (see CEPath in ce_transfer.h).
+    // picks one of the five optimized strategies (see CEPath in ce_transfer.h).
     if (!ce_config.path_opt_enabled) {
       ce_transfer_per_block<Type>(
           num_blocks, start_layer_id, num_layers, kv_dim,
