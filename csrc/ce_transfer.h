@@ -34,8 +34,9 @@ struct CETransferConfig {
   // picks the fastest strategy for each case (runs all viable paths
   // head-to-head).
   int force_path = -1;
-  // enable_memcpy2d: when true, SEGMENT_SCATTER and GATHER_DIRECT use cudaMemcpy2DAsync
-  // (strided D2H directly to CPU positions). Fast on NVIDIA (H20:
+  // enable_memcpy2d: when true, SEGMENT_SCATTER, GATHER_SCATTER, and GATHER_DIRECT
+  // use cudaMemcpy2DAsync (strided D2H/H2D directly between dev_buf/GPU and CPU
+  // positions, bypassing host staging + CPU scatter/gather). Fast on NVIDIA (H20:
   // 58ms, 24 GiB/s), catastrophically slow on P800/Kunlunxin (12.8s, 0.11
   // GiB/s — the DMA engine does not handle 2D strided patterns). Default
   // false: use staging buffer + CPU scatter (works on all platforms).

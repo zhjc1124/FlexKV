@@ -21,11 +21,11 @@ fastest is marked as 'recommended'. If choose_path's auto-pick matches the
 recommended, choose_path is optimal for that form; otherwise it should be
 investigated.
 
-memcpy2d (FLEXKV_ENABLE_MEMCPY2D=1) only affects path 2 SEGMENT_SCATTER and
-path 4 GATHER_DIRECT (D2H + H2D). Pass --memcpy2d on to additionally time those
-two paths with cudaMemcpy2DAsync and print a focused benefit block (speedup =
-off / on). Keep it off (default) on P800/Kunlunxin where memcpy2d is ~200x
-slower; it only helps on NVIDIA H20.
+memcpy2d (FLEXKV_ENABLE_MEMCPY2D=1) affects path 2 SEGMENT_SCATTER, path 3
+GATHER_SCATTER, and path 4 GATHER_DIRECT (D2H + H2D). Pass --memcpy2d on to
+additionally time those paths with cudaMemcpy2DAsync and print a focused
+benefit block (speedup = off / on). Keep it off (default) on P800/Kunlunxin
+where memcpy2d is ~200x slower; it only helps on NVIDIA H20.
 
 Usage:
     python benchmarks/microbenchmark_ce_strategy.py --num-gpus 4 --iters 20
@@ -259,13 +259,14 @@ STR_ABBR = {
     "GATHER_DIRECT": "G_DIR",
 }
 
-# Paths that consume FLEXKV_ENABLE_MEMCPY2D (cudaMemcpy2DAsync). Only these two
+# Paths that consume FLEXKV_ENABLE_MEMCPY2D (cudaMemcpy2DAsync). These three
 # are affected by the flag; the others ignore it. Used by --memcpy2d on.
 # NOTE: must use string names (not int IDs) — checked via `fp_name in AFFECTED_PATHS`.
-AFFECTED_PATHS = {"SEGMENT_SCATTER", "GATHER_DIRECT"}  # path 2, path 4
+AFFECTED_PATHS = {"SEGMENT_SCATTER", "GATHER_SCATTER", "GATHER_DIRECT"}  # path 2, 3, 4
 # Column abbreviation for the memcpy2d=1 variant of an affected path.
 STR_ABBR_2D = {
     "SEGMENT_SCATTER": "S_SCT2",
+    "GATHER_SCATTER": "G_SCT2",
     "GATHER_DIRECT": "G_DIR2",
 }
 
@@ -690,7 +691,7 @@ def print_memcpy2d_benefit(results, run_rows):
     print("  memcpy2d benefit (FLEXKV_ENABLE_MEMCPY2D=1) — affected paths only")
     print("=" * 100)
     print("  speedup = off / on  (>1: memcpy2d FASTER, <1: SLOWER)")
-    affected_order = [p for p in ["SEGMENT_SCATTER", "GATHER_DIRECT"]
+    affected_order = [p for p in ["SEGMENT_SCATTER", "GATHER_SCATTER", "GATHER_DIRECT"]
                       if p in AFFECTED_PATHS]
     hdr = "  {:>32s}  {:>4s}".format("Form", "Dir")
     for pname in affected_order:

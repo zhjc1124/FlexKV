@@ -809,6 +809,12 @@ void ce_transfer_gather_scatter(
       (is_host_to_device &&
        !(analysis.cpu_log_contig && analysis.cpu_phys_contig));  // H2D: gather
 
+  // memcpy2d bypasses host staging entirely (cudaMemcpy2DAsync does strided
+  // dev_buf<->CPU directly). No host_buf, no ping-pong, no scatter/gather.
+  if (ce_config.enable_memcpy2d) {
+    need_host_buf = false;
+  }
+
   // D2H ping-pong: CPU scatter overlaps with GPU D2H.
   // H2D has no ping-pong (CPU gather too fast).
   bool need_pingpong_host = need_host_buf && !is_host_to_device;
@@ -830,6 +836,111 @@ void ce_transfer_gather_scatter(
   cudaEvent_t *pingpong_events = get_cached_event_pair(need_pingpong_host, events_created);
 
   const int64_t total_iters = (int64_t)num_layers * kv_dim;
+
+  // ---- memcpy2d branch (bidirectional) ----
+  // When enable_memcpy2d=TRUE, use cudaMemcpy2DAsync per segment to do a
+  // strided dev_buf<->CPU transfer directly, bypassing the host staging
+  // buffer + CPU scatter/gather. The GPU gather/scatter (index_select/
+  // index_copy_) still runs when GPU blocks are non-contiguous, but the
+  // D2H/H2D + CPU scatter/gather steps are fused into one cudaMemcpy2DAsync
+  // per segment. Fast on NVIDIA (DMA engine handles 2D); slow on P800.
+  if (ce_config.enable_memcpy2d) {
+    cudaMemcpyKind kind = is_host_to_device ? cudaMemcpyHostToDevice
+                                            : cudaMemcpyDeviceToHost;
+    for (int64_t it = 0; it < total_iters; ++it) {
+      int i = (int)(it / kv_dim);
+      int j = (int)(it % kv_dim);
+
+      // GPU block stride (pitch) in bytes.
+      int64_t *gpu_ptr_block0 =
+          ptr_at<Type>(gpu_tensor_handler, i + start_layer_id, j, 0);
+      int64_t *gpu_ptr_block1 =
+          ptr_at<Type>(gpu_tensor_handler, i + start_layer_id, j, 1);
+      int64_t gpu_block_stride_bytes =
+          (int64_t)((char *)gpu_ptr_block1 - (char *)gpu_ptr_block0);
+      int64_t *gpu_layer_kv_base =
+          gpu_ptr_block0 + gpu_startoff_inside_chunks_int64;
+
+      // CPU base for this (layer, kv).
+      int64_t *cpu_base = cpu_ptr_int64 +
+          (i + start_layer_id) * cpu_layer_stride_int64 +
+          j * cpu_kv_stride_int64 + cpu_startoff_inside_chunks_int64;
+      size_t cpu_pitch = (size_t)cpu_block_stride_int64 * sizeof(int64_t);
+
+      bool gpu_contig = analysis.gpu_log_contig && analysis.gpu_phys_contig;
+
+      if (!is_host_to_device) {
+        // ---- D2H ----
+        // Step 1: GPU gather (if needed)
+        const int64_t *d2h_src;
+        size_t dev_pitch;
+        if (gpu_contig) {
+          d2h_src = gpu_layer_kv_base +
+                    gpu_block_ids[0] * (gpu_block_stride_bytes / sizeof(int64_t));
+          dev_pitch = (size_t)gpu_block_stride_bytes;
+        } else {
+          at::Tensor src_view = at::from_blob(
+              gpu_layer_kv_base, {max_gpu_id + 1, elems_per_block},
+              {gpu_block_stride_bytes / sizeof(int64_t), 1}, i64_cuda);
+          at::index_select_out(dev_buf[0], src_view, 0, gpu_ids_cuda);
+          d2h_src = reinterpret_cast<int64_t *>(dev_buf[0].data_ptr());
+          dev_pitch = (size_t)chunk_size_in_bytes;
+        }
+
+        // Step 2: memcpy2d dev_buf/GPU -> CPU (strided, per segment)
+        for (const auto &seg : analysis.segments) {
+          int64_t cb = cpu_block_ids[seg.start_k];
+          void *cpu_dst = cpu_base + cb * cpu_block_stride_int64;
+          void *src = (char *)d2h_src +
+                      (int64_t)seg.start_k * chunk_size_in_bytes;
+          cudaMemcpy2DAsync(cpu_dst, cpu_pitch, src, dev_pitch,
+                            chunk_size_in_bytes, (size_t)seg.run_len,
+                            kind, stream);
+          FLEXKV_GPU_CPU_TRANSFER(false, chunk_size_in_bytes * seg.run_len);
+        }
+        cudaStreamSynchronize(stream);
+      } else {
+        // ---- H2D ----
+        // Step 1: memcpy2d CPU -> dev_buf/GPU (strided, per segment)
+        int64_t *h2d_dst;
+        size_t dev_pitch;
+        if (gpu_contig) {
+          h2d_dst = gpu_layer_kv_base +
+                    gpu_block_ids[0] * (gpu_block_stride_bytes / sizeof(int64_t));
+          dev_pitch = (size_t)gpu_block_stride_bytes;
+        } else {
+          h2d_dst = reinterpret_cast<int64_t *>(dev_buf[0].data_ptr());
+          dev_pitch = (size_t)chunk_size_in_bytes;
+        }
+
+        for (const auto &seg : analysis.segments) {
+          int64_t cb = cpu_block_ids[seg.start_k];
+          const int64_t *cpu_src = cpu_base + cb * cpu_block_stride_int64;
+          void *dst = (char *)h2d_dst +
+                      (int64_t)seg.start_k * chunk_size_in_bytes;
+          cudaMemcpy2DAsync(dst, dev_pitch, cpu_src, cpu_pitch,
+                            chunk_size_in_bytes, (size_t)seg.run_len,
+                            kind, stream);
+          FLEXKV_GPU_CPU_TRANSFER(true, chunk_size_in_bytes * seg.run_len);
+        }
+        cudaStreamSynchronize(stream);
+
+        // Step 2: GPU scatter (if needed)
+        if (!gpu_contig) {
+          at::Tensor dst_view = at::from_blob(
+              gpu_layer_kv_base, {max_gpu_id + 1, elems_per_block},
+              {gpu_block_stride_bytes / sizeof(int64_t), 1}, i64_cuda);
+          dst_view.index_copy_(0, dst_ids_cuda, dev_buf[0]);
+        }
+      }
+    }
+    cudaStreamSynchronize(stream);
+    gpu_ids_cuda.reset();
+    dst_ids_cuda.reset();
+    dev_buf[0].reset();
+    dev_buf[1].reset();
+    return;
+  }
 
   for (int64_t it = 0; it < total_iters; ++it) {
     int i = (int)(it / kv_dim);
