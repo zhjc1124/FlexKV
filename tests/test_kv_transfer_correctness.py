@@ -834,10 +834,15 @@ def test_non_mla_roundtrip_layerwise(data_config, cpu_layout_name):
     sync_all(num_gpus)
 
     # H2D readback via layerwise (test target).
+    # ce_is_blockfirst MUST match the D2H path (make_tp_group above) — if it
+    # defaults to GLOBAL_CONFIG_FROM_ENV.cpu_layout_type (BLOCKFIRST), the H2D
+    # CE path selector sees is_blockfirst=True and picks GATHER_DIRECT instead
+    # of SEGMENT_SCATTER, breaking the round-trip for LAYERFIRST non-MLA TP.
     layerwise_h2d_readback(
         all_gpu, cpu_kv, num_gpus, gpu_layout, num_layers, ids,
         cpu_stride_kv, cpu_stride_layer, cpu_stride_block, cpu_stride_tp,
-        chunk_size, is_mla, mode)
+        chunk_size, is_mla, mode,
+        ce_is_blockfirst=(cpu_layout_name == "BLOCKFIRST"))
 
     for g in range(num_gpus):
         for layer in [0, num_layers - 1]:
@@ -912,7 +917,8 @@ def test_mla_roundtrip_modes_layerwise(data_config, cpu_layout_name, mode):
     layerwise_h2d_readback(
         all_gpu, cpu_kv, num_gpus, gpu_layout, num_layers, ids,
         cpu_stride_kv, cpu_stride_layer, cpu_stride_block, cpu_stride_tp,
-        chunk_size, is_mla, mode)
+        chunk_size, is_mla, mode,
+        ce_is_blockfirst=(cpu_layout_name == "BLOCKFIRST"))
 
     # All ranks should recover GPU 0's data (MLA replicates).
     spot_check_gpu(all_gpu, 0, num_gpus, num_layers, num_blocks,
