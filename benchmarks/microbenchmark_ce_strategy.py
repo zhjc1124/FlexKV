@@ -735,10 +735,8 @@ def print_memcpy2d_benefit(results, run_rows):
 def print_recommendation_summary(all_results, args, threshold):
     """Print layout/mode recommendation per (size × model) based on auto timing.
 
-    For each size, computes the average auto timing across all (continuity × dir)
-    for each (model × mode × layout) group, then recommends the fastest.
-    MHA: recommend layout only (mode is don't-care).
-    MLA: recommend layout × mode.
+    MLA: show all (mode × layout) combinations ranked, recommend the fastest.
+    MHA: show lfirst vs bfirst, recommend the fastest.
     """
     mla_modes = ["rank0_only", "layer_parallel", "sharded"]
     for size_name in args.sizes:
@@ -750,7 +748,6 @@ def print_recommendation_summary(all_results, args, threshold):
         print("=" * 100)
 
         # Collect auto timings grouped by (model, mode, layout)
-        # Key: (is_mla, mode, layout) → list of auto times
         groups = {}
         for pattern, layout_key, is_mla, mode, dirs in PATH_FORMS:
             if pattern == "scattered" and num_blocks <= threshold:
@@ -768,33 +765,66 @@ def print_recommendation_summary(all_results, args, threshold):
                     key = (is_mla, mode, layout_key)
                     groups.setdefault(key, []).append(auto)
 
-        # --- MHA: recommend layout ---
-        print("\n  MHA (recommend layout):")
-        mha_layouts = {}
-        for layout_key in ["lfirst", "bfirst"]:
-            vals = []
-            for (is_mla, mode, lk), times in groups.items():
-                if not is_mla and lk == layout_key:
-                    vals.extend(times)
-            if vals:
-                mha_layouts[layout_key] = sum(vals) / len(vals)
-        for layout_key, avg in sorted(mha_layouts.items(), key=lambda x: x[1]):
-            star = " *" if layout_key == min(mha_layouts, key=mha_layouts.get) else ""
-            print("    {:>8s}  avg={:.3f} ms{}".format(layout_key, avg, star))
+        # Compute avg per group
+        avgs = {}
+        for key, times in groups.items():
+            avgs[key] = sum(times) / len(times)
 
-        # --- MLA: recommend layout × mode ---
-        print("\n  MLA (recommend layout × mode):")
-        mla_groups = {}
-        for (is_mla, mode, layout_key), times in groups.items():
-            if is_mla:
-                mla_groups[(layout_key, mode)] = sum(times) / len(times)
-        for (layout_key, mode), avg in sorted(mla_groups.items(), key=lambda x: x[1]):
-            star = " *" if (layout_key, mode) == min(mla_groups, key=mla_groups.get) else ""
-            print("    {:>8s} × {:>16s}  avg={:.3f} ms{}".format(
-                layout_key, mode, avg, star))
+        # --- MLA: table of mode × layout ---
+        print("\n  MLA — avg auto timing (ms) per mode × layout:")
+        print("  {:>16s}  {:>12s}  {:>12s}".format("mode", "lfirst", "bfirst"))
+        print("  " + "-" * 44)
+        mla_best = None
+        mla_best_val = float('inf')
+        for mode in mla_modes:
+            row = "  {:>16s}".format(mode)
+            for layout_key in ["lfirst", "bfirst"]:
+                v = avgs.get((True, mode, layout_key))
+                if v is not None:
+                    mark = ""
+                    if v == mla_best_val or v < mla_best_val:
+                        pass  # will mark after finding best
+                    row += "  {:>10.3f}  ".format(v)
+                    if v < mla_best_val:
+                        mla_best_val = v
+                        mla_best = (mode, layout_key)
+                else:
+                    row += "  {:>10s}  ".format("-")
+            print(row)
+        # Reprint with * marks
+        print("  {:>16s}  {:>12s}  {:>12s}".format("mode", "lfirst", "bfirst"))
+        print("  " + "-" * 44)
+        for mode in mla_modes:
+            row = "  {:>16s}".format(mode)
+            for layout_key in ["lfirst", "bfirst"]:
+                v = avgs.get((True, mode, layout_key))
+                if v is not None:
+                    star = " *" if (mode, layout_key) == mla_best else "  "
+                    row += "  {:>9.3f}{}".format(v, star)
+                else:
+                    row += "  {:>10s}  ".format("-")
+            print(row)
+        if mla_best:
+            print("  => Recommended: MLA {} + {}".format(mla_best[0], mla_best[1]))
+
+        # --- MHA: lfirst vs bfirst ---
+        print("\n  MHA — avg auto timing (ms) per layout:")
+        mha_best = None
+        mha_best_val = float('inf')
+        for layout_key in ["lfirst", "bfirst"]:
+            v = avgs.get((False, "rank0_only", layout_key))
+            if v is not None and v < mha_best_val:
+                mha_best_val = v
+                mha_best = layout_key
+        for layout_key in ["lfirst", "bfirst"]:
+            v = avgs.get((False, "rank0_only", layout_key))
+            if v is not None:
+                star = " *" if layout_key == mha_best else ""
+                print("    {:>8s}  avg={:.3f} ms{}".format(layout_key, v, star))
+        if mha_best:
+            print("  => Recommended: MHA {}".format(mha_best))
 
     print("\n" + "=" * 100)
-    print("  Recommendation: pick the layout/mode with lowest avg auto timing.")
     print("  '*' = best (lowest average across all continuity × direction).")
     print("=" * 100)
 
