@@ -116,14 +116,11 @@ CEPath choose_path(const CEAnalysis &a, const CETransferConfig &ce_config,
     return CEPath::CONTIG_DIRECT;
 
   // Sharded D2H (LF + MLA sharded): !gpu_phys_contig (chunk shrunk to shard).
-  // GATHER_SCATTER handles this via GPU index_select gather with proper
-  // stride (same technique as GATHER_DIRECT). If chunk not 8-aligned
-  // (extremely rare), fall back to SEGMENT_SCATTER.
-  if (!a.gpu_phys_contig) {
-    if (chunk_size_in_bytes > 0 && chunk_size_in_bytes % sizeof(int64_t) != 0)
-      return CEPath::SEGMENT_SCATTER;
+  // GATHER_SCATTER is the ONLY correct path — SEGMENT_SCATTER assumes
+  // gpu_phys_contig for its merged-segment memcpy and would misplace shard
+  // data. Non-8-aligned chunks are still handled correctly by GATHER_SCATTER.
+  if (!a.gpu_phys_contig)
     return CEPath::GATHER_SCATTER;
-  }
 
   // LAYERFIRST or BF MHA: remaining paths by contiguity.
   // LAYERFIRST non-MLA (!cpu_phys_contig && !is_blockfirst): SEGMENT_SCATTER
