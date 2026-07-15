@@ -796,10 +796,18 @@ void ce_transfer_gather_scatter(
 
   // Host staging buffer needed:
   // - D2H: always (staging + CPU scatter to strided dst)
-  // - H2D: when CPU src is non-contiguous (cpu_log_contig = CPU side)
+  // - H2D: when CPU src is non-contiguous — either logically (scattered
+  //   block_ids, cpu_log_contig=false) or physically (block_stride !=
+  //   chunk_size, cpu_phys_contig=false). Must match the Step 1 condition
+  //   below: `if (cpu_log_contig && cpu_phys_contig)` uses direct ptr,
+  //   otherwise gather_from_cpu() needs host_buf. Missing the physical
+  //   contig check here causes segfault on BLOCKFIRST H2D where
+  //   cpu_log_contig=true but cpu_phys_contig=false (block_stride includes
+  //   all layers+kv_dim, >> chunk_size).
   bool need_host_buf =
       !is_host_to_device ||  // D2H: always stage then scatter
-      (is_host_to_device && !analysis.cpu_log_contig);  // H2D: CPU gather needed
+      (is_host_to_device &&
+       !(analysis.cpu_log_contig && analysis.cpu_phys_contig));  // H2D: gather
 
   // D2H ping-pong: CPU scatter overlaps with GPU D2H.
   // H2D has no ping-pong (CPU gather too fast).
