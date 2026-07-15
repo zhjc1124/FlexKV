@@ -79,11 +79,16 @@ LAYOUTS = {
 }
 
 # (label, is_mla, mode)
-# MHA: non-MLA, mode ignored. MLA: rank_rotate (best mode) or sharded.
+# MHA: non-MLA, mode ignored.
+# MLA: all 4 D2H modes (sharded / rank0_only / layer_parallel / rank_rotate).
+# CPU tensor total blocks = num_blocks * num_gpus ONLY for all_write (handled in
+# cpu_strides_for_strategy); the 4 modes below all use num_blocks, correct as-is.
 STRATEGIES = [
-    ("MHA",             False, "sharded"),
-    ("MLA-rank_rotate",  True, "rank_rotate"),
-    ("MLA-sharded",      True, "sharded"),
+    ("MHA",               False, "sharded"),
+    ("MLA-sharded",        True, "sharded"),
+    ("MLA-rank0_only",     True, "rank0_only"),
+    ("MLA-layer_parallel", True, "layer_parallel"),
+    ("MLA-rank_rotate",    True, "rank_rotate"),
 ]
 
 CE_CONFIGS = [
