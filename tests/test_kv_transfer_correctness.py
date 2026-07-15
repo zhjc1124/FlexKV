@@ -1060,9 +1060,10 @@ CE_SEGMENT_THRESHOLDS = [8, 2]
 
 # enable_memcpy2d is swept as an orthogonal dimension. When True, the C++ engine
 # uses cudaMemcpy2DAsync for strided direct transfer (both D2H and H2D) instead of
-# staging + scatter/gather. It applies to path 2 SEGMENT_SCATTER and path 4
-# GATHER_DIRECT only; other paths (CONTIG_DIRECT / SEGMENT_DIRECT / GATHER_SCATTER)
-# ignore it (the C++ check is `if (ce_config.enable_memcpy2d)` with no direction guard).
+# staging + scatter/gather. It applies to path 2 SEGMENT_SCATTER, path 3
+# GATHER_SCATTER, and path 4 GATHER_DIRECT; other paths (CONTIG_DIRECT /
+# SEGMENT_DIRECT) ignore it. For GATHER_SCATTER, memcpy2d replaces the CPU-side
+# scatter/gather (GPU index_select/index_copy_ still runs).
 # CE_MEMCPY2D_CONFIGS defined near top of file (before first use).
 
 
@@ -1304,11 +1305,11 @@ def test_ce_paths_layerwise_h2d(data_config, is_mla, cpu_layout_name, pattern,
     # segment_threshold has no effect — skip redundant threshold sweeps.
     if cpu_layout_name == "BLOCKFIRST" and segment_threshold != 8:
         pytest.skip("BF always uses GATHER_DIRECT, threshold has no effect")
-    # memcpy2d now applies to H2D as well (symmetric to D2H): when the
-    # selected path is SEGMENT_SCATTER and enable_memcpy2d=True, H2D goes
-    # through the cudaMemcpy2DAsync branch. Other paths
-    # (GATHER_DIRECT/CONTIG_DIRECT/SEGMENT_DIRECT/GATHER_SCATTER) do not
-    # consult enable_memcpy2d, so their behavior is unchanged.
+    # memcpy2d applies to H2D as well (symmetric to D2H): when the selected
+    # path is SEGMENT_SCATTER, GATHER_SCATTER, or GATHER_DIRECT and
+    # enable_memcpy2d=True, H2D goes through the cudaMemcpy2DAsync branch.
+    # Other paths (CONTIG_DIRECT / SEGMENT_DIRECT) do not consult
+    # enable_memcpy2d, so their behavior is unchanged.
     num_layers, num_blocks, tpb, num_heads, head_dim = data_config
     if pattern == "scattered" and num_blocks <= segment_threshold:
         pytest.skip("scattered needs num_blocks > segment_threshold ({}) "
