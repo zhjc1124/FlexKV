@@ -733,22 +733,24 @@ def print_memcpy2d_benefit(results, run_rows):
 
 
 def print_recommendation_summary(all_results, args, threshold):
-    """Print layout/mode recommendation per (size × model) based on auto timing.
+    """Print layout/mode recommendation per (size × model).
 
-    MLA: show all (mode × layout) combinations ranked, recommend the fastest.
-    MHA: show lfirst vs bfirst, recommend the fastest.
+    When --memcpy2d on: outputs BOTH off and on recommendations (data already
+    collected in a single run — auto=off, S_SCT2/G_SCT2/G_DIR2=on).
+    When --memcpy2d off: only off recommendation.
     """
     mla_modes = ["rank0_only", "layer_parallel", "sharded"]
+    show_on = (args.memcpy2d == "on")
+
     for size_name in args.sizes:
         results = all_results[size_name]
         num_layers, num_blocks, head_dim = SIZES[size_name]
-        print("\n" + "=" * 100)
-        print("  Recommendation for size={} ({}L / {}B / hd={})  memcpy2d={}".format(
-            size_name, num_layers, num_blocks, head_dim, args.memcpy2d))
-        print("=" * 100)
 
-        # Collect auto timings grouped by (model, mode, layout)
-        groups = {}
+        # For each (form, dir), compute best_off and best_on timing.
+        # best_off = min of all off-variant viable path timings (auto or forced).
+        # best_on  = min of all timings including [2d] variants (scattered guard:
+        #            [2d] variants excluded for scattered since guard falls through).
+        best_per_formdir = {}  # (form_name, dir_name) → (best_off, best_on)
         for pattern, layout_key, is_mla, mode, dirs in PATH_FORMS:
             if pattern == "scattered" and num_blocks <= threshold:
                 continue
@@ -757,75 +759,112 @@ def print_recommendation_summary(all_results, args, threshold):
                 form_name = "{}/{}/{}/{}".format(pattern, layout_key, mla_tag, mode)
             else:
                 form_name = "{}/{}/{}".format(pattern, layout_key, mla_tag)
+            viable = correct_paths_for(layout_key, is_mla, pattern, mode,
+                                        True, threshold)  # H2D viable (superset)
+            viable_names = {pn for _, pn in viable}
             for is_h2d in dirs:
                 dir_name = "H2D" if is_h2d else "D2H"
                 cfgs = results.get((form_name, dir_name), {})
-                auto = cfgs.get("auto")
-                if auto is not None:
-                    key = (is_mla, mode, layout_key)
-                    groups.setdefault(key, []).append(auto)
+                auto_path = cfgs.get("auto_path", "")
+                # Collect off timings
+                off_vals = []
+                for pname in viable_names:
+                    v = cfgs.get(pname)
+                    if v is None and pname == auto_path:
+                        v = cfgs.get("auto")
+                    if v is not None:
+                        off_vals.append(v)
+                best_off = min(off_vals) if off_vals else None
+                # Collect on timings (off + [2d] variants, with scattered guard)
+                on_vals = list(off_vals)  # off variants still available
+                if show_on:
+                    is_scattered = (pattern == "scattered")
+                    for pname in viable_names:
+                        if pname in AFFECTED_PATHS and not is_scattered:
+                            v = cfgs.get(pname + " [2d]")
+                            if v is not None:
+                                on_vals.append(v)
+                best_on = min(on_vals) if on_vals else None
+                best_per_formdir[(form_name, dir_name)] = (best_off, best_on)
 
-        # Compute avg per group
-        avgs = {}
-        for key, times in groups.items():
-            avgs[key] = sum(times) / len(times)
+        # Print recommendation tables
+        for memcpy_label, use_on in [("memcpy2d=off", False), ("memcpy2d=on", True)]:
+            if use_on and not show_on:
+                continue  # skip on-table if --memcpy2d off
 
-        # --- MLA: table of mode × layout ---
-        print("\n  MLA — avg auto timing (ms) per mode × layout:")
-        print("  {:>16s}  {:>12s}  {:>12s}".format("mode", "lfirst", "bfirst"))
-        print("  " + "-" * 44)
-        mla_best = None
-        mla_best_val = float('inf')
-        for mode in mla_modes:
-            row = "  {:>16s}".format(mode)
-            for layout_key in ["lfirst", "bfirst"]:
-                v = avgs.get((True, mode, layout_key))
-                if v is not None:
-                    mark = ""
-                    if v == mla_best_val or v < mla_best_val:
-                        pass  # will mark after finding best
-                    row += "  {:>10.3f}  ".format(v)
-                    if v < mla_best_val:
+            print("\n" + "=" * 100)
+            print("  Recommendation for size={} ({}L / {}B / hd={})  {}".format(
+                size_name, num_layers, num_blocks, head_dim, memcpy_label))
+            print("=" * 100)
+
+            # Group by (is_mla, mode, layout) → list of best timings
+            groups = {}
+            for pattern, layout_key, is_mla, mode, dirs in PATH_FORMS:
+                if pattern == "scattered" and num_blocks <= threshold:
+                    continue
+                mla_tag = "mla" if is_mla else "mha"
+                if is_mla:
+                    form_name = "{}/{}/{}/{}".format(pattern, layout_key, mla_tag, mode)
+                else:
+                    form_name = "{}/{}/{}".format(pattern, layout_key, mla_tag)
+                for is_h2d in dirs:
+                    dir_name = "H2D" if is_h2d else "D2H"
+                    vals = best_per_formdir.get((form_name, dir_name))
+                    if vals is not None:
+                        v = vals[1] if use_on else vals[0]
+                        if v is not None:
+                            key = (is_mla, mode, layout_key)
+                            groups.setdefault(key, []).append(v)
+
+            avgs = {}
+            for key, times in groups.items():
+                avgs[key] = sum(times) / len(times)
+
+            # --- MLA: table of mode × layout ---
+            print("\n  MLA — avg best timing (ms) per mode × layout:")
+            print("  {:>16s}  {:>12s}  {:>12s}".format("mode", "lfirst", "bfirst"))
+            print("  " + "-" * 44)
+            mla_best = None
+            mla_best_val = float('inf')
+            for mode in mla_modes:
+                for layout_key in ["lfirst", "bfirst"]:
+                    v = avgs.get((True, mode, layout_key))
+                    if v is not None and v < mla_best_val:
                         mla_best_val = v
                         mla_best = (mode, layout_key)
-                else:
-                    row += "  {:>10s}  ".format("-")
-            print(row)
-        # Reprint with * marks
-        print("  {:>16s}  {:>12s}  {:>12s}".format("mode", "lfirst", "bfirst"))
-        print("  " + "-" * 44)
-        for mode in mla_modes:
-            row = "  {:>16s}".format(mode)
-            for layout_key in ["lfirst", "bfirst"]:
-                v = avgs.get((True, mode, layout_key))
-                if v is not None:
-                    star = " *" if (mode, layout_key) == mla_best else "  "
-                    row += "  {:>9.3f}{}".format(v, star)
-                else:
-                    row += "  {:>10s}  ".format("-")
-            print(row)
-        if mla_best:
-            print("  => Recommended: MLA {} + {}".format(mla_best[0], mla_best[1]))
+            for mode in mla_modes:
+                row = "  {:>16s}".format(mode)
+                for layout_key in ["lfirst", "bfirst"]:
+                    v = avgs.get((True, mode, layout_key))
+                    if v is not None:
+                        star = " *" if (mode, layout_key) == mla_best else "  "
+                        row += "  {:>9.3f}{}".format(v, star)
+                    else:
+                        row += "  {:>10s}  ".format("-")
+                print(row)
+            if mla_best:
+                print("  => Recommended: MLA {} + {}".format(mla_best[0], mla_best[1]))
 
-        # --- MHA: lfirst vs bfirst ---
-        print("\n  MHA — avg auto timing (ms) per layout:")
-        mha_best = None
-        mha_best_val = float('inf')
-        for layout_key in ["lfirst", "bfirst"]:
-            v = avgs.get((False, "rank0_only", layout_key))
-            if v is not None and v < mha_best_val:
-                mha_best_val = v
-                mha_best = layout_key
-        for layout_key in ["lfirst", "bfirst"]:
-            v = avgs.get((False, "rank0_only", layout_key))
-            if v is not None:
-                star = " *" if layout_key == mha_best else ""
-                print("    {:>8s}  avg={:.3f} ms{}".format(layout_key, v, star))
-        if mha_best:
-            print("  => Recommended: MHA {}".format(mha_best))
+            # --- MHA: lfirst vs bfirst ---
+            print("\n  MHA — avg best timing (ms) per layout:")
+            mha_best = None
+            mha_best_val = float('inf')
+            for layout_key in ["lfirst", "bfirst"]:
+                v = avgs.get((False, "rank0_only", layout_key))
+                if v is not None and v < mha_best_val:
+                    mha_best_val = v
+                    mha_best = layout_key
+            for layout_key in ["lfirst", "bfirst"]:
+                v = avgs.get((False, "rank0_only", layout_key))
+                if v is not None:
+                    star = " *" if layout_key == mha_best else ""
+                    print("    {:>8s}  avg={:.3f} ms{}".format(layout_key, v, star))
+            if mha_best:
+                print("  => Recommended: MHA {}".format(mha_best))
 
     print("\n" + "=" * 100)
     print("  '*' = best (lowest average across all continuity × direction).")
+    print("  best = fastest viable path for each (form, dir), including [2d] variants when memcpy2d=on.")
     print("=" * 100)
 
 
