@@ -144,7 +144,9 @@ CEAnalysis analyze_ce_transfer(
     int64_t chunk_size_in_bytes, int64_t gpu_block_stride_in_bytes);
 
 CEPath choose_path(const CEAnalysis &a, const CETransferConfig &ce_config,
-                   int64_t chunk_size_in_bytes = 0);
+                   int64_t chunk_size_in_bytes = 0,
+                   bool is_host_to_device = false,
+                   bool is_full_block = false);
 
 // ============================================================================
 // Cached staging buffers & events

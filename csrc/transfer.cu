@@ -154,7 +154,13 @@ void transfer_kv_blocks(
                     "force_path out of range [0,4]: ", ce_config.force_path);
         path = static_cast<CEPath>(ce_config.force_path);
       } else {
-        path = choose_path(analysis, ce_config, chunk_size_in_bytes);
+        // is_full_block: all layers*kv_dim transferred in one call (rank0_only
+        // mode). layer_parallel transfers fewer layers → !full_block.
+        // Used by choose_path to route bfirst+MLA+D2H+!full_block to S_SCT.
+        bool is_full_block = ((int64_t)num_layers * kv_dim * chunk_size_in_bytes
+                              == cpu_block_stride_in_bytes);
+        path = choose_path(analysis, ce_config, chunk_size_in_bytes,
+                           is_host_to_device, is_full_block);
       }
 
       switch (path) {

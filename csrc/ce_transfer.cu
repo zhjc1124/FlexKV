@@ -97,7 +97,8 @@ CEAnalysis analyze_ce_transfer(
 // physically contiguous) / SEGMENT_SCATTER (dst strided, GPU contiguous) /
 // self-describing name. GATHER_SCATTER (was Path 2) is unchanged.
 CEPath choose_path(const CEAnalysis &a, const CETransferConfig &ce_config,
-                   int64_t chunk_size_in_bytes) {
+                   int64_t chunk_size_in_bytes,
+                   bool is_host_to_device, bool is_full_block) {
   // GATHER_DIRECT: BLOCKFIRST + CPU non-contiguous + GPU physically contiguous
   // (non-sharded). D2D transpose GPU LAYERFIRST -> dev_staging (contiguous),
   // then a direct per-segment memcpy to CPU. The compact-staging trick needs
@@ -108,8 +109,19 @@ CEPath choose_path(const CEAnalysis &a, const CETransferConfig &ce_config,
   // staging stride is shard_size); route those to GATHER_SCATTER instead (it
   // CPU-scatters each shard to its exact offset). Checked before
   // !gpu_phys_contig but only when GPU is also contiguous.
-  if (ce_config.is_blockfirst && !a.cpu_phys_contig && a.gpu_phys_contig)
+  //
+  // Exception: bfirst + MLA + D2H + !full_block (layer_parallel) → SEGMENT_SCATTER
+  // is 30%-8.9x faster than GATHER_DIRECT. GATHER_DIRECT's D2D transpose has
+  // high fixed overhead for small per-batch data (layer_parallel transfers
+  // num_layers/num_gpus layers per batch). SEGMENT_SCATTER's staging+scatter
+  // is lighter. Only applies to MLA (kv_dim=1, full_block detectable); MHA
+  // has !full_block always (heads_per_rank < num_heads) but GATHER_DIRECT is
+  // optimal at medium/large for MHA's larger data.
+  if (ce_config.is_blockfirst && !a.cpu_phys_contig && a.gpu_phys_contig) {
+    if (is_host_to_device && ce_config.is_mla && !is_full_block)
+      return CEPath::SEGMENT_SCATTER;  // bfirst MLA layer_parallel D2H
     return CEPath::GATHER_DIRECT;
+  }
 
   // CONTIG_DIRECT: logical + physical contiguity on both sides -> one big memcpy.
   if (a.gpu_log_contig && a.cpu_log_contig && a.cpu_phys_contig && a.gpu_phys_contig)
@@ -518,7 +530,9 @@ void ce_transfer_segment_scatter(
   // Direction (is_host_to_device) selects src/dst/pitch/kind:
   //   D2H: GPU src (contiguous within segment) -> CPU dst (strided)
   //   H2D: CPU src (strided) -> GPU dst (contiguous within segment)
-  if (ce_config.enable_memcpy2d) {
+  // Scattered guard: cudaMemcpy2DAsync is 50x slower for scattered blocks
+  // (random row access defeats DMA engine). Fall through to staging+scatter.
+  if (ce_config.enable_memcpy2d && analysis.num_segments <= ce_config.segment_threshold) {
     cudaMemcpyKind kind = is_host_to_device ? cudaMemcpyHostToDevice
                                             : cudaMemcpyDeviceToHost;
     const int64_t total_iters = (int64_t)num_layers * kv_dim;
@@ -844,7 +858,8 @@ void ce_transfer_gather_scatter(
   // index_copy_) still runs when GPU blocks are non-contiguous, but the
   // D2H/H2D + CPU scatter/gather steps are fused into one cudaMemcpy2DAsync
   // per segment. Fast on NVIDIA (DMA engine handles 2D); slow on P800.
-  if (ce_config.enable_memcpy2d) {
+  // Scattered guard: cudaMemcpy2DAsync is 50x slower for scattered blocks.
+  if (ce_config.enable_memcpy2d && analysis.num_segments <= ce_config.segment_threshold) {
     cudaMemcpyKind kind = is_host_to_device ? cudaMemcpyHostToDevice
                                             : cudaMemcpyDeviceToHost;
     for (int64_t it = 0; it < total_iters; ++it) {
