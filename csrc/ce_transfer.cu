@@ -118,7 +118,11 @@ CEPath choose_path(const CEAnalysis &a, const CETransferConfig &ce_config,
   // has !full_block always (heads_per_rank < num_heads) but GATHER_DIRECT is
   // optimal at medium/large for MHA's larger data.
   if (ce_config.is_blockfirst && !a.cpu_phys_contig && a.gpu_phys_contig) {
-    if (is_host_to_device && ce_config.is_mla && !is_full_block)
+    // is_host_to_device=true means H2D. The SEGMENT_SCATTER win applies to
+    // D2H (device->host, is_host_to_device=false), so guard with
+    // !is_host_to_device. (18eee0b3b wrote is_host_to_device by mistake,
+    // applying the optimization to the wrong transfer direction.)
+    if (!is_host_to_device && ce_config.is_mla && !is_full_block)
       return CEPath::SEGMENT_SCATTER;  // bfirst MLA layer_parallel D2H
     return CEPath::GATHER_DIRECT;
   }
