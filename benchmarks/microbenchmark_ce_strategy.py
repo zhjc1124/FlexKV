@@ -277,62 +277,79 @@ STR_ABBR_2D = {
 # - GATHER_SCATTER: LF + MLA (non-sharded OR sharded via strided from_blob)
 #   (BF segfault; MHA segfault)
 # - GATHER_DIRECT: BF only (LF segfault — from_blob with BF stride assumption)
-_MERGE = [(2, "SEGMENT_SCATTER")]
+def correct_paths_for(layout_key, is_mla, pattern, mode, is_h2d, threshold):
+    """Return the (path_id, name) list of strategies that are DATA-CORRECT for
+    a form. Mirrors the hard constraints each CEPath imposes (see csrc/ce_transfer.h):
 
-# LF + MLA + non-sharded
-_LF_CONTIG_MLA = [(0, "CONTIG_DIRECT"), (1, "SEGMENT_DIRECT")] + _MERGE + [(3, "GATHER_SCATTER")]
-_LF_OTHER_MLA  = [(1, "SEGMENT_DIRECT")] + _MERGE + [(3, "GATHER_SCATTER")]
+      CONTIG_DIRECT(0):   cpu_phys_contig & gpu_phys_contig & contiguous (1 seg)
+      SEGMENT_DIRECT(1):  cpu_phys_contig & gpu_phys_contig & <=threshold segs
+      SEGMENT_SCATTER(2): gpu_phys_contig (non-sharded); CPU scatter handles any layout
+      GATHER_SCATTER(3):  ALWAYS correct — GPU gather + CPU scatter, any layout / sharded
+      GATHER_DIRECT(4):   BF (!cpu_phys_contig) & gpu_phys_contig (non-sharded)
 
-# LF + sharded: GATHER_SCATTER only
-# (SEGMENT_SCATTER assumes gpu_phys_contig for merged segment memcpy —
-#  sharded breaks this; CONTIG_DIRECT/SEGMENT_DIRECT need gpu_phys_contig too)
-_LF_SHARDED = [(3, "GATHER_SCATTER")]
+    cpu_phys_contig = (layout==lfirst) and is_mla.
+    gpu_phys_contig = !(mode==sharded and direction==D2H); sharded only breaks D2H.
+    Computed rather than hand-listed so it can never drift from the C++ rules.
+    """
+    cpu_phys_contig = (layout_key == "lfirst") and is_mla
+    gpu_phys_contig = not (mode == "sharded" and not is_h2d)
+    if pattern == "contiguous":
+        num_segments = 1
+    elif pattern == "few_seg":
+        num_segments = 4
+    else:
+        num_segments = threshold + 1
+    out = []
+    if cpu_phys_contig and gpu_phys_contig and num_segments == 1:
+        out.append((0, "CONTIG_DIRECT"))
+    if cpu_phys_contig and gpu_phys_contig and num_segments <= threshold:
+        out.append((1, "SEGMENT_DIRECT"))
+    if gpu_phys_contig:
+        out.append((2, "SEGMENT_SCATTER"))
+    out.append((3, "GATHER_SCATTER"))  # universal fallback — always correct
+    # GATHER_DIRECT is BF-only (BLOCKFIRST). On LF it assumes the wrong layout,
+    # so gate on is_blockfirst — not just `not cpu_phys_contig` (which is also
+    # true for MHA+LF and would wrongly include GATHER_DIRECT there).
+    if (layout_key == "bfirst") and gpu_phys_contig:
+        out.append((4, "GATHER_DIRECT"))
+    return out
 
-# LF + MHA: only SEGMENT_SCATTER is data-correct.
-# CONTIG_DIRECT/SEGMENT_DIRECT produce wrong data (cpu_phys_contig=false:
-# per-rank chunk < full block_stride). GATHER_SCATTER segfaults on MHA.
-_LF_MHA = _MERGE  # only SEGMENT_SCATTER
-
-# BF (any pattern/mla/mode): SEGMENT_SCATTER + GATHER_DIRECT
-_BF = _MERGE + [(4, "GATHER_DIRECT")]
-
-# BF + sharded: GATHER_SCATTER only (mirrors LF_SHARDED). SEGMENT_SCATTER and
-# GATHER_DIRECT both require gpu_phys_contig (sharded breaks it): GATHER_DIRECT's
-# compact staging misplaces (layer,kv)>0 within each block, SEGMENT_SCATTER's
-# merged-segment memcpy assumes contiguous GPU blocks.
-_BF_SHARDED = [(3, "GATHER_SCATTER")]
 
 # Full matrix: 3 patterns x 2 layouts x 3 mla modes (rank0_only, layer_parallel,
 # sharded) + 3 patterns x 2 layouts x 1 mha (mode is don't-care, not shown).
+# The data-correct strategy set per (form, dir) is computed by correct_paths_for()
+# above — no longer hand-listed, so it can never drift out of sync with the C++
+# constraints (and GATHER_SCATTER, being universally correct, now appears in
+# every form as a head-to-head alternative).
 PATH_FORMS = [
     # --- mla + rank0_only (H2D + D2H) ---
-    ("contiguous", "lfirst", True,  "rank0_only",     [True, False], _LF_CONTIG_MLA),
-    ("contiguous", "bfirst", True,  "rank0_only",     [True, False], _BF),
-    ("few_seg",    "lfirst", True,  "rank0_only",     [True, False], _LF_OTHER_MLA),
-    ("few_seg",    "bfirst", True,  "rank0_only",     [True, False], _BF),
-    ("scattered",  "lfirst", True,  "rank0_only",     [True, False], _LF_OTHER_MLA),
-    ("scattered",  "bfirst", True,  "rank0_only",     [True, False], _BF),
+    ("contiguous", "lfirst", True,  "rank0_only",     [True, False]),
+    ("contiguous", "bfirst", True,  "rank0_only",     [True, False]),
+    ("few_seg",    "lfirst", True,  "rank0_only",     [True, False]),
+    ("few_seg",    "bfirst", True,  "rank0_only",     [True, False]),
+    ("scattered",  "lfirst", True,  "rank0_only",     [True, False]),
+    ("scattered",  "bfirst", True,  "rank0_only",     [True, False]),
     # --- mla + layer_parallel (H2D + D2H) ---
-    ("contiguous", "lfirst", True,  "layer_parallel", [True, False], _LF_CONTIG_MLA),
-    ("contiguous", "bfirst", True,  "layer_parallel", [True, False], _BF),
-    ("few_seg",    "lfirst", True,  "layer_parallel", [True, False], _LF_OTHER_MLA),
-    ("few_seg",    "bfirst", True,  "layer_parallel", [True, False], _BF),
-    ("scattered",  "lfirst", True,  "layer_parallel", [True, False], _LF_OTHER_MLA),
-    ("scattered",  "bfirst", True,  "layer_parallel", [True, False], _BF),
+    ("contiguous", "lfirst", True,  "layer_parallel", [True, False]),
+    ("contiguous", "bfirst", True,  "layer_parallel", [True, False]),
+    ("few_seg",    "lfirst", True,  "layer_parallel", [True, False]),
+    ("few_seg",    "bfirst", True,  "layer_parallel", [True, False]),
+    ("scattered",  "lfirst", True,  "layer_parallel", [True, False]),
+    ("scattered",  "bfirst", True,  "layer_parallel", [True, False]),
     # --- mla + sharded (D2H only) ---
-    ("contiguous", "lfirst", True,  "sharded",        [False], _LF_SHARDED),
-    ("contiguous", "bfirst", True,  "sharded",        [False], _BF_SHARDED),
-    ("few_seg",    "lfirst", True,  "sharded",        [False], _LF_SHARDED),
-    ("few_seg",    "bfirst", True,  "sharded",        [False], _BF_SHARDED),
-    ("scattered",  "lfirst", True,  "sharded",        [False], _LF_SHARDED),
-    ("scattered",  "bfirst", True,  "sharded",        [False], _BF_SHARDED),
+    ("contiguous", "lfirst", True,  "sharded",        [False]),
+    ("contiguous", "bfirst", True,  "sharded",        [False]),
+    ("few_seg",    "lfirst", True,  "sharded",        [False]),
+    ("few_seg",    "bfirst", True,  "sharded",        [False]),
+    ("scattered",  "lfirst", True,  "sharded",        [False]),
+    ("scattered",  "bfirst", True,  "sharded",        [False]),
     # --- mha (H2D + D2H, mode is don't-care) ---
-    ("contiguous", "lfirst", False, "rank0_only",     [True, False], _LF_MHA),
-    ("contiguous", "bfirst", False, "rank0_only",     [True, False], _BF),
-    ("few_seg",    "lfirst", False, "rank0_only",     [True, False], _LF_MHA),
-    ("few_seg",    "bfirst", False, "rank0_only",     [True, False], _BF),
-    ("scattered",  "lfirst", False, "rank0_only",     [True, False], _LF_MHA),
-    ("scattered",  "bfirst", False, "rank0_only",     [True, False], _BF),
+    ("contiguous", "lfirst", False, "rank0_only",     [True, False]),
+    ("contiguous", "bfirst", False, "rank0_only",     [True, False]),
+    ("few_seg",    "lfirst", False, "rank0_only",     [True, False]),
+    ("few_seg",    "bfirst", False, "rank0_only",     [True, False]),
+    ("scattered",  "lfirst", False, "rank0_only",     [True, False]),
+    ("scattered",  "bfirst", False, "rank0_only",     [True, False]),
 ]
 
 
@@ -404,7 +421,7 @@ def run_strategy_compare(args):
         results = all_results[size_name]
         heads_per_rank = 1
 
-        for pattern, layout_key, is_mla, mode, dirs, viable in PATH_FORMS:
+        for pattern, layout_key, is_mla, mode, dirs in PATH_FORMS:
             mla_tag = "mla" if is_mla else "mha"
             # MHA mode is don't-care — don't show it in the form name.
             if is_mla:
@@ -497,6 +514,8 @@ def run_strategy_compare(args):
                 # benefit of FLEXKV_ENABLE_MEMCPY2D can be measured head-to-head.
                 # The off variant of the auto-picked path is already timed by
                 # the 'auto' run, so we skip that one to avoid redundancy.
+                viable = correct_paths_for(layout_key, is_mla, pattern, mode,
+                                            is_h2d, threshold)
                 for fp_id, fp_name in viable:
                     m2d_settings = [False]
                     if args.memcpy2d == "on" and fp_name in AFFECTED_PATHS:
@@ -540,7 +559,7 @@ def run_strategy_compare(args):
 
         # Build the list of (form_name, dir_name) rows actually run.
         run_rows = []
-        for pattern, layout_key, is_mla, mode, dirs, viable in PATH_FORMS:
+        for pattern, layout_key, is_mla, mode, dirs in PATH_FORMS:
             if pattern == "scattered" and num_blocks <= threshold:
                 continue
             mla_tag = "mla" if is_mla else "mha"
@@ -549,6 +568,8 @@ def run_strategy_compare(args):
             else:
                 form_name = "{}/{}/{}".format(pattern, layout_key, mla_tag)
             for is_h2d in dirs:
+                viable = correct_paths_for(layout_key, is_mla, pattern, mode,
+                                            is_h2d, threshold)
                 run_rows.append((form_name, "H2D" if is_h2d else "D2H", viable))
 
         col_w = 9
