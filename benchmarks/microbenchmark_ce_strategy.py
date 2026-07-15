@@ -317,35 +317,31 @@ def correct_paths_for(layout_key, is_mla, pattern, mode, is_h2d, threshold):
     return out
 
 
-# Full matrix: 3 patterns x 2 layouts x 3 mla modes (rank0_only, layer_parallel,
-# sharded) + 3 patterns x 2 layouts x 1 mha (mode is don't-care, not shown).
-# The data-correct strategy set per (form, dir) is computed by correct_paths_for()
-# above — no longer hand-listed, so it can never drift out of sync with the C++
-# constraints (and GATHER_SCATTER, being universally correct, now appears in
-# every form as a head-to-head alternative).
+# Full matrix ordered by: model → mode → layout → continuity.
+# This groups H2D+D2H for the same (model × mode × layout × continuity) together.
 PATH_FORMS = [
-    # --- mla + rank0_only (H2D + D2H) ---
+    # --- MLA + rank0_only ---
     ("contiguous", "lfirst", True,  "rank0_only",     [True, False]),
     ("contiguous", "bfirst", True,  "rank0_only",     [True, False]),
     ("few_seg",    "lfirst", True,  "rank0_only",     [True, False]),
     ("few_seg",    "bfirst", True,  "rank0_only",     [True, False]),
     ("scattered",  "lfirst", True,  "rank0_only",     [True, False]),
     ("scattered",  "bfirst", True,  "rank0_only",     [True, False]),
-    # --- mla + layer_parallel (H2D + D2H) ---
+    # --- MLA + layer_parallel ---
     ("contiguous", "lfirst", True,  "layer_parallel", [True, False]),
     ("contiguous", "bfirst", True,  "layer_parallel", [True, False]),
     ("few_seg",    "lfirst", True,  "layer_parallel", [True, False]),
     ("few_seg",    "bfirst", True,  "layer_parallel", [True, False]),
     ("scattered",  "lfirst", True,  "layer_parallel", [True, False]),
     ("scattered",  "bfirst", True,  "layer_parallel", [True, False]),
-    # --- mla + sharded (D2H only) ---
+    # --- MLA + sharded (D2H only) ---
     ("contiguous", "lfirst", True,  "sharded",        [False]),
     ("contiguous", "bfirst", True,  "sharded",        [False]),
     ("few_seg",    "lfirst", True,  "sharded",        [False]),
     ("few_seg",    "bfirst", True,  "sharded",        [False]),
     ("scattered",  "lfirst", True,  "sharded",        [False]),
     ("scattered",  "bfirst", True,  "sharded",        [False]),
-    # --- mha (H2D + D2H, mode is don't-care) ---
+    # --- MHA (H2D + D2H, mode is don't-care) ---
     ("contiguous", "lfirst", False, "rank0_only",     [True, False]),
     ("contiguous", "bfirst", False, "rank0_only",     [True, False]),
     ("few_seg",    "lfirst", False, "rank0_only",     [True, False]),
@@ -681,6 +677,9 @@ def run_strategy_compare(args):
             print_memcpy2d_benefit(results, run_rows)
         print("=" * 100)
 
+    # -- Print recommendation summary across all sizes --------------------------
+    print_recommendation_summary(all_results, args, threshold)
+
 
 def print_memcpy2d_benefit(results, run_rows):
     """Focused block: for the two memcpy2d-affected paths (SEGMENT_SCATTER,
@@ -733,6 +732,73 @@ def print_memcpy2d_benefit(results, run_rows):
     print("=" * 100)
 
 
+def print_recommendation_summary(all_results, args, threshold):
+    """Print layout/mode recommendation per (size × model) based on auto timing.
+
+    For each size, computes the average auto timing across all (continuity × dir)
+    for each (model × mode × layout) group, then recommends the fastest.
+    MHA: recommend layout only (mode is don't-care).
+    MLA: recommend layout × mode.
+    """
+    mla_modes = ["rank0_only", "layer_parallel", "sharded"]
+    for size_name in args.sizes:
+        results = all_results[size_name]
+        num_layers, num_blocks, head_dim = SIZES[size_name]
+        print("\n" + "=" * 100)
+        print("  Recommendation for size={} ({}L / {}B / hd={})  memcpy2d={}".format(
+            size_name, num_layers, num_blocks, head_dim, args.memcpy2d))
+        print("=" * 100)
+
+        # Collect auto timings grouped by (model, mode, layout)
+        # Key: (is_mla, mode, layout) → list of auto times
+        groups = {}
+        for pattern, layout_key, is_mla, mode, dirs in PATH_FORMS:
+            if pattern == "scattered" and num_blocks <= threshold:
+                continue
+            mla_tag = "mla" if is_mla else "mha"
+            if is_mla:
+                form_name = "{}/{}/{}/{}".format(pattern, layout_key, mla_tag, mode)
+            else:
+                form_name = "{}/{}/{}".format(pattern, layout_key, mla_tag)
+            for is_h2d in dirs:
+                dir_name = "H2D" if is_h2d else "D2H"
+                cfgs = results.get((form_name, dir_name), {})
+                auto = cfgs.get("auto")
+                if auto is not None:
+                    key = (is_mla, mode, layout_key)
+                    groups.setdefault(key, []).append(auto)
+
+        # --- MHA: recommend layout ---
+        print("\n  MHA (recommend layout):")
+        mha_layouts = {}
+        for layout_key in ["lfirst", "bfirst"]:
+            vals = []
+            for (is_mla, mode, lk), times in groups.items():
+                if not is_mla and lk == layout_key:
+                    vals.extend(times)
+            if vals:
+                mha_layouts[layout_key] = sum(vals) / len(vals)
+        for layout_key, avg in sorted(mha_layouts.items(), key=lambda x: x[1]):
+            star = " *" if layout_key == min(mha_layouts, key=mha_layouts.get) else ""
+            print("    {:>8s}  avg={:.3f} ms{}".format(layout_key, avg, star))
+
+        # --- MLA: recommend layout × mode ---
+        print("\n  MLA (recommend layout × mode):")
+        mla_groups = {}
+        for (is_mla, mode, layout_key), times in groups.items():
+            if is_mla:
+                mla_groups[(layout_key, mode)] = sum(times) / len(times)
+        for (layout_key, mode), avg in sorted(mla_groups.items(), key=lambda x: x[1]):
+            star = " *" if (layout_key, mode) == min(mla_groups, key=mla_groups.get) else ""
+            print("    {:>8s} × {:>16s}  avg={:.3f} ms{}".format(
+                layout_key, mode, avg, star))
+
+    print("\n" + "=" * 100)
+    print("  Recommendation: pick the layout/mode with lowest avg auto timing.")
+    print("  '*' = best (lowest average across all continuity × direction).")
+    print("=" * 100)
+
+
 # -- Main --------------------------------------------------------------------
 
 def main():
@@ -747,11 +813,11 @@ def main():
                         choices=list(SIZES.keys()),
                         help="Data sizes to test (default: all)")
     parser.add_argument("--memcpy2d", choices=["off", "on"], default="off",
-                        help="When 'on', also time SEGMENT_SCATTER (path 2) and "
-                             "GATHER_DIRECT (path 4) with cudaMemcpy2DAsync "
-                             "(FLEXKV_ENABLE_MEMCPY2D=1) and print a benefit block. "
-                             "Off by default (these paths ignore it / P800 is ~200x "
-                             "slower).")
+                        help="When 'on', also time SEGMENT_SCATTER (path 2), "
+                             "GATHER_SCATTER (path 3), and GATHER_DIRECT (path 4) "
+                             "with cudaMemcpy2DAsync (FLEXKV_ENABLE_MEMCPY2D=1) "
+                             "and print a benefit block. "
+                             "Off by default (P800 is ~200x slower).")
     args = parser.parse_args()
 
     num_gpus = NUM_GPUS if args.num_gpus <= 0 else min(args.num_gpus, NUM_GPUS)
