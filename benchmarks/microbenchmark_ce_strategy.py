@@ -21,8 +21,15 @@ fastest is marked as 'recommended'. If choose_path's auto-pick matches the
 recommended, choose_path is optimal for that form; otherwise it should be
 investigated.
 
+memcpy2d (FLEXKV_ENABLE_MEMCPY2D=1) only affects path 2 SEGMENT_SCATTER and
+path 4 GATHER_DIRECT (D2H + H2D). Pass --memcpy2d on to additionally time those
+two paths with cudaMemcpy2DAsync and print a focused benefit block (speedup =
+off / on). Keep it off (default) on P800/Kunlunxin where memcpy2d is ~200x
+slower; it only helps on NVIDIA H20.
+
 Usage:
     python benchmarks/microbenchmark_ce_strategy.py --num-gpus 4 --iters 20
+    python benchmarks/microbenchmark_ce_strategy.py --num-gpus 4 --iters 20 --memcpy2d on
 """
 
 import argparse
@@ -133,7 +140,8 @@ def make_cpu_tensor_strat(cpu_layout, num_layers, total_blocks, head_dim,
 def make_tp_group(cpu_ptr, all_gpu, num_gpus, gpu_layout, num_layers,
                   ce_path_opt=True,
                   ce_segment_threshold=8, ce_force_path=-1,
-                  ce_is_mla=False, ce_is_blockfirst=False):
+                  ce_is_mla=False, ce_is_blockfirst=False,
+                  ce_enable_memcpy2d=False):
     """TPTransferThreadGroup with CE config passed per-construction."""
     gpu_ptrs = []
     for g in range(num_gpus):
@@ -153,7 +161,8 @@ def make_tp_group(cpu_ptr, all_gpu, num_gpus, gpu_layout, num_layers,
         ce_path_opt=ce_path_opt,
         ce_force_path=ce_force_path,
         ce_is_mla=ce_is_mla,
-        ce_is_blockfirst=ce_is_blockfirst)
+        ce_is_blockfirst=ce_is_blockfirst,
+        ce_enable_memcpy2d=ce_enable_memcpy2d)
 
 
 def fill_gpu(all_gpu, gpu_id, num_layers, num_blocks, head_dim):
@@ -248,6 +257,15 @@ STR_ABBR = {
     "SEGMENT_SCATTER": "S_SCT",
     "GATHER_SCATTER": "G_SCT",
     "GATHER_DIRECT": "G_DIR",
+}
+
+# Paths that consume FLEXKV_ENABLE_MEMCPY2D (cudaMemcpy2DAsync). Only these two
+# are affected by the flag; the others ignore it. Used by --memcpy2d on.
+AFFECTED_PATHS = {2, 4}  # SEGMENT_SCATTER, GATHER_DIRECT
+# Column abbreviation for the memcpy2d=1 variant of an affected path.
+STR_ABBR_2D = {
+    "SEGMENT_SCATTER": "S_SCT2",
+    "GATHER_DIRECT": "G_DIR2",
 }
 
 # -- Viable force paths per form ---------------------------------------------
@@ -362,6 +380,9 @@ def run_strategy_compare(args):
     print("  Threshold:  {}".format(threshold))
     print("  Iters:      {}".format(args.iters))
     print("  Strategies: {}".format(", ".join(s[1] for s in STRATEGIES)))
+    print("  memcpy2d:   {}".format(
+        "on — SEGMENT_SCATTER/GATHER_DIRECT also timed with cudaMemcpy2DAsync"
+        if args.memcpy2d == "on" else "off (default)"))
     print("=" * 100)
 
     # results[size][(form_name, dir_name)][strategy_name] = median_ms
@@ -463,29 +484,41 @@ def run_strategy_compare(args):
                 except Exception as e:
                     print("FAILED: {}".format(e))
 
-                # Run each viable strategy (skip auto-pick — redundant)
+                # Run each viable strategy (skip auto-pick — redundant).
+                # When --memcpy2d on, the two affected paths (SEGMENT_SCATTER,
+                # GATHER_DIRECT) are also timed with cudaMemcpy2DAsync so the
+                # benefit of FLEXKV_ENABLE_MEMCPY2D can be measured head-to-head.
+                # The off variant of the auto-picked path is already timed by
+                # the 'auto' run, so we skip that one to avoid redundancy.
                 for fp_id, fp_name in viable:
-                    if fp_name == auto_path:
-                        continue
-                    print("  {} ...".format(fp_name), end=" ", flush=True)
-                    try:
-                        tp = make_tp_group(
-                            cpu_kv.data_ptr(), all_gpu, num_gpus, gpu_layout,
-                            num_layers, ce_path_opt=True,
-                            ce_segment_threshold=threshold,
-                            ce_force_path=fp_id,
-                            ce_is_mla=is_mla,
-                            ce_is_blockfirst=(layout_key == "bfirst"))
-                        med = bench_one_dir(
-                            tp, ids, cpu_kv_sb, cpu_ly_sb, cpu_bl_sb, cpu_tp_sb,
-                            num_layers, is_h2d, num_gpus, args.iters, is_mla, mode,
-                            transfer_num_cta=cta)
-                        results[key][fp_name] = med
-                        print("{:.3f} ms".format(med))
-                        del tp
-                    except Exception as e:
-                        results[key][fp_name] = None
-                        print("FAILED: {}".format(e))
+                    m2d_settings = [False]
+                    if args.memcpy2d == "on" and fp_name in AFFECTED_PATHS:
+                        m2d_settings = [False, True]
+                    for m2d in m2d_settings:
+                        if m2d is False and fp_name == auto_path:
+                            continue
+                        tag = " [memcpy2d=1]" if m2d else ""
+                        label = fp_name + (" [2d]" if m2d else "")
+                        print("  {}{} ...".format(fp_name, tag), end=" ", flush=True)
+                        try:
+                            tp = make_tp_group(
+                                cpu_kv.data_ptr(), all_gpu, num_gpus, gpu_layout,
+                                num_layers, ce_path_opt=True,
+                                ce_segment_threshold=threshold,
+                                ce_force_path=fp_id,
+                                ce_is_mla=is_mla,
+                                ce_is_blockfirst=(layout_key == "bfirst"),
+                                ce_enable_memcpy2d=m2d)
+                            med = bench_one_dir(
+                                tp, ids, cpu_kv_sb, cpu_ly_sb, cpu_bl_sb, cpu_tp_sb,
+                                num_layers, is_h2d, num_gpus, args.iters, is_mla, mode,
+                                transfer_num_cta=cta)
+                            results[key][label] = med
+                            print("{:.3f} ms".format(med))
+                            del tp
+                        except Exception as e:
+                            results[key][label] = None
+                            print("FAILED: {}".format(e))
 
             del all_gpu, cpu_kv
 
@@ -516,6 +549,10 @@ def run_strategy_compare(args):
         hdr = "  {:>32s}  {:>4s}  {:>{w}s}".format("Form", "Dir", "base", w=col_w)
         for _, pname in STRATEGIES:
             hdr += "  {:>{w}s}".format(STR_ABBR[pname], w=col_w)
+        if args.memcpy2d == "on":
+            for _, pname in STRATEGIES:
+                if pname in AFFECTED_PATHS:
+                    hdr += "  {:>{w}s}".format(STR_ABBR_2D[pname], w=col_w)
         hdr += "  {:>{w}s}".format("auto", w=col_w)
         hdr += "  {:>16s}".format("recommended")
         hdr += " {:>2s}".format("=")
@@ -578,6 +615,16 @@ def run_strategy_compare(args):
                 is_fast = (v is not None and v == fastest_val)
                 line += "  {}".format(fmt_val(v, is_fast))
 
+            if args.memcpy2d == "on":
+                for _, pname in STRATEGIES:
+                    if pname in AFFECTED_PATHS:
+                        v = cfgs.get(pname + " [2d]")
+                        off_v = strategy_times.get(pname)
+                        # '*' here means the memcpy2d=1 variant is FASTER than
+                        # its off sibling for the same path (i.e. benefit).
+                        is_fast = (v is not None and off_v is not None and v < off_v)
+                        line += "  {}".format(fmt_val(v, is_fast))
+
             # auto column
             if auto is None:
                 line += "  {:>{w}s}".format("-", w=col_w)
@@ -600,7 +647,60 @@ def run_strategy_compare(args):
             else:
                 print("  => inspect rows marked '!' (auto not fastest).")
         print("  '*' = fastest strategy. '=' = auto matches recommended. '!' = auto NOT optimal.")
+        if args.memcpy2d == "on":
+            print_memcpy2d_benefit(results, run_rows)
         print("=" * 100)
+
+
+def print_memcpy2d_benefit(results, run_rows):
+    """Focused block: for the two memcpy2d-affected paths (SEGMENT_SCATTER,
+    GATHER_DIRECT), show off vs on (FLEXKV_ENABLE_MEMCPY2D=1) timing and the
+    speedup (off / on). Surfaces whether memcpy2d has any benefit per form.
+    """
+    print("\n" + "=" * 100)
+    print("  memcpy2d benefit (FLEXKV_ENABLE_MEMCPY2D=1) — affected paths only")
+    print("=" * 100)
+    print("  speedup = off / on  (>1: memcpy2d FASTER, <1: SLOWER)")
+    affected_order = [p for p in ["SEGMENT_SCATTER", "GATHER_DIRECT"]
+                      if p in AFFECTED_PATHS]
+    hdr = "  {:>32s}  {:>4s}".format("Form", "Dir")
+    for pname in affected_order:
+        hdr += "  {:>11s}  {:>11s}  {:>7s}".format(
+            STR_ABBR[pname] + "(off)", STR_ABBR_2D[pname], "speed")
+    print(hdr)
+    print("  " + "-" * (len(hdr) - 2))
+    any_row = False
+    for form_name, dir_name, viable in run_rows:
+        cfgs = results.get((form_name, dir_name), {})
+        auto_path = cfgs.get("auto_path", "")
+        viable_names = {pn for _, pn in viable}
+        if not any(p in viable_names for p in affected_order):
+            continue
+        any_row = True
+        line = "  {:>32s}  {:>4s}".format(form_name, dir_name)
+        for pname in affected_order:
+            if pname not in viable_names:
+                line += "  {:>11s}  {:>11s}  {:>7s}".format("-", "-", "-")
+                continue
+            off_v = cfgs.get(pname)
+            if off_v is None and auto_path == pname:
+                off_v = cfgs.get("auto")
+            on_v = cfgs.get(pname + " [2d]")
+            if off_v is not None and on_v is not None and on_v > 0:
+                sp = off_v / on_v
+                sp_str = "{:.2f}x".format(sp)
+            else:
+                sp_str = "-"
+            line += "  {:>11.3f}  {:>11.3f}  {:>7s}".format(
+                off_v if off_v is not None else 0.0,
+                on_v if on_v is not None else 0.0, sp_str)
+        print(line)
+    if not any_row:
+        print("  (no affected-path forms in this size)")
+    print("  " + "-" * (len(hdr) - 2))
+    print("  P800/Kunlunxin: memcpy2d=1 expected ~200x SLOWER (keep off).")
+    print("  NVIDIA H20: memcpy2d=1 ~58ms (fast). Use only there.")
+    print("=" * 100)
 
 
 # -- Main --------------------------------------------------------------------
@@ -616,6 +716,12 @@ def main():
     parser.add_argument("--sizes", nargs="+", default=list(SIZES.keys()),
                         choices=list(SIZES.keys()),
                         help="Data sizes to test (default: all)")
+    parser.add_argument("--memcpy2d", choices=["off", "on"], default="off",
+                        help="When 'on', also time SEGMENT_SCATTER (path 2) and "
+                             "GATHER_DIRECT (path 4) with cudaMemcpy2DAsync "
+                             "(FLEXKV_ENABLE_MEMCPY2D=1) and print a benefit block. "
+                             "Off by default (these paths ignore it / P800 is ~200x "
+                             "slower).")
     args = parser.parse_args()
 
     num_gpus = NUM_GPUS if args.num_gpus <= 0 else min(args.num_gpus, NUM_GPUS)
