@@ -39,6 +39,7 @@ except ImportError:
 
 try:
     from flexkv.c_ext import TPTransferThreadGroup
+    from flexkv.common.config import GLOBAL_CONFIG_FROM_ENV
     from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
     FLEXKV_AVAILABLE = True
 except ImportError as e:
@@ -149,7 +150,13 @@ def make_cpu_tensor(cpu_layout, num_layers, total_blocks, head_dim, is_mla, num_
 
 def make_tp_group(cpu_ptr, all_gpu, num_gpus, gpu_layout, num_layers,
                   ce_path_opt=True, ce_segment_threshold=8,
-                  ce_is_mla=False, ce_is_blockfirst=False):
+                  ce_is_mla=False, ce_is_blockfirst=False,
+                  ce_enable_memcpy2d=None):
+    # Default to the global CE memcpy2d setting (FLEXKV_ENABLE_CE_MEMCPY2D,
+    # default ON since the env rename). Pass explicitly to override, e.g.
+    # ce_enable_memcpy2d=False to match the pre-rename default-off behavior.
+    if ce_enable_memcpy2d is None:
+        ce_enable_memcpy2d = GLOBAL_CONFIG_FROM_ENV.enable_ce_memcpy2d
     gpu_ptrs = []
     for g in range(num_gpus):
         for l in range(num_layers):
@@ -167,7 +174,8 @@ def make_tp_group(cpu_ptr, all_gpu, num_gpus, gpu_layout, num_layers,
         ce_segment_threshold=ce_segment_threshold,
         ce_path_opt=ce_path_opt,
         ce_is_mla=ce_is_mla,
-        ce_is_blockfirst=ce_is_blockfirst)
+        ce_is_blockfirst=ce_is_blockfirst,
+        ce_enable_memcpy2d=ce_enable_memcpy2d)
 
 
 def fill_gpu(all_gpu, gpu_id, num_layers, num_blocks, head_dim):

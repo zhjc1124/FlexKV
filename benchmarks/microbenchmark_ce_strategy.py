@@ -370,7 +370,13 @@ def python_choose_path(pattern, layout_key, mode, is_h2d, threshold,
 
     # GATHER_DIRECT: BF + !cpu_phys_contig + GPU physically contiguous
     # (non-sharded). Sharded D2H breaks gpu_phys_contig -> GATHER_SCATTER.
+    # Exception: bfirst + MLA + D2H + !full_block (layer_parallel) ->
+    # SEGMENT_SCATTER is 30%-8.9x faster than GATHER_DIRECT. Mirrors
+    # ce_transfer.cu:120-128 (is_full_block = mode in (rank0_only, all_write);
+    # !is_host_to_device = D2H).
     if is_blockfirst and not cpu_phys_contig and gpu_phys_contig:
+        if not is_h2d and is_mla and mode not in ("rank0_only", "all_write"):
+            return "SEGMENT_SCATTER"
         return "GATHER_DIRECT"
     if cpu_phys_contig and gpu_phys_contig and num_segments == 1:
         return "CONTIG_DIRECT"
