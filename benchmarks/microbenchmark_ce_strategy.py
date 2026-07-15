@@ -797,7 +797,10 @@ def print_recommendation_summary(all_results, args, threshold):
                 size_name, num_layers, num_blocks, head_dim, memcpy_label))
             print("=" * 100)
 
-            # Group by (is_mla, mode, layout) → list of best timings
+            # Group by (is_mla, mode, layout) → list of best timings.
+            # Sharded H2D == rank0_only H2D (C++ uses cpu_startoff=0 for both),
+            # so use rank0_only's H2D data to fill in sharded's H2D for fair
+            # comparison (all modes get 6 data points: 3 patterns × 2 dirs).
             groups = {}
             for pattern, layout_key, is_mla, mode, dirs in PATH_FORMS:
                 if pattern == "scattered" and num_blocks <= threshold:
@@ -810,6 +813,10 @@ def print_recommendation_summary(all_results, args, threshold):
                 for is_h2d in dirs:
                     dir_name = "H2D" if is_h2d else "D2H"
                     vals = best_per_formdir.get((form_name, dir_name))
+                    if vals is None and is_mla and mode == "sharded" and is_h2d:
+                        # Sharded H2D: use rank0_only H2D (same C++ path)
+                        h2d_form = "{}/{}/{}/{}".format(pattern, layout_key, mla_tag, "rank0_only")
+                        vals = best_per_formdir.get((h2d_form, dir_name))
                     if vals is not None:
                         v = vals[1] if use_on else vals[0]
                         if v is not None:
