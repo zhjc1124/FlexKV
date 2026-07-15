@@ -881,7 +881,7 @@ void ce_transfer_gather_scatter(
         } else {
           at::Tensor src_view = at::from_blob(
               gpu_layer_kv_base, {max_gpu_id + 1, elems_per_block},
-              {gpu_block_stride_bytes / sizeof(int64_t), 1}, i64_cuda);
+              {(int64_t)(gpu_block_stride_bytes / sizeof(int64_t)), 1}, i64_cuda);
           at::index_select_out(dev_buf[0], src_view, 0, gpu_ids_cuda);
           d2h_src = reinterpret_cast<int64_t *>(dev_buf[0].data_ptr());
           dev_pitch = (size_t)chunk_size_in_bytes;
@@ -929,7 +929,7 @@ void ce_transfer_gather_scatter(
         if (!gpu_contig) {
           at::Tensor dst_view = at::from_blob(
               gpu_layer_kv_base, {max_gpu_id + 1, elems_per_block},
-              {gpu_block_stride_bytes / sizeof(int64_t), 1}, i64_cuda);
+              {(int64_t)(gpu_block_stride_bytes / sizeof(int64_t)), 1}, i64_cuda);
           dst_view.index_copy_(0, dst_ids_cuda, dev_buf[0]);
         }
       }
