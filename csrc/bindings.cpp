@@ -58,7 +58,8 @@ void transfer_kv_blocks_binding(
     bool sync = true,
     bool ce_path_opt = false,
     int ce_segment_threshold = 8, int ce_force_path = -1,
-    bool ce_enable_memcpy2d = false, bool is_blockfirst = false) {
+    bool ce_enable_memcpy2d = false, bool is_blockfirst = false,
+    int ce_gather_threads = 4, bool ce_gather_nt = true) {
   int num_blocks = gpu_block_id_tensor.numel();
 
   int64_t *gpu_block_ids =
@@ -92,6 +93,8 @@ void transfer_kv_blocks_binding(
   ce_config.enable_memcpy2d = ce_enable_memcpy2d;
   ce_config.is_blockfirst = is_blockfirst;
   ce_config.is_mla = is_mla;
+  ce_config.gather_threads = ce_gather_threads;
+  ce_config.gather_nt = ce_gather_nt;
 
   // Create GTensorHandler
   flexkv::GTensorHandler handler(
@@ -435,7 +438,9 @@ PYBIND11_MODULE(c_ext, m) {
         py::arg("ce_path_opt") = false,
         py::arg("ce_segment_threshold") = 8, py::arg("ce_force_path") = -1,
         py::arg("ce_enable_memcpy2d") = false,
-        py::arg("is_blockfirst") = false);
+        py::arg("is_blockfirst") = false,
+        py::arg("ce_gather_threads") = 4,
+        py::arg("ce_gather_nt") = true);
   m.def("transfer_kv_blocks_ssd", &transfer_kv_blocks_ssd_binding,
         "Transfer KV blocks between SSD and CPU memory", py::arg("ioctx"),
         py::arg("cpu_layer_id_list"), py::arg("cpu_tensor_ptr"),
@@ -469,7 +474,9 @@ PYBIND11_MODULE(c_ext, m) {
                        int ce_force_path,
                        bool ce_enable_memcpy2d,
                        bool is_blockfirst,
-                       bool is_mla) {
+                       bool is_mla,
+                       int ce_gather_threads,
+                       bool ce_gather_nt) {
             flexkv::CETransferConfig cfg;
             cfg.segment_threshold = ce_segment_threshold;
             cfg.path_opt_enabled = ce_path_opt;
@@ -477,6 +484,8 @@ PYBIND11_MODULE(c_ext, m) {
             cfg.enable_memcpy2d = ce_enable_memcpy2d;
             cfg.is_blockfirst = is_blockfirst;
             cfg.is_mla = is_mla;
+            cfg.gather_threads = ce_gather_threads;
+            cfg.gather_nt = ce_gather_nt;
              return new flexkv::LayerwiseTransferGroup(
                  num_gpus, gpu_blocks, cpu_blocks, ssd_files, num_layers,
                  gpu_kv_strides_tensor, gpu_block_strides_tensor,
@@ -507,7 +516,9 @@ PYBIND11_MODULE(c_ext, m) {
            py::arg("ce_force_path") = -1,
            py::arg("ce_enable_memcpy2d") = false,
            py::arg("is_blockfirst") = false,
-           py::arg("is_mla") = false)
+           py::arg("is_mla") = false,
+           py::arg("ce_gather_threads") = 4,
+           py::arg("ce_gather_nt") = true)
       .def("layerwise_transfer",
            &flexkv::LayerwiseTransferGroup::layerwise_transfer,
            py::arg("ssd_block_ids"), py::arg("cpu_block_ids_d2h"),
@@ -597,7 +608,9 @@ PYBIND11_MODULE(c_ext, m) {
                        int ce_force_path,
                        bool ce_enable_memcpy2d,
                        bool is_blockfirst,
-                       bool is_mla) {
+                       bool is_mla,
+                       int ce_gather_threads,
+                       bool ce_gather_nt) {
             flexkv::CETransferConfig cfg;
             cfg.segment_threshold = ce_segment_threshold;
             cfg.path_opt_enabled = ce_path_opt;
@@ -605,6 +618,8 @@ PYBIND11_MODULE(c_ext, m) {
             cfg.enable_memcpy2d = ce_enable_memcpy2d;
             cfg.is_blockfirst = is_blockfirst;
             cfg.is_mla = is_mla;
+            cfg.gather_threads = ce_gather_threads;
+            cfg.gather_nt = ce_gather_nt;
              return new flexkv::TPTransferThreadGroup(
                  num_gpus, gpu_block_ptrs_flat, num_tensors_per_gpu,
                  cpu_blocks_ptr, num_layers, gpu_kv_strides_in_bytes,
@@ -627,7 +642,9 @@ PYBIND11_MODULE(c_ext, m) {
            py::arg("ce_force_path") = -1,
            py::arg("ce_enable_memcpy2d") = false,
            py::arg("is_blockfirst") = false,
-           py::arg("is_mla") = false)
+           py::arg("is_mla") = false,
+           py::arg("ce_gather_threads") = 4,
+           py::arg("ce_gather_nt") = true)
       .def("tp_group_transfer",
            &flexkv::TPTransferThreadGroup::tp_group_transfer,
            py::arg("gpu_block_id_tensor"), py::arg("cpu_block_id_tensor"),
