@@ -234,5 +234,16 @@ private:
 #define FLEXKV_BLOCKS_EVICTED(num_blocks) \
     flexkv::monitoring::MetricsManager::Instance().IncrementBlocksEvicted(num_blocks)
 
+// SSD transfer byte accounting (no-op on this branch).
+// 52e416d introduced FLEXKV_CPU_SSD_TRANSFER usages in transfer_ssd.cpp /
+// packed_ssd.cpp, but its original definition (RecordTransfer + TransferType::CPU_SSD)
+// lived in that commit's parent metrics_manager.h, which our b70205e2 base does not
+// carry. This branch's MetricsManager only tracks cache ops and builds with
+// FLEXKV_ENABLE_METRICS=0, so record as a no-op to keep the extension build green.
+#ifndef FLEXKV_CPU_SSD_TRANSFER
+#define FLEXKV_CPU_SSD_TRANSFER(is_read, bytes) \
+    do { (void)(is_read); (void)(bytes); } while (0)
+#endif
+
 }  // namespace monitoring
 }  // namespace flexkv
