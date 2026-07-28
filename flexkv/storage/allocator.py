@@ -102,12 +102,29 @@ class CPUAllocator(BaseStorageAllocator):
         total_size = layout.get_total_elements()
         # although the kv layout may have multiple dimensions, we only have one-dim CPU tensor
         flexkv_logger.info(f"CPU allocate total_size: {dtype.itemsize * total_size/1024/1024/1024} GB")
+        # Baseline buffer; THP-upgraded below on success.
         physical_tensor = torch.empty(
                             size=(total_size,),
                             dtype=dtype,
                             device="cpu",
                             pin_memory=False,
                         )
+        num_bytes = total_size * dtype.itemsize
+        pin_memory = kwargs.get("pin_memory", False)
+        thp = _alloc_thp_staging_buffer(num_bytes, pin_memory)
+        if thp is not None:
+            ptr, aligned_bytes, registered = thp
+            physical_tensor = torch.frombuffer(
+                (ctypes.c_char * num_bytes).from_address(ptr),
+                dtype=dtype,
+            ).reshape(total_size)
+            data_ptr = physical_tensor.data_ptr()
+            finalizer = weakref.finalize(
+                physical_tensor, _cleanup_cpu_mapping,
+                int(ptr), aligned_bytes, registered, data_ptr,
+            )
+            _live_cpu_mappings[data_ptr] = finalizer
+
         return StorageHandle(
             handle_type=AccessHandleType.TENSOR,
             data=physical_tensor,
@@ -117,7 +134,14 @@ class CPUAllocator(BaseStorageAllocator):
 
     @classmethod
     def free(cls, accessible_handle: StorageHandle) -> None:
-        pass
+        if accessible_handle.handle_type != AccessHandleType.TENSOR:
+            return
+        tensor = accessible_handle.data
+        if not isinstance(tensor, torch.Tensor):
+            return
+        finalizer = _live_cpu_mappings.pop(tensor.data_ptr(), None)
+        if finalizer is not None:
+            finalizer()
 
     @classmethod
     def from_raw_data(cls,
@@ -132,6 +156,59 @@ class CPUAllocator(BaseStorageAllocator):
             dtype=dtype,
         )
 
+def _alloc_thp_staging_buffer(num_bytes: int, pin_memory: bool) -> "tuple[int, int, bool] | None":
+    """Best-effort THP staging buffer: mmap(MAP_ANONYMOUS) + MADV_HUGEPAGE, optional cudaHostRegister.
+
+    Returns (ptr, aligned_bytes, registered); None only if mmap fails (caller falls back to torch.empty).
+    """
+    aligned_bytes = _align_to_page(num_bytes, DEFAULT_HUGE_PAGE_SIZE)
+    ctypes.set_errno(0)
+    ptr = _libc.mmap(
+        None, aligned_bytes,
+        _PROT_READ | _PROT_WRITE,
+        _MAP_PRIVATE | _MAP_ANONYMOUS,
+        -1, 0,
+    )
+    if ptr is None or ptr == _MAP_FAILED:
+        return None
+
+    if _libc.madvise(ptr, aligned_bytes, _MADV_HUGEPAGE) != 0:
+        flexkv_logger.warning(
+            f"CPUAllocator THP madvise failed "
+            f"(ptr={ptr}, size={aligned_bytes}): "
+            f"{os.strerror(ctypes.get_errno())}"
+        )
+    else:
+        flexkv_logger.info(
+            f"CPUAllocator THP madvise OK (ptr={ptr}, "
+            f"size={aligned_bytes / 1024 / 1024 / 1024:.4f} GB)"
+        )
+
+    registered = False
+    if pin_memory:
+        try:
+            err = torch.cuda.cudart().cudaHostRegister(ptr, aligned_bytes, 0)
+            if isinstance(err, tuple):
+                err = err[0]
+            if err != 0:
+                flexkv_logger.warning(
+                    f"CPUAllocator cudaHostRegister failed (err={err}), "
+                    f"continuing without pinning"
+                )
+            else:
+                registered = True
+                flexkv_logger.info(
+                    f"CPUAllocator cudaHostRegister OK (ptr={ptr}, "
+                    f"size={aligned_bytes / 1024 / 1024 / 1024:.4f} GB)"
+                )
+        except Exception as e:
+            flexkv_logger.warning(
+                f"CPUAllocator cudaHostRegister exception: {e}"
+            )
+
+    return int(ptr), aligned_bytes, registered
+
+
 # ---------------------------------------------------------------------------
 # HugePage helpers (standalone, reusable outside of BaseStorageAllocator)
 # ---------------------------------------------------------------------------
@@ -142,6 +219,7 @@ _MAP_SHARED = 0x01
 _MAP_PRIVATE = 0x02
 _MAP_ANONYMOUS = 0x20
 _MAP_HUGETLB = 0x40000
+_MADV_HUGEPAGE = 14  # linux madvise advice for THP
 _MAP_HUGE_SHIFT = 26
 _PROT_READ = 0x1
 _PROT_WRITE = 0x2
@@ -160,6 +238,8 @@ _libc.mmap.argtypes = [
 ]
 _libc.munmap.restype = ctypes.c_int
 _libc.munmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+_libc.madvise.restype = ctypes.c_int
+_libc.madvise.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
 _libc.ftruncate.restype = ctypes.c_int
 _libc.ftruncate.argtypes = [ctypes.c_int, ctypes.c_long]
 _libc.close.restype = ctypes.c_int
@@ -194,6 +274,20 @@ class _HugePageMapping:
 
 
 _live_hugepage_mappings: "Dict[int, _HugePageMapping]" = {}
+
+# CPUAllocator mmap regions: data_ptr -> finalizer
+_live_cpu_mappings: "Dict[int, Any]" = {}
+
+
+def _cleanup_cpu_mapping(addr: int, aligned: int, registered: bool,
+                         data_ptr: int) -> None:
+    if registered:
+        try:
+            torch.cuda.cudart().cudaHostUnregister(addr)
+        except Exception as e:  # noqa: BLE001
+            flexkv_logger.warning(f"CPUAllocator cudaHostUnregister failed: {e}")
+    _munmap_huge(addr, aligned)
+    _live_cpu_mappings.pop(data_ptr, None)
 
 
 @dataclass(frozen=True)
