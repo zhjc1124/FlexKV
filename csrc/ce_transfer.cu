@@ -208,7 +208,7 @@ void ce_transfer_per_block(
                                           : cudaMemcpyDeviceToHost;
   // Batch coalesce: collect per-block copies, submit once (CUDA 12+).
   std::vector<void *> b_dst;
-  std::vector<const void *> b_src;
+  std::vector<void *> b_src;
   std::vector<size_t> b_cnt;
 #if CUDART_VERSION >= 12000
   if (ce_config.enable_memcpy_batch) {
@@ -251,8 +251,15 @@ void ce_transfer_per_block(
 #if CUDART_VERSION >= 12000
   // CUDA<12: falls through to per-call path above (no batch symbol).
   if (ce_config.enable_memcpy_batch && !b_dst.empty()) {
-    cudaMemcpyBatchAsync(b_dst.data(), b_src.data(), b_cnt.data(), kind,
-                         (unsigned long)b_dst.size(), stream);
+    cudaMemcpyAttributes attr{};
+    attr.srcAccessOrder = cudaMemcpySrcAccessOrderAny;
+    attr.flags = cudaMemcpyDefault;
+    cudaMemcpyAttributes attrs[1] = {attr};
+    size_t attrsIdxs[1] = {0};
+    size_t failIdx = 0;
+    cudaMemcpyBatchAsync(b_dst.data(), b_src.data(), b_cnt.data(),
+                         (size_t)b_dst.size(), attrs, attrsIdxs, 1, &failIdx,
+                         stream);
   }
 #endif
 }
@@ -277,7 +284,7 @@ void ce_transfer_contig_direct(
                                           : cudaMemcpyDeviceToHost;
   // Batch coalesce: collect per-(layer,kv) copies, submit once (CUDA 12+).
   std::vector<void *> b_dst;
-  std::vector<const void *> b_src;
+  std::vector<void *> b_src;
   std::vector<size_t> b_cnt;
 #if CUDART_VERSION >= 12000
   if (ce_config.enable_memcpy_batch) {
@@ -317,8 +324,15 @@ void ce_transfer_contig_direct(
   }
 #if CUDART_VERSION >= 12000
   if (ce_config.enable_memcpy_batch && !b_dst.empty()) {
-    cudaMemcpyBatchAsync(b_dst.data(), b_src.data(), b_cnt.data(), kind,
-                         (unsigned long)b_dst.size(), stream);
+    cudaMemcpyAttributes attr{};
+    attr.srcAccessOrder = cudaMemcpySrcAccessOrderAny;
+    attr.flags = cudaMemcpyDefault;
+    cudaMemcpyAttributes attrs[1] = {attr};
+    size_t attrsIdxs[1] = {0};
+    size_t failIdx = 0;
+    cudaMemcpyBatchAsync(b_dst.data(), b_src.data(), b_cnt.data(),
+                         (size_t)b_dst.size(), attrs, attrsIdxs, 1, &failIdx,
+                         stream);
   }
 #endif
 }
@@ -341,7 +355,7 @@ void ce_transfer_segment_direct(
                                           : cudaMemcpyDeviceToHost;
   // Batch coalesce: collect per-segment copies, submit once (CUDA 12+).
   std::vector<void *> b_dst;
-  std::vector<const void *> b_src;
+  std::vector<void *> b_src;
   std::vector<size_t> b_cnt;
 #if CUDART_VERSION >= 12000
   if (ce_config.enable_memcpy_batch) {
@@ -386,8 +400,15 @@ void ce_transfer_segment_direct(
   }
 #if CUDART_VERSION >= 12000
   if (ce_config.enable_memcpy_batch && !b_dst.empty()) {
-    cudaMemcpyBatchAsync(b_dst.data(), b_src.data(), b_cnt.data(), kind,
-                         (unsigned long)b_dst.size(), stream);
+    cudaMemcpyAttributes attr{};
+    attr.srcAccessOrder = cudaMemcpySrcAccessOrderAny;
+    attr.flags = cudaMemcpyDefault;
+    cudaMemcpyAttributes attrs[1] = {attr};
+    size_t attrsIdxs[1] = {0};
+    size_t failIdx = 0;
+    cudaMemcpyBatchAsync(b_dst.data(), b_src.data(), b_cnt.data(),
+                         (size_t)b_dst.size(), attrs, attrsIdxs, 1, &failIdx,
+                         stream);
   }
 #endif
 }
@@ -747,7 +768,7 @@ void ce_transfer_segment_scatter(
     const int64_t total_iters = (int64_t)num_layers * kv_dim;
     // Batch coalesce: collect 2D params, submit once (CUDA 12+).
     std::vector<void *> b_dst;
-    std::vector<const void *> b_src;
+    std::vector<void *> b_src;
     std::vector<size_t> b_cnt;
 #if CUDART_VERSION >= 12000
     if (ce_config.enable_memcpy_batch) {
@@ -802,8 +823,15 @@ void ce_transfer_segment_scatter(
 #if CUDART_VERSION >= 12000
     // CUDA<12: falls through to per-call path above (no batch symbol).
     if (ce_config.enable_memcpy_batch && !b_dst.empty()) {
-      cudaMemcpyBatchAsync(b_dst.data(), b_src.data(), b_cnt.data(), kind,
-                           (unsigned long)b_dst.size(), stream);
+      cudaMemcpyAttributes attr{};
+      attr.srcAccessOrder = cudaMemcpySrcAccessOrderAny;
+      attr.flags = cudaMemcpyDefault;
+      cudaMemcpyAttributes attrs[1] = {attr};
+      size_t attrsIdxs[1] = {0};
+      size_t failIdx = 0;
+      cudaMemcpyBatchAsync(b_dst.data(), b_src.data(), b_cnt.data(),
+                           (size_t)b_dst.size(), attrs, attrsIdxs, 1, &failIdx,
+                           stream);
     }
 #endif
     cudaStreamSynchronize(stream);
@@ -1040,7 +1068,7 @@ void ce_transfer_gather_scatter(
                                             : cudaMemcpyDeviceToHost;
     // Batch coalesce: collect 2D params per iter, submit once (CUDA 12+).
     std::vector<void *> b_dst;
-    std::vector<const void *> b_src;
+    std::vector<void *> b_src;
     std::vector<size_t> b_cnt;
 #if CUDART_VERSION >= 12000
     if (ce_config.enable_memcpy_batch) {
@@ -1114,8 +1142,15 @@ void ce_transfer_gather_scatter(
         }
 #if CUDART_VERSION >= 12000
         if (ce_config.enable_memcpy_batch && !b_dst.empty()) {
-          cudaMemcpyBatchAsync(b_dst.data(), b_src.data(), b_cnt.data(), kind,
-                               (unsigned long)b_dst.size(), stream);
+          cudaMemcpyAttributes attr{};
+          attr.srcAccessOrder = cudaMemcpySrcAccessOrderAny;
+          attr.flags = cudaMemcpyDefault;
+          cudaMemcpyAttributes attrs[1] = {attr};
+          size_t attrsIdxs[1] = {0};
+          size_t failIdx = 0;
+          cudaMemcpyBatchAsync(b_dst.data(), b_src.data(), b_cnt.data(),
+                               (size_t)b_dst.size(), attrs, attrsIdxs, 1, &failIdx,
+                               stream);
         }
 #endif
         cudaStreamSynchronize(stream);
@@ -1157,8 +1192,15 @@ void ce_transfer_gather_scatter(
         }
 #if CUDART_VERSION >= 12000
         if (ce_config.enable_memcpy_batch && !b_dst.empty()) {
-          cudaMemcpyBatchAsync(b_dst.data(), b_src.data(), b_cnt.data(), kind,
-                               (unsigned long)b_dst.size(), stream);
+          cudaMemcpyAttributes attr{};
+          attr.srcAccessOrder = cudaMemcpySrcAccessOrderAny;
+          attr.flags = cudaMemcpyDefault;
+          cudaMemcpyAttributes attrs[1] = {attr};
+          size_t attrsIdxs[1] = {0};
+          size_t failIdx = 0;
+          cudaMemcpyBatchAsync(b_dst.data(), b_src.data(), b_cnt.data(),
+                               (size_t)b_dst.size(), attrs, attrsIdxs, 1, &failIdx,
+                               stream);
         }
 #endif
         cudaStreamSynchronize(stream);
@@ -1445,7 +1487,7 @@ void ce_transfer_gather_direct(
         size_t spitch = (size_t)cpu_block_stride_int64 * sizeof(int64_t);
         // Batch coalesce: collect 2D params, submit once (CUDA 12+).
         std::vector<void *> b_dst;
-        std::vector<const void *> b_src;
+        std::vector<void *> b_src;
         std::vector<size_t> b_cnt;
 #if CUDART_VERSION >= 12000
         if (ce_config.enable_memcpy_batch) {
@@ -1481,9 +1523,15 @@ void ce_transfer_gather_direct(
 #if CUDART_VERSION >= 12000
         // CUDA<12: falls through to per-call path above (no batch symbol).
         if (ce_config.enable_memcpy_batch && !b_dst.empty()) {
+          cudaMemcpyAttributes attr{};
+          attr.srcAccessOrder = cudaMemcpySrcAccessOrderAny;
+          attr.flags = cudaMemcpyDefault;
+          cudaMemcpyAttributes attrs[1] = {attr};
+          size_t attrsIdxs[1] = {0};
+          size_t failIdx = 0;
           cudaMemcpyBatchAsync(b_dst.data(), b_src.data(), b_cnt.data(),
-                               cudaMemcpyDeviceToHost,
-                               (unsigned long)b_dst.size(), stream);
+                               (size_t)b_dst.size(), attrs, attrsIdxs, 1, &failIdx,
+                               stream);
         }
 #endif
       } else {
@@ -1529,7 +1577,7 @@ void ce_transfer_gather_direct(
         size_t spitch = (size_t)cpu_block_stride_int64 * sizeof(int64_t);
         // Batch coalesce: collect 2D params, submit once (CUDA 12+).
         std::vector<void *> b_dst;
-        std::vector<const void *> b_src;
+        std::vector<void *> b_src;
         std::vector<size_t> b_cnt;
 #if CUDART_VERSION >= 12000
         if (ce_config.enable_memcpy_batch) {
@@ -1565,9 +1613,15 @@ void ce_transfer_gather_direct(
 #if CUDART_VERSION >= 12000
         // CUDA<12: falls through to per-call path above (no batch symbol).
         if (ce_config.enable_memcpy_batch && !b_dst.empty()) {
+          cudaMemcpyAttributes attr{};
+          attr.srcAccessOrder = cudaMemcpySrcAccessOrderAny;
+          attr.flags = cudaMemcpyDefault;
+          cudaMemcpyAttributes attrs[1] = {attr};
+          size_t attrsIdxs[1] = {0};
+          size_t failIdx = 0;
           cudaMemcpyBatchAsync(b_dst.data(), b_src.data(), b_cnt.data(),
-                               cudaMemcpyHostToDevice,
-                               (unsigned long)b_dst.size(), stream);
+                               (size_t)b_dst.size(), attrs, attrsIdxs, 1, &failIdx,
+                               stream);
         }
 #endif
       } else {
@@ -1625,7 +1679,7 @@ void ce_transfer_gather_direct(
   template void FN<BackendType::BK>(                                         \
       int, int, int, int, int64_t *, GTensorHandler, int64_t,                \
       int64_t *, int64_t *, int64_t, int64_t, int64_t, int64_t, int64_t,     \
-      cudaStream_t, bool);
+      cudaStream_t, bool, const CETransferConfig &);
 
 #define FLEXKV_INST_STG(FN, BK)                                              \
   template void FN<BackendType::BK>(                                         \
