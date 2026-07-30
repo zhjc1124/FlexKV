@@ -253,13 +253,29 @@ void ce_transfer_per_block(
   if (ce_config.enable_memcpy_batch && !b_dst.empty()) {
     cudaMemcpyAttributes attr{};
     attr.srcAccessOrder = cudaMemcpySrcAccessOrderAny;
+    if (is_host_to_device) {
+      attr.srcLocHint.type = cudaMemLocationTypeHost;
+      attr.dstLocHint.type = cudaMemLocationTypeDevice;
+    } else {
+      attr.srcLocHint.type = cudaMemLocationTypeDevice;
+      attr.dstLocHint.type = cudaMemLocationTypeHost;
+    }
+    attr.srcLocHint.id = 0;
+    attr.dstLocHint.id = 0;
     attr.flags = cudaMemcpyDefault;
     cudaMemcpyAttributes attrs[1] = {attr};
     size_t attrsIdxs[1] = {0};
     size_t failIdx = 0;
-    cudaMemcpyBatchAsync(b_dst.data(), b_src.data(), b_cnt.data(),
+    cudaError_t e = cudaMemcpyBatchAsync(b_dst.data(), b_src.data(), b_cnt.data(),
                          (size_t)b_dst.size(), attrs, attrsIdxs, 1, &failIdx,
                          stream);
+    if (e != cudaSuccess) {
+      // Fallback to per-element copies so correctness is preserved even if
+      // the batch API is unavailable / rejects the attributes.
+      for (size_t k = 0; k < b_dst.size(); ++k)
+        cudaMemcpyAsync(b_dst[k], b_src[k], b_cnt[k], cudaMemcpyDefault, stream);
+    }
+    cudaStreamSynchronize(stream);
   }
 #endif
 }
@@ -326,13 +342,29 @@ void ce_transfer_contig_direct(
   if (ce_config.enable_memcpy_batch && !b_dst.empty()) {
     cudaMemcpyAttributes attr{};
     attr.srcAccessOrder = cudaMemcpySrcAccessOrderAny;
+    if (is_host_to_device) {
+      attr.srcLocHint.type = cudaMemLocationTypeHost;
+      attr.dstLocHint.type = cudaMemLocationTypeDevice;
+    } else {
+      attr.srcLocHint.type = cudaMemLocationTypeDevice;
+      attr.dstLocHint.type = cudaMemLocationTypeHost;
+    }
+    attr.srcLocHint.id = 0;
+    attr.dstLocHint.id = 0;
     attr.flags = cudaMemcpyDefault;
     cudaMemcpyAttributes attrs[1] = {attr};
     size_t attrsIdxs[1] = {0};
     size_t failIdx = 0;
-    cudaMemcpyBatchAsync(b_dst.data(), b_src.data(), b_cnt.data(),
+    cudaError_t e = cudaMemcpyBatchAsync(b_dst.data(), b_src.data(), b_cnt.data(),
                          (size_t)b_dst.size(), attrs, attrsIdxs, 1, &failIdx,
                          stream);
+    if (e != cudaSuccess) {
+      // Fallback to per-element copies so correctness is preserved even if
+      // the batch API is unavailable / rejects the attributes.
+      for (size_t k = 0; k < b_dst.size(); ++k)
+        cudaMemcpyAsync(b_dst[k], b_src[k], b_cnt[k], cudaMemcpyDefault, stream);
+    }
+    cudaStreamSynchronize(stream);
   }
 #endif
 }
@@ -402,13 +434,29 @@ void ce_transfer_segment_direct(
   if (ce_config.enable_memcpy_batch && !b_dst.empty()) {
     cudaMemcpyAttributes attr{};
     attr.srcAccessOrder = cudaMemcpySrcAccessOrderAny;
+    if (is_host_to_device) {
+      attr.srcLocHint.type = cudaMemLocationTypeHost;
+      attr.dstLocHint.type = cudaMemLocationTypeDevice;
+    } else {
+      attr.srcLocHint.type = cudaMemLocationTypeDevice;
+      attr.dstLocHint.type = cudaMemLocationTypeHost;
+    }
+    attr.srcLocHint.id = 0;
+    attr.dstLocHint.id = 0;
     attr.flags = cudaMemcpyDefault;
     cudaMemcpyAttributes attrs[1] = {attr};
     size_t attrsIdxs[1] = {0};
     size_t failIdx = 0;
-    cudaMemcpyBatchAsync(b_dst.data(), b_src.data(), b_cnt.data(),
+    cudaError_t e = cudaMemcpyBatchAsync(b_dst.data(), b_src.data(), b_cnt.data(),
                          (size_t)b_dst.size(), attrs, attrsIdxs, 1, &failIdx,
                          stream);
+    if (e != cudaSuccess) {
+      // Fallback to per-element copies so correctness is preserved even if
+      // the batch API is unavailable / rejects the attributes.
+      for (size_t k = 0; k < b_dst.size(); ++k)
+        cudaMemcpyAsync(b_dst[k], b_src[k], b_cnt[k], cudaMemcpyDefault, stream);
+    }
+    cudaStreamSynchronize(stream);
   }
 #endif
 }
@@ -825,13 +873,29 @@ void ce_transfer_segment_scatter(
     if (ce_config.enable_memcpy_batch && !b_dst.empty()) {
       cudaMemcpyAttributes attr{};
       attr.srcAccessOrder = cudaMemcpySrcAccessOrderAny;
+      if (is_host_to_device) {
+        attr.srcLocHint.type = cudaMemLocationTypeHost;
+        attr.dstLocHint.type = cudaMemLocationTypeDevice;
+      } else {
+        attr.srcLocHint.type = cudaMemLocationTypeDevice;
+        attr.dstLocHint.type = cudaMemLocationTypeHost;
+      }
+      attr.srcLocHint.id = 0;
+      attr.dstLocHint.id = 0;
       attr.flags = cudaMemcpyDefault;
       cudaMemcpyAttributes attrs[1] = {attr};
       size_t attrsIdxs[1] = {0};
       size_t failIdx = 0;
-      cudaMemcpyBatchAsync(b_dst.data(), b_src.data(), b_cnt.data(),
+      cudaError_t e = cudaMemcpyBatchAsync(b_dst.data(), b_src.data(), b_cnt.data(),
                            (size_t)b_dst.size(), attrs, attrsIdxs, 1, &failIdx,
                            stream);
+      if (e != cudaSuccess) {
+        // Fallback to per-element copies so correctness is preserved even if
+        // the batch API is unavailable / rejects the attributes.
+        for (size_t k = 0; k < b_dst.size(); ++k)
+          cudaMemcpyAsync(b_dst[k], b_src[k], b_cnt[k], cudaMemcpyDefault, stream);
+      }
+      cudaStreamSynchronize(stream);
     }
 #endif
     cudaStreamSynchronize(stream);
@@ -1144,13 +1208,29 @@ void ce_transfer_gather_scatter(
         if (ce_config.enable_memcpy_batch && !b_dst.empty()) {
           cudaMemcpyAttributes attr{};
           attr.srcAccessOrder = cudaMemcpySrcAccessOrderAny;
+          if (is_host_to_device) {
+            attr.srcLocHint.type = cudaMemLocationTypeHost;
+            attr.dstLocHint.type = cudaMemLocationTypeDevice;
+          } else {
+            attr.srcLocHint.type = cudaMemLocationTypeDevice;
+            attr.dstLocHint.type = cudaMemLocationTypeHost;
+          }
+          attr.srcLocHint.id = 0;
+          attr.dstLocHint.id = 0;
           attr.flags = cudaMemcpyDefault;
           cudaMemcpyAttributes attrs[1] = {attr};
           size_t attrsIdxs[1] = {0};
           size_t failIdx = 0;
-          cudaMemcpyBatchAsync(b_dst.data(), b_src.data(), b_cnt.data(),
+          cudaError_t e = cudaMemcpyBatchAsync(b_dst.data(), b_src.data(), b_cnt.data(),
                                (size_t)b_dst.size(), attrs, attrsIdxs, 1, &failIdx,
                                stream);
+          if (e != cudaSuccess) {
+            // Fallback to per-element copies so correctness is preserved even if
+            // the batch API is unavailable / rejects the attributes.
+            for (size_t k = 0; k < b_dst.size(); ++k)
+              cudaMemcpyAsync(b_dst[k], b_src[k], b_cnt[k], cudaMemcpyDefault, stream);
+          }
+          cudaStreamSynchronize(stream);
         }
 #endif
         cudaStreamSynchronize(stream);
@@ -1194,13 +1274,29 @@ void ce_transfer_gather_scatter(
         if (ce_config.enable_memcpy_batch && !b_dst.empty()) {
           cudaMemcpyAttributes attr{};
           attr.srcAccessOrder = cudaMemcpySrcAccessOrderAny;
+          if (is_host_to_device) {
+            attr.srcLocHint.type = cudaMemLocationTypeHost;
+            attr.dstLocHint.type = cudaMemLocationTypeDevice;
+          } else {
+            attr.srcLocHint.type = cudaMemLocationTypeDevice;
+            attr.dstLocHint.type = cudaMemLocationTypeHost;
+          }
+          attr.srcLocHint.id = 0;
+          attr.dstLocHint.id = 0;
           attr.flags = cudaMemcpyDefault;
           cudaMemcpyAttributes attrs[1] = {attr};
           size_t attrsIdxs[1] = {0};
           size_t failIdx = 0;
-          cudaMemcpyBatchAsync(b_dst.data(), b_src.data(), b_cnt.data(),
+          cudaError_t e = cudaMemcpyBatchAsync(b_dst.data(), b_src.data(), b_cnt.data(),
                                (size_t)b_dst.size(), attrs, attrsIdxs, 1, &failIdx,
                                stream);
+          if (e != cudaSuccess) {
+            // Fallback to per-element copies so correctness is preserved even if
+            // the batch API is unavailable / rejects the attributes.
+            for (size_t k = 0; k < b_dst.size(); ++k)
+              cudaMemcpyAsync(b_dst[k], b_src[k], b_cnt[k], cudaMemcpyDefault, stream);
+          }
+          cudaStreamSynchronize(stream);
         }
 #endif
         cudaStreamSynchronize(stream);
@@ -1525,13 +1621,29 @@ void ce_transfer_gather_direct(
         if (ce_config.enable_memcpy_batch && !b_dst.empty()) {
           cudaMemcpyAttributes attr{};
           attr.srcAccessOrder = cudaMemcpySrcAccessOrderAny;
+          if (is_host_to_device) {
+            attr.srcLocHint.type = cudaMemLocationTypeHost;
+            attr.dstLocHint.type = cudaMemLocationTypeDevice;
+          } else {
+            attr.srcLocHint.type = cudaMemLocationTypeDevice;
+            attr.dstLocHint.type = cudaMemLocationTypeHost;
+          }
+          attr.srcLocHint.id = 0;
+          attr.dstLocHint.id = 0;
           attr.flags = cudaMemcpyDefault;
           cudaMemcpyAttributes attrs[1] = {attr};
           size_t attrsIdxs[1] = {0};
           size_t failIdx = 0;
-          cudaMemcpyBatchAsync(b_dst.data(), b_src.data(), b_cnt.data(),
+          cudaError_t e = cudaMemcpyBatchAsync(b_dst.data(), b_src.data(), b_cnt.data(),
                                (size_t)b_dst.size(), attrs, attrsIdxs, 1, &failIdx,
                                stream);
+          if (e != cudaSuccess) {
+            // Fallback to per-element copies so correctness is preserved even if
+            // the batch API is unavailable / rejects the attributes.
+            for (size_t k = 0; k < b_dst.size(); ++k)
+              cudaMemcpyAsync(b_dst[k], b_src[k], b_cnt[k], cudaMemcpyDefault, stream);
+          }
+          cudaStreamSynchronize(stream);
         }
 #endif
       } else {
@@ -1615,13 +1727,29 @@ void ce_transfer_gather_direct(
         if (ce_config.enable_memcpy_batch && !b_dst.empty()) {
           cudaMemcpyAttributes attr{};
           attr.srcAccessOrder = cudaMemcpySrcAccessOrderAny;
+          if (is_host_to_device) {
+            attr.srcLocHint.type = cudaMemLocationTypeHost;
+            attr.dstLocHint.type = cudaMemLocationTypeDevice;
+          } else {
+            attr.srcLocHint.type = cudaMemLocationTypeDevice;
+            attr.dstLocHint.type = cudaMemLocationTypeHost;
+          }
+          attr.srcLocHint.id = 0;
+          attr.dstLocHint.id = 0;
           attr.flags = cudaMemcpyDefault;
           cudaMemcpyAttributes attrs[1] = {attr};
           size_t attrsIdxs[1] = {0};
           size_t failIdx = 0;
-          cudaMemcpyBatchAsync(b_dst.data(), b_src.data(), b_cnt.data(),
+          cudaError_t e = cudaMemcpyBatchAsync(b_dst.data(), b_src.data(), b_cnt.data(),
                                (size_t)b_dst.size(), attrs, attrsIdxs, 1, &failIdx,
                                stream);
+          if (e != cudaSuccess) {
+            // Fallback to per-element copies so correctness is preserved even if
+            // the batch API is unavailable / rejects the attributes.
+            for (size_t k = 0; k < b_dst.size(); ++k)
+              cudaMemcpyAsync(b_dst[k], b_src[k], b_cnt[k], cudaMemcpyDefault, stream);
+          }
+          cudaStreamSynchronize(stream);
         }
 #endif
       } else {
