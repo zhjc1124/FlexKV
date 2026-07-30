@@ -262,7 +262,7 @@ void ce_transfer_per_block(
     }
     attr.srcLocHint.id = 0;
     attr.dstLocHint.id = 0;
-    attr.flags = cudaMemcpyDefault;
+    attr.flags = cudaMemcpyFlagDefault;
     cudaMemcpyAttributes attrs[1] = {attr};
     std::vector<size_t> attrsIdxs(b_dst.size(), 0);
     size_t failIdx = 0;
@@ -351,7 +351,7 @@ void ce_transfer_contig_direct(
     }
     attr.srcLocHint.id = 0;
     attr.dstLocHint.id = 0;
-    attr.flags = cudaMemcpyDefault;
+    attr.flags = cudaMemcpyFlagDefault;
     cudaMemcpyAttributes attrs[1] = {attr};
     std::vector<size_t> attrsIdxs(b_dst.size(), 0);
     size_t failIdx = 0;
@@ -443,7 +443,7 @@ void ce_transfer_segment_direct(
     }
     attr.srcLocHint.id = 0;
     attr.dstLocHint.id = 0;
-    attr.flags = cudaMemcpyDefault;
+    attr.flags = cudaMemcpyFlagDefault;
     cudaMemcpyAttributes attrs[1] = {attr};
     std::vector<size_t> attrsIdxs(b_dst.size(), 0);
     size_t failIdx = 0;
@@ -882,7 +882,7 @@ void ce_transfer_segment_scatter(
       }
       attr.srcLocHint.id = 0;
       attr.dstLocHint.id = 0;
-      attr.flags = cudaMemcpyDefault;
+      attr.flags = cudaMemcpyFlagDefault;
       cudaMemcpyAttributes attrs[1] = {attr};
       std::vector<size_t> attrsIdxs(b_dst.size(), 0);
       size_t failIdx = 0;
@@ -1217,7 +1217,7 @@ void ce_transfer_gather_scatter(
           }
           attr.srcLocHint.id = 0;
           attr.dstLocHint.id = 0;
-          attr.flags = cudaMemcpyDefault;
+          attr.flags = cudaMemcpyFlagDefault;
           cudaMemcpyAttributes attrs[1] = {attr};
           std::vector<size_t> attrsIdxs(b_dst.size(), 0);
           size_t failIdx = 0;
@@ -1283,7 +1283,7 @@ void ce_transfer_gather_scatter(
           }
           attr.srcLocHint.id = 0;
           attr.dstLocHint.id = 0;
-          attr.flags = cudaMemcpyDefault;
+          attr.flags = cudaMemcpyFlagDefault;
           cudaMemcpyAttributes attrs[1] = {attr};
           std::vector<size_t> attrsIdxs(b_dst.size(), 0);
           size_t failIdx = 0;
@@ -1630,7 +1630,7 @@ void ce_transfer_gather_direct(
           }
           attr.srcLocHint.id = 0;
           attr.dstLocHint.id = 0;
-          attr.flags = cudaMemcpyDefault;
+          attr.flags = cudaMemcpyFlagDefault;
           cudaMemcpyAttributes attrs[1] = {attr};
           std::vector<size_t> attrsIdxs(b_dst.size(), 0);
           size_t failIdx = 0;
@@ -1736,7 +1736,7 @@ void ce_transfer_gather_direct(
           }
           attr.srcLocHint.id = 0;
           attr.dstLocHint.id = 0;
-          attr.flags = cudaMemcpyDefault;
+          attr.flags = cudaMemcpyFlagDefault;
           cudaMemcpyAttributes attrs[1] = {attr};
           std::vector<size_t> attrsIdxs(b_dst.size(), 0);
           size_t failIdx = 0;

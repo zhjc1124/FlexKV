@@ -36,7 +36,7 @@ int main() {
   attr.srcLocHint.id = 0;
   attr.dstLocHint.type = cudaMemLocationTypeHost;    // D2H: dest is host
   attr.dstLocHint.id = 0;
-  attr.flags = cudaMemcpyDefault;
+  attr.flags = cudaMemcpyFlagDefault;
   cudaMemcpyAttributes attrs[1] = {attr};
   // attrsIdxs MUST have `count` entries (one per copy), each a valid attr index.
   std::vector<size_t> attrsIdxs(b_dst.size(), 0);
