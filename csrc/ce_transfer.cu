@@ -746,10 +746,14 @@ void ce_transfer_segment_scatter(
                                             : cudaMemcpyDeviceToHost;
     const int64_t total_iters = (int64_t)num_layers * kv_dim;
     // Batch coalesce: collect 2D params, submit once (CUDA 12+).
-    std::vector<cudaMemcpyParams> params;
+    std::vector<void *> b_dst;
+    std::vector<const void *> b_src;
+    std::vector<size_t> b_cnt;
 #if CUDART_VERSION >= 12000
     if (ce_config.enable_memcpy_batch) {
-      params.reserve((size_t)total_iters * ce_analysis.segments.size());
+      b_dst.reserve((size_t)total_iters * ce_analysis.segments.size());
+      b_src.reserve((size_t)total_iters * ce_analysis.segments.size());
+      b_cnt.reserve((size_t)total_iters * ce_analysis.segments.size());
     }
 #endif
     for (int64_t it = 0; it < total_iters; ++it) {
@@ -781,19 +785,11 @@ void ce_transfer_segment_scatter(
 
 #if CUDART_VERSION >= 12000
         if (ce_config.enable_memcpy_batch) {
-          cudaMemcpyParams p;
-          p.srcMemoryType = is_host_to_device ? cudaMemoryTypeHost
-                                              : cudaMemoryTypeDevice;
-          p.dstMemoryType = is_host_to_device ? cudaMemoryTypeDevice
-                                              : cudaMemoryTypeHost;
-          p.src = src;
-          p.dst = dst;
-          p.extent.pitch2D.srcPitch = spitch;
-          p.extent.pitch2D.dstPitch = dpitch;
-          p.extent.pitch2D.width = (size_t)chunk_size_in_bytes;
-          p.extent.pitch2D.height = (size_t)seg.nr_blocks;
-          p.reserved = nullptr;
-          params.push_back(p);
+          for (size_t r = 0; r < (size_t)seg.nr_blocks; ++r) {
+            b_dst.push_back((char *)dst + r * dpitch);
+            b_src.push_back((char *)src + r * spitch);
+            b_cnt.push_back((size_t)chunk_size_in_bytes);
+          }
         } else
 #endif
         {
@@ -805,8 +801,9 @@ void ce_transfer_segment_scatter(
     }
 #if CUDART_VERSION >= 12000
     // CUDA<12: falls through to per-call path above (no batch symbol).
-    if (ce_config.enable_memcpy_batch && !params.empty()) {
-      cudaMemcpyBatchAsync(params.data(), (unsigned long)params.size(), stream);
+    if (ce_config.enable_memcpy_batch && !b_dst.empty()) {
+      cudaMemcpyBatchAsync(b_dst.data(), b_src.data(), b_cnt.data(), kind,
+                           (unsigned long)b_dst.size(), stream);
     }
 #endif
     cudaStreamSynchronize(stream);
@@ -1042,10 +1039,14 @@ void ce_transfer_gather_scatter(
     cudaMemcpyKind kind = is_host_to_device ? cudaMemcpyHostToDevice
                                             : cudaMemcpyDeviceToHost;
     // Batch coalesce: collect 2D params per iter, submit once (CUDA 12+).
-    std::vector<cudaMemcpyParams> params;
+    std::vector<void *> b_dst;
+    std::vector<const void *> b_src;
+    std::vector<size_t> b_cnt;
 #if CUDART_VERSION >= 12000
     if (ce_config.enable_memcpy_batch) {
-      params.reserve(ce_analysis.segments.size());
+      b_dst.reserve(ce_analysis.segments.size());
+      b_src.reserve(ce_analysis.segments.size());
+      b_cnt.reserve(ce_analysis.segments.size());
     }
 #endif
     for (int64_t it = 0; it < total_iters; ++it) {
@@ -1089,7 +1090,7 @@ void ce_transfer_gather_scatter(
         }
 
         // Step 2: memcpy2d dev_buf/GPU -> CPU (strided, per segment)
-        params.clear();
+        b_dst.clear(); b_src.clear(); b_cnt.clear();
         for (const auto &seg : ce_analysis.segments) {
           int64_t cb = cpu_block_ids[seg.start_k];
           void *cpu_dst = cpu_base + cb * cpu_block_stride_int64;
@@ -1097,19 +1098,11 @@ void ce_transfer_gather_scatter(
                       (int64_t)seg.start_k * chunk_size_in_bytes;
 #if CUDART_VERSION >= 12000
           if (ce_config.enable_memcpy_batch) {
-            cudaMemcpyParams p;
-            p.srcMemoryType = is_host_to_device ? cudaMemoryTypeHost
-                                                : cudaMemoryTypeDevice;
-            p.dstMemoryType = is_host_to_device ? cudaMemoryTypeDevice
-                                                : cudaMemoryTypeHost;
-            p.src = src;
-            p.dst = cpu_dst;
-            p.extent.pitch2D.srcPitch = dev_pitch;
-            p.extent.pitch2D.dstPitch = cpu_pitch;
-            p.extent.pitch2D.width = (size_t)chunk_size_in_bytes;
-            p.extent.pitch2D.height = (size_t)seg.nr_blocks;
-            p.reserved = nullptr;
-            params.push_back(p);
+            for (size_t r = 0; r < (size_t)seg.nr_blocks; ++r) {
+              b_dst.push_back((char *)cpu_dst + r * cpu_pitch);
+              b_src.push_back((char *)src + r * dev_pitch);
+              b_cnt.push_back((size_t)chunk_size_in_bytes);
+            }
           } else
 #endif
           {
@@ -1120,8 +1113,9 @@ void ce_transfer_gather_scatter(
           FLEXKV_GPU_CPU_TRANSFER(false, chunk_size_in_bytes * seg.nr_blocks);
         }
 #if CUDART_VERSION >= 12000
-        if (ce_config.enable_memcpy_batch && !params.empty()) {
-          cudaMemcpyBatchAsync(params.data(), (unsigned long)params.size(), stream);
+        if (ce_config.enable_memcpy_batch && !b_dst.empty()) {
+          cudaMemcpyBatchAsync(b_dst.data(), b_src.data(), b_cnt.data(), kind,
+                               (unsigned long)b_dst.size(), stream);
         }
 #endif
         cudaStreamSynchronize(stream);
@@ -1139,7 +1133,7 @@ void ce_transfer_gather_scatter(
           dev_pitch = (size_t)chunk_size_in_bytes;
         }
 
-        params.clear();
+        b_dst.clear(); b_src.clear(); b_cnt.clear();
         for (const auto &seg : ce_analysis.segments) {
           int64_t cb = cpu_block_ids[seg.start_k];
           const int64_t *cpu_src = cpu_base + cb * cpu_block_stride_int64;
@@ -1147,19 +1141,11 @@ void ce_transfer_gather_scatter(
                       (int64_t)seg.start_k * chunk_size_in_bytes;
 #if CUDART_VERSION >= 12000
           if (ce_config.enable_memcpy_batch) {
-            cudaMemcpyParams p;
-            p.srcMemoryType = is_host_to_device ? cudaMemoryTypeHost
-                                                : cudaMemoryTypeDevice;
-            p.dstMemoryType = is_host_to_device ? cudaMemoryTypeDevice
-                                                : cudaMemoryTypeHost;
-            p.src = cpu_src;
-            p.dst = dst;
-            p.extent.pitch2D.srcPitch = cpu_pitch;
-            p.extent.pitch2D.dstPitch = dev_pitch;
-            p.extent.pitch2D.width = (size_t)chunk_size_in_bytes;
-            p.extent.pitch2D.height = (size_t)seg.nr_blocks;
-            p.reserved = nullptr;
-            params.push_back(p);
+            for (size_t r = 0; r < (size_t)seg.nr_blocks; ++r) {
+              b_dst.push_back((char *)dst + r * dev_pitch);
+              b_src.push_back((char *)cpu_src + r * cpu_pitch);
+              b_cnt.push_back((size_t)chunk_size_in_bytes);
+            }
           } else
 #endif
           {
@@ -1170,8 +1156,9 @@ void ce_transfer_gather_scatter(
           FLEXKV_GPU_CPU_TRANSFER(true, chunk_size_in_bytes * seg.nr_blocks);
         }
 #if CUDART_VERSION >= 12000
-        if (ce_config.enable_memcpy_batch && !params.empty()) {
-          cudaMemcpyBatchAsync(params.data(), (unsigned long)params.size(), stream);
+        if (ce_config.enable_memcpy_batch && !b_dst.empty()) {
+          cudaMemcpyBatchAsync(b_dst.data(), b_src.data(), b_cnt.data(), kind,
+                               (unsigned long)b_dst.size(), stream);
         }
 #endif
         cudaStreamSynchronize(stream);
@@ -1457,10 +1444,14 @@ void ce_transfer_gather_direct(
       if (ce_config.enable_memcpy2d) {
         size_t spitch = (size_t)cpu_block_stride_int64 * sizeof(int64_t);
         // Batch coalesce: collect 2D params, submit once (CUDA 12+).
-        std::vector<cudaMemcpyParams> params;
+        std::vector<void *> b_dst;
+        std::vector<const void *> b_src;
+        std::vector<size_t> b_cnt;
 #if CUDART_VERSION >= 12000
         if (ce_config.enable_memcpy_batch) {
-          params.reserve(ce_analysis.segments.size());
+          b_dst.reserve(ce_analysis.segments.size());
+          b_src.reserve(ce_analysis.segments.size());
+          b_cnt.reserve(ce_analysis.segments.size());
         }
 #endif
         for (const auto &seg : ce_analysis.segments) {
@@ -1473,17 +1464,11 @@ void ce_transfer_gather_direct(
               (int64_t)seg.start_k * total_iters * chunk_size_in_bytes;
 #if CUDART_VERSION >= 12000
           if (ce_config.enable_memcpy_batch) {
-            cudaMemcpyParams p;
-            p.srcMemoryType = cudaMemoryTypeDevice;
-            p.dstMemoryType = cudaMemoryTypeHost;
-            p.src = src;
-            p.dst = cpu_dst;
-            p.extent.pitch2D.srcPitch = width;
-            p.extent.pitch2D.dstPitch = spitch;
-            p.extent.pitch2D.width = width;
-            p.extent.pitch2D.height = (size_t)seg.nr_blocks;
-            p.reserved = nullptr;
-            params.push_back(p);
+            for (size_t r = 0; r < (size_t)seg.nr_blocks; ++r) {
+              b_dst.push_back((char *)cpu_dst + r * spitch);
+              b_src.push_back((char *)src + r * width);
+              b_cnt.push_back((size_t)width);
+            }
           } else
 #endif
           {
@@ -1495,8 +1480,10 @@ void ce_transfer_gather_direct(
         }
 #if CUDART_VERSION >= 12000
         // CUDA<12: falls through to per-call path above (no batch symbol).
-        if (ce_config.enable_memcpy_batch && !params.empty()) {
-          cudaMemcpyBatchAsync(params.data(), (unsigned long)params.size(), stream);
+        if (ce_config.enable_memcpy_batch && !b_dst.empty()) {
+          cudaMemcpyBatchAsync(b_dst.data(), b_src.data(), b_cnt.data(),
+                               cudaMemcpyDeviceToHost,
+                               (unsigned long)b_dst.size(), stream);
         }
 #endif
       } else {
@@ -1541,10 +1528,14 @@ void ce_transfer_gather_direct(
       if (ce_config.enable_memcpy2d) {
         size_t spitch = (size_t)cpu_block_stride_int64 * sizeof(int64_t);
         // Batch coalesce: collect 2D params, submit once (CUDA 12+).
-        std::vector<cudaMemcpyParams> params;
+        std::vector<void *> b_dst;
+        std::vector<const void *> b_src;
+        std::vector<size_t> b_cnt;
 #if CUDART_VERSION >= 12000
         if (ce_config.enable_memcpy_batch) {
-          params.reserve(ce_analysis.segments.size());
+          b_dst.reserve(ce_analysis.segments.size());
+          b_src.reserve(ce_analysis.segments.size());
+          b_cnt.reserve(ce_analysis.segments.size());
         }
 #endif
         for (const auto &seg : ce_analysis.segments) {
@@ -1557,17 +1548,11 @@ void ce_transfer_gather_direct(
               (int64_t)seg.start_k * total_iters * chunk_size_in_bytes;
 #if CUDART_VERSION >= 12000
           if (ce_config.enable_memcpy_batch) {
-            cudaMemcpyParams p;
-            p.srcMemoryType = cudaMemoryTypeHost;
-            p.dstMemoryType = cudaMemoryTypeDevice;
-            p.src = cpu_src;
-            p.dst = dst;
-            p.extent.pitch2D.srcPitch = spitch;
-            p.extent.pitch2D.dstPitch = width;
-            p.extent.pitch2D.width = width;
-            p.extent.pitch2D.height = (size_t)seg.nr_blocks;
-            p.reserved = nullptr;
-            params.push_back(p);
+            for (size_t r = 0; r < (size_t)seg.nr_blocks; ++r) {
+              b_dst.push_back((char *)dst + r * width);
+              b_src.push_back((char *)cpu_src + r * spitch);
+              b_cnt.push_back((size_t)width);
+            }
           } else
 #endif
           {
@@ -1579,8 +1564,10 @@ void ce_transfer_gather_direct(
         }
 #if CUDART_VERSION >= 12000
         // CUDA<12: falls through to per-call path above (no batch symbol).
-        if (ce_config.enable_memcpy_batch && !params.empty()) {
-          cudaMemcpyBatchAsync(params.data(), (unsigned long)params.size(), stream);
+        if (ce_config.enable_memcpy_batch && !b_dst.empty()) {
+          cudaMemcpyBatchAsync(b_dst.data(), b_src.data(), b_cnt.data(),
+                               cudaMemcpyHostToDevice,
+                               (unsigned long)b_dst.size(), stream);
         }
 #endif
       } else {
