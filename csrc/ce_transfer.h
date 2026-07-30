@@ -23,6 +23,8 @@ struct CETransferConfig {
   int force_path = -1;
   // cudaMemcpy2DAsync fast path: NVIDIA on, P800 off
   bool enable_memcpy2d = false;
+  // cudaMemcpyBatchAsync (CUDA 12+) coalesce: off = per-call fallback
+  bool enable_memcpy_batch = false;
   // CPU layout: BLOCKFIRST vs LAYERFIRST
   bool is_blockfirst = false;
   // model uses MLA (kv_dim=1)
@@ -82,7 +84,8 @@ void ce_transfer_per_block(
     int64_t cpu_kv_stride_int64, int64_t cpu_layer_stride_int64,
     int64_t cpu_block_stride_int64,
     int64_t cpu_startoff_inside_chunks_int64, int64_t chunk_size_in_bytes,
-    cudaStream_t stream, bool is_host_to_device);
+    cudaStream_t stream, bool is_host_to_device,
+    const CETransferConfig &ce_config);
 
 // ---- CONTIG_DIRECT: one big memcpy (both sides contig) ----
 template <BackendType Type>
@@ -94,7 +97,8 @@ void ce_transfer_contig_direct(
     int64_t cpu_kv_stride_int64, int64_t cpu_layer_stride_int64,
     int64_t cpu_block_stride_int64,
     int64_t cpu_startoff_inside_chunks_int64, int64_t chunk_size_in_bytes,
-    cudaStream_t stream, bool is_host_to_device);
+    cudaStream_t stream, bool is_host_to_device,
+    const CETransferConfig &ce_config);
 
 // ---- SEGMENT_DIRECT: per-run memcpy, no staging ----
 template <BackendType Type>

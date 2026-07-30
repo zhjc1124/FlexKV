@@ -202,9 +202,22 @@ void ce_transfer_per_block(
     int64_t cpu_kv_stride_int64, int64_t cpu_layer_stride_int64,
     int64_t cpu_block_stride_int64,
     int64_t cpu_startoff_inside_chunks_int64, int64_t chunk_size_in_bytes,
-    cudaStream_t stream, bool is_host_to_device) {
+    cudaStream_t stream, bool is_host_to_device,
+    const CETransferConfig &ce_config) {
   cudaMemcpyKind kind = is_host_to_device ? cudaMemcpyHostToDevice
                                           : cudaMemcpyDeviceToHost;
+  // Batch coalesce: collect per-block copies, submit once (CUDA 12+).
+  std::vector<void *> b_dst;
+  std::vector<const void *> b_src;
+  std::vector<size_t> b_cnt;
+#if CUDART_VERSION >= 12000
+  if (ce_config.enable_memcpy_batch) {
+    size_t n = (size_t)num_layers * kv_dim * num_blocks;
+    b_dst.reserve(n);
+    b_src.reserve(n);
+    b_cnt.reserve(n);
+  }
+#endif
   for (int i = 0; i < num_layers; i++) {
     for (int j = 0; j < kv_dim; j++) {
       int64_t *cpu_base =
@@ -221,11 +234,27 @@ void ce_transfer_per_block(
             cpu_base + cpu_block_ids[b] * cpu_block_stride_int64;
         void *dst = is_host_to_device ? (void *)gpu_ptr_off : (void *)cpu_ptr_b;
         void *src = is_host_to_device ? (void *)cpu_ptr_b : (void *)gpu_ptr_off;
-        cudaMemcpyAsync(dst, src, chunk_size_in_bytes, kind, stream);
+#if CUDART_VERSION >= 12000
+        if (ce_config.enable_memcpy_batch) {
+          b_dst.push_back(dst);
+          b_src.push_back(src);
+          b_cnt.push_back((size_t)chunk_size_in_bytes);
+        } else
+#endif
+        {
+          cudaMemcpyAsync(dst, src, chunk_size_in_bytes, kind, stream);
+        }
         FLEXKV_GPU_CPU_TRANSFER(is_host_to_device, chunk_size_in_bytes);
       }
     }
   }
+#if CUDART_VERSION >= 12000
+  // CUDA<12: falls through to per-call path above (no batch symbol).
+  if (ce_config.enable_memcpy_batch && !b_dst.empty()) {
+    cudaMemcpyBatchAsync(b_dst.data(), b_src.data(), b_cnt.data(), kind,
+                         (unsigned long)b_dst.size(), stream);
+  }
+#endif
 }
 
 // device buffer failure -> fall back to PER_BLOCK.
@@ -241,10 +270,23 @@ void ce_transfer_contig_direct(
     int64_t cpu_kv_stride_int64, int64_t cpu_layer_stride_int64,
     int64_t cpu_block_stride_int64,
     int64_t cpu_startoff_inside_chunks_int64, int64_t chunk_size_in_bytes,
-    cudaStream_t stream, bool is_host_to_device) {
+    cudaStream_t stream, bool is_host_to_device,
+    const CETransferConfig &ce_config) {
   int64_t big_size = chunk_size_in_bytes * num_blocks;
   cudaMemcpyKind kind = is_host_to_device ? cudaMemcpyHostToDevice
                                           : cudaMemcpyDeviceToHost;
+  // Batch coalesce: collect per-(layer,kv) copies, submit once (CUDA 12+).
+  std::vector<void *> b_dst;
+  std::vector<const void *> b_src;
+  std::vector<size_t> b_cnt;
+#if CUDART_VERSION >= 12000
+  if (ce_config.enable_memcpy_batch) {
+    size_t n = (size_t)num_layers * kv_dim;
+    b_dst.reserve(n);
+    b_src.reserve(n);
+    b_cnt.reserve(n);
+  }
+#endif
   for (int i = 0; i < num_layers; i++) {
     for (int j = 0; j < kv_dim; j++) {
       int64_t *cpu_chunk_ptr =
@@ -260,10 +302,25 @@ void ce_transfer_contig_direct(
                                     : (void *)cpu_chunk_ptr;
       void *src = is_host_to_device ? (void *)cpu_chunk_ptr
                                     : (void *)gpu_chunk_ptr;
-      cudaMemcpyAsync(dst, src, big_size, kind, stream);
+#if CUDART_VERSION >= 12000
+      if (ce_config.enable_memcpy_batch) {
+        b_dst.push_back(dst);
+        b_src.push_back(src);
+        b_cnt.push_back((size_t)big_size);
+      } else
+#endif
+      {
+        cudaMemcpyAsync(dst, src, big_size, kind, stream);
+      }
       FLEXKV_GPU_CPU_TRANSFER(is_host_to_device, big_size);
     }
   }
+#if CUDART_VERSION >= 12000
+  if (ce_config.enable_memcpy_batch && !b_dst.empty()) {
+    cudaMemcpyBatchAsync(b_dst.data(), b_src.data(), b_cnt.data(), kind,
+                         (unsigned long)b_dst.size(), stream);
+  }
+#endif
 }
 
 // ---- SEGMENT_DIRECT: per-run memcpy, no staging ----
@@ -282,6 +339,18 @@ void ce_transfer_segment_direct(
   (void)ce_config;  // ping-pong / staging config unused: this path never stages.
   cudaMemcpyKind kind = is_host_to_device ? cudaMemcpyHostToDevice
                                           : cudaMemcpyDeviceToHost;
+  // Batch coalesce: collect per-segment copies, submit once (CUDA 12+).
+  std::vector<void *> b_dst;
+  std::vector<const void *> b_src;
+  std::vector<size_t> b_cnt;
+#if CUDART_VERSION >= 12000
+  if (ce_config.enable_memcpy_batch) {
+    size_t n = (size_t)num_layers * kv_dim * ce_analysis.segments.size();
+    b_dst.reserve(n);
+    b_src.reserve(n);
+    b_cnt.reserve(n);
+  }
+#endif
   for (int i = 0; i < num_layers; i++) {
     for (int j = 0; j < kv_dim; j++) {
       for (const auto &seg : ce_analysis.segments) {
@@ -301,11 +370,26 @@ void ce_transfer_segment_direct(
                                       : (void *)cpu_ptr;
         void *src = is_host_to_device ? (void *)cpu_ptr
                                       : (void *)gpu_ptr_off;
-        cudaMemcpyAsync(dst, src, seg_size, kind, stream);
+#if CUDART_VERSION >= 12000
+        if (ce_config.enable_memcpy_batch) {
+          b_dst.push_back(dst);
+          b_src.push_back(src);
+          b_cnt.push_back((size_t)seg_size);
+        } else
+#endif
+        {
+          cudaMemcpyAsync(dst, src, seg_size, kind, stream);
+        }
         FLEXKV_GPU_CPU_TRANSFER(is_host_to_device, seg_size);
       }
     }
   }
+#if CUDART_VERSION >= 12000
+  if (ce_config.enable_memcpy_batch && !b_dst.empty()) {
+    cudaMemcpyBatchAsync(b_dst.data(), b_src.data(), b_cnt.data(), kind,
+                         (unsigned long)b_dst.size(), stream);
+  }
+#endif
 }
 
 // ---- Ping-pong: D2H double-buffer (SEGMENT_SCATTER, GATHER_SCATTER); not in direct paths ----
@@ -661,6 +745,13 @@ void ce_transfer_segment_scatter(
     cudaMemcpyKind kind = is_host_to_device ? cudaMemcpyHostToDevice
                                             : cudaMemcpyDeviceToHost;
     const int64_t total_iters = (int64_t)num_layers * kv_dim;
+    // Batch coalesce: collect 2D params, submit once (CUDA 12+).
+    std::vector<cudaMemcpyParams> params;
+#if CUDART_VERSION >= 12000
+    if (ce_config.enable_memcpy_batch) {
+      params.reserve((size_t)total_iters * ce_analysis.segments.size());
+    }
+#endif
     for (int64_t it = 0; it < total_iters; ++it) {
       int i = (int)(it / kv_dim);
       int j = (int)(it % kv_dim);
@@ -688,11 +779,36 @@ void ce_transfer_segment_scatter(
         size_t dpitch = is_host_to_device ? gpu_pitch : cpu_pitch;
         size_t spitch = is_host_to_device ? cpu_pitch : gpu_pitch;
 
-        cudaMemcpy2DAsync(dst, dpitch, src, spitch,
-                          chunk_size_in_bytes, seg.nr_blocks, kind, stream);
+#if CUDART_VERSION >= 12000
+        if (ce_config.enable_memcpy_batch) {
+          cudaMemcpyParams p;
+          p.srcMemoryType = is_host_to_device ? cudaMemoryTypeHost
+                                              : cudaMemoryTypeDevice;
+          p.dstMemoryType = is_host_to_device ? cudaMemoryTypeDevice
+                                              : cudaMemoryTypeHost;
+          p.src = src;
+          p.dst = dst;
+          p.extent.pitch2D.srcPitch = spitch;
+          p.extent.pitch2D.dstPitch = dpitch;
+          p.extent.pitch2D.width = (size_t)chunk_size_in_bytes;
+          p.extent.pitch2D.height = (size_t)seg.nr_blocks;
+          p.reserved = nullptr;
+          params.push_back(p);
+        } else
+#endif
+        {
+          cudaMemcpy2DAsync(dst, dpitch, src, spitch,
+                            chunk_size_in_bytes, seg.nr_blocks, kind, stream);
+        }
         FLEXKV_GPU_CPU_TRANSFER(is_host_to_device, chunk_size_in_bytes * seg.nr_blocks);
       }
     }
+#if CUDART_VERSION >= 12000
+    // CUDA<12: falls through to per-call path above (no batch symbol).
+    if (ce_config.enable_memcpy_batch && !params.empty()) {
+      cudaMemcpyBatchAsync(params.data(), (unsigned long)params.size(), stream);
+    }
+#endif
     cudaStreamSynchronize(stream);
     return;
   }
@@ -856,14 +972,14 @@ void ce_transfer_gather_scatter(
   at::Tensor dst_ids_cuda;
   if (!ce_analysis.gpu_log_contig || !ce_analysis.gpu_phys_contig) {
     gpu_ids_raw = get_cached_device_buffer(ids_bytes);
-    if (!gpu_ids_raw) { ce_transfer_per_block<Type>(num_blocks, start_layer_id, num_layers, kv_dim, gpu_block_ids, gpu_tensor_handler, gpu_startoff_inside_chunks_int64, cpu_block_ids, cpu_ptr_int64, cpu_kv_stride_int64, cpu_layer_stride_int64, cpu_block_stride_int64, cpu_startoff_inside_chunks_int64, chunk_size_in_bytes, stream, is_host_to_device); return; }
+    if (!gpu_ids_raw) { ce_transfer_per_block<Type>(num_blocks, start_layer_id, num_layers, kv_dim, gpu_block_ids, gpu_tensor_handler, gpu_startoff_inside_chunks_int64, cpu_block_ids, cpu_ptr_int64, cpu_kv_stride_int64, cpu_layer_stride_int64, cpu_block_stride_int64, cpu_startoff_inside_chunks_int64, chunk_size_in_bytes, stream, is_host_to_device, ce_config); return; }
     cudaMemcpyAsync(gpu_ids_raw, gpu_block_ids, ids_bytes,
                     cudaMemcpyHostToDevice, stream);
     gpu_ids_cuda = at::from_blob(gpu_ids_raw, {num_blocks}, i64_cuda);
 
     if (is_host_to_device) {
       dst_ids_raw = get_cached_device_buffer(ids_bytes, 1);  // slot=1
-      if (!dst_ids_raw) { ce_transfer_per_block<Type>(num_blocks, start_layer_id, num_layers, kv_dim, gpu_block_ids, gpu_tensor_handler, gpu_startoff_inside_chunks_int64, cpu_block_ids, cpu_ptr_int64, cpu_kv_stride_int64, cpu_layer_stride_int64, cpu_block_stride_int64, cpu_startoff_inside_chunks_int64, chunk_size_in_bytes, stream, is_host_to_device); return; }
+      if (!dst_ids_raw) { ce_transfer_per_block<Type>(num_blocks, start_layer_id, num_layers, kv_dim, gpu_block_ids, gpu_tensor_handler, gpu_startoff_inside_chunks_int64, cpu_block_ids, cpu_ptr_int64, cpu_kv_stride_int64, cpu_layer_stride_int64, cpu_block_stride_int64, cpu_startoff_inside_chunks_int64, chunk_size_in_bytes, stream, is_host_to_device, ce_config); return; }
       cudaMemcpyAsync(dst_ids_raw, gpu_block_ids, ids_bytes,
                       cudaMemcpyHostToDevice, stream);
       dst_ids_cuda = at::from_blob(dst_ids_raw, {num_blocks}, i64_cuda);
@@ -879,7 +995,7 @@ void ce_transfer_gather_scatter(
     bool need_two = !is_host_to_device;  // D2H ping-pong only
     size_t dev_alloc = need_two ? buf_bytes * 2 : buf_bytes;
     void *dev_base = get_cached_device_buffer(dev_alloc, 2);  // slot=2
-    if (!dev_base) { ce_transfer_per_block<Type>(num_blocks, start_layer_id, num_layers, kv_dim, gpu_block_ids, gpu_tensor_handler, gpu_startoff_inside_chunks_int64, cpu_block_ids, cpu_ptr_int64, cpu_kv_stride_int64, cpu_layer_stride_int64, cpu_block_stride_int64, cpu_startoff_inside_chunks_int64, chunk_size_in_bytes, stream, is_host_to_device); return; }
+    if (!dev_base) { ce_transfer_per_block<Type>(num_blocks, start_layer_id, num_layers, kv_dim, gpu_block_ids, gpu_tensor_handler, gpu_startoff_inside_chunks_int64, cpu_block_ids, cpu_ptr_int64, cpu_kv_stride_int64, cpu_layer_stride_int64, cpu_block_stride_int64, cpu_startoff_inside_chunks_int64, chunk_size_in_bytes, stream, is_host_to_device, ce_config); return; }
     dev_raw[0] = dev_base;
     dev_buf[0] = at::from_blob(dev_raw[0], {num_blocks, elems_per_block},
                                i64_cuda);
@@ -925,6 +1041,13 @@ void ce_transfer_gather_scatter(
   if (ce_config.enable_memcpy2d && ce_analysis.num_segments <= ce_config.segment_threshold) {
     cudaMemcpyKind kind = is_host_to_device ? cudaMemcpyHostToDevice
                                             : cudaMemcpyDeviceToHost;
+    // Batch coalesce: collect 2D params per iter, submit once (CUDA 12+).
+    std::vector<cudaMemcpyParams> params;
+#if CUDART_VERSION >= 12000
+    if (ce_config.enable_memcpy_batch) {
+      params.reserve(ce_analysis.segments.size());
+    }
+#endif
     for (int64_t it = 0; it < total_iters; ++it) {
       int i = (int)(it / kv_dim);
       int j = (int)(it % kv_dim);
@@ -966,16 +1089,41 @@ void ce_transfer_gather_scatter(
         }
 
         // Step 2: memcpy2d dev_buf/GPU -> CPU (strided, per segment)
+        params.clear();
         for (const auto &seg : ce_analysis.segments) {
           int64_t cb = cpu_block_ids[seg.start_k];
           void *cpu_dst = cpu_base + cb * cpu_block_stride_int64;
           void *src = (char *)d2h_src +
                       (int64_t)seg.start_k * chunk_size_in_bytes;
-          cudaMemcpy2DAsync(cpu_dst, cpu_pitch, src, dev_pitch,
-                            chunk_size_in_bytes, (size_t)seg.nr_blocks,
-                            kind, stream);
+#if CUDART_VERSION >= 12000
+          if (ce_config.enable_memcpy_batch) {
+            cudaMemcpyParams p;
+            p.srcMemoryType = is_host_to_device ? cudaMemoryTypeHost
+                                                : cudaMemoryTypeDevice;
+            p.dstMemoryType = is_host_to_device ? cudaMemoryTypeDevice
+                                                : cudaMemoryTypeHost;
+            p.src = src;
+            p.dst = cpu_dst;
+            p.extent.pitch2D.srcPitch = dev_pitch;
+            p.extent.pitch2D.dstPitch = cpu_pitch;
+            p.extent.pitch2D.width = (size_t)chunk_size_in_bytes;
+            p.extent.pitch2D.height = (size_t)seg.nr_blocks;
+            p.reserved = nullptr;
+            params.push_back(p);
+          } else
+#endif
+          {
+            cudaMemcpy2DAsync(cpu_dst, cpu_pitch, src, dev_pitch,
+                              chunk_size_in_bytes, (size_t)seg.nr_blocks,
+                              kind, stream);
+          }
           FLEXKV_GPU_CPU_TRANSFER(false, chunk_size_in_bytes * seg.nr_blocks);
         }
+#if CUDART_VERSION >= 12000
+        if (ce_config.enable_memcpy_batch && !params.empty()) {
+          cudaMemcpyBatchAsync(params.data(), (unsigned long)params.size(), stream);
+        }
+#endif
         cudaStreamSynchronize(stream);
       } else {
         // ---- H2D ----
@@ -991,16 +1139,41 @@ void ce_transfer_gather_scatter(
           dev_pitch = (size_t)chunk_size_in_bytes;
         }
 
+        params.clear();
         for (const auto &seg : ce_analysis.segments) {
           int64_t cb = cpu_block_ids[seg.start_k];
           const int64_t *cpu_src = cpu_base + cb * cpu_block_stride_int64;
           void *dst = (char *)h2d_dst +
                       (int64_t)seg.start_k * chunk_size_in_bytes;
-          cudaMemcpy2DAsync(dst, dev_pitch, cpu_src, cpu_pitch,
-                            chunk_size_in_bytes, (size_t)seg.nr_blocks,
-                            kind, stream);
+#if CUDART_VERSION >= 12000
+          if (ce_config.enable_memcpy_batch) {
+            cudaMemcpyParams p;
+            p.srcMemoryType = is_host_to_device ? cudaMemoryTypeHost
+                                                : cudaMemoryTypeDevice;
+            p.dstMemoryType = is_host_to_device ? cudaMemoryTypeDevice
+                                                : cudaMemoryTypeHost;
+            p.src = cpu_src;
+            p.dst = dst;
+            p.extent.pitch2D.srcPitch = cpu_pitch;
+            p.extent.pitch2D.dstPitch = dev_pitch;
+            p.extent.pitch2D.width = (size_t)chunk_size_in_bytes;
+            p.extent.pitch2D.height = (size_t)seg.nr_blocks;
+            p.reserved = nullptr;
+            params.push_back(p);
+          } else
+#endif
+          {
+            cudaMemcpy2DAsync(dst, dev_pitch, cpu_src, cpu_pitch,
+                              chunk_size_in_bytes, (size_t)seg.nr_blocks,
+                              kind, stream);
+          }
           FLEXKV_GPU_CPU_TRANSFER(true, chunk_size_in_bytes * seg.nr_blocks);
         }
+#if CUDART_VERSION >= 12000
+        if (ce_config.enable_memcpy_batch && !params.empty()) {
+          cudaMemcpyBatchAsync(params.data(), (unsigned long)params.size(), stream);
+        }
+#endif
         cudaStreamSynchronize(stream);
 
         // Step 2: GPU scatter (if needed)
@@ -1219,7 +1392,7 @@ void ce_transfer_gather_direct(
   at::Tensor gpu_ids_cuda;
   if (!ce_analysis.gpu_log_contig) {
     gpu_ids_raw = get_cached_device_buffer(ids_bytes);
-    if (!gpu_ids_raw) { ce_transfer_per_block<Type>(num_blocks, start_layer_id, num_layers, kv_dim, gpu_block_ids, gpu_tensor_handler, gpu_startoff_inside_chunks_int64, cpu_block_ids, cpu_ptr_int64, cpu_kv_stride_int64, cpu_layer_stride_int64, cpu_block_stride_int64, cpu_startoff_inside_chunks_int64, chunk_size_in_bytes, stream, is_host_to_device); return; }
+    if (!gpu_ids_raw) { ce_transfer_per_block<Type>(num_blocks, start_layer_id, num_layers, kv_dim, gpu_block_ids, gpu_tensor_handler, gpu_startoff_inside_chunks_int64, cpu_block_ids, cpu_ptr_int64, cpu_kv_stride_int64, cpu_layer_stride_int64, cpu_block_stride_int64, cpu_startoff_inside_chunks_int64, chunk_size_in_bytes, stream, is_host_to_device, ce_config); return; }
     cudaMemcpyAsync(gpu_ids_raw, gpu_block_ids, ids_bytes,
                     cudaMemcpyHostToDevice, stream);
     gpu_ids_cuda = at::from_blob(gpu_ids_raw, {num_blocks}, i64_cuda);
@@ -1227,7 +1400,7 @@ void ce_transfer_gather_direct(
 
   // Device staging buffer: [num_blocks, total_iters, elems_per_block] contiguous
   void *dev_staging = get_cached_device_buffer(total_dev_bytes, 2);
-  if (!dev_staging) { ce_transfer_per_block<Type>(num_blocks, start_layer_id, num_layers, kv_dim, gpu_block_ids, gpu_tensor_handler, gpu_startoff_inside_chunks_int64, cpu_block_ids, cpu_ptr_int64, cpu_kv_stride_int64, cpu_layer_stride_int64, cpu_block_stride_int64, cpu_startoff_inside_chunks_int64, chunk_size_in_bytes, stream, is_host_to_device); return; }
+  if (!dev_staging) { ce_transfer_per_block<Type>(num_blocks, start_layer_id, num_layers, kv_dim, gpu_block_ids, gpu_tensor_handler, gpu_startoff_inside_chunks_int64, cpu_block_ids, cpu_ptr_int64, cpu_kv_stride_int64, cpu_layer_stride_int64, cpu_block_stride_int64, cpu_startoff_inside_chunks_int64, chunk_size_in_bytes, stream, is_host_to_device, ce_config); return; }
   at::Tensor dev_staging_view = at::from_blob(
       dev_staging, {num_blocks, total_iters, elems_per_block}, i64_cuda);
 
@@ -1283,6 +1456,13 @@ void ce_transfer_gather_direct(
       size_t width = (size_t)total_iters * chunk_size_in_bytes;
       if (ce_config.enable_memcpy2d) {
         size_t spitch = (size_t)cpu_block_stride_int64 * sizeof(int64_t);
+        // Batch coalesce: collect 2D params, submit once (CUDA 12+).
+        std::vector<cudaMemcpyParams> params;
+#if CUDART_VERSION >= 12000
+        if (ce_config.enable_memcpy_batch) {
+          params.reserve(ce_analysis.segments.size());
+        }
+#endif
         for (const auto &seg : ce_analysis.segments) {
           int64_t seg_start_block = cpu_block_ids[seg.start_k];
           int64_t *cpu_dst = cpu_ptr_int64 +
@@ -1291,11 +1471,34 @@ void ce_transfer_gather_direct(
               cpu_startoff_inside_chunks_int64;
           void *src = (char *)dev_staging +
               (int64_t)seg.start_k * total_iters * chunk_size_in_bytes;
-          cudaMemcpy2DAsync(cpu_dst, spitch, src, width,
-                            width, (size_t)seg.nr_blocks,
-                            cudaMemcpyDeviceToHost, stream);
+#if CUDART_VERSION >= 12000
+          if (ce_config.enable_memcpy_batch) {
+            cudaMemcpyParams p;
+            p.srcMemoryType = cudaMemoryTypeDevice;
+            p.dstMemoryType = cudaMemoryTypeHost;
+            p.src = src;
+            p.dst = cpu_dst;
+            p.extent.pitch2D.srcPitch = width;
+            p.extent.pitch2D.dstPitch = spitch;
+            p.extent.pitch2D.width = width;
+            p.extent.pitch2D.height = (size_t)seg.nr_blocks;
+            p.reserved = nullptr;
+            params.push_back(p);
+          } else
+#endif
+          {
+            cudaMemcpy2DAsync(cpu_dst, spitch, src, width,
+                              width, (size_t)seg.nr_blocks,
+                              cudaMemcpyDeviceToHost, stream);
+          }
           FLEXKV_GPU_CPU_TRANSFER(false, width * seg.nr_blocks);
         }
+#if CUDART_VERSION >= 12000
+        // CUDA<12: falls through to per-call path above (no batch symbol).
+        if (ce_config.enable_memcpy_batch && !params.empty()) {
+          cudaMemcpyBatchAsync(params.data(), (unsigned long)params.size(), stream);
+        }
+#endif
       } else {
         for (int b = 0; b < num_blocks; ++b) {
           int64_t cb = cpu_block_ids[b];
@@ -1337,6 +1540,13 @@ void ce_transfer_gather_direct(
       size_t width = (size_t)total_iters * chunk_size_in_bytes;
       if (ce_config.enable_memcpy2d) {
         size_t spitch = (size_t)cpu_block_stride_int64 * sizeof(int64_t);
+        // Batch coalesce: collect 2D params, submit once (CUDA 12+).
+        std::vector<cudaMemcpyParams> params;
+#if CUDART_VERSION >= 12000
+        if (ce_config.enable_memcpy_batch) {
+          params.reserve(ce_analysis.segments.size());
+        }
+#endif
         for (const auto &seg : ce_analysis.segments) {
           int64_t seg_start_block = cpu_block_ids[seg.start_k];
           const int64_t *cpu_src = cpu_ptr_int64 +
@@ -1345,11 +1555,34 @@ void ce_transfer_gather_direct(
               cpu_startoff_inside_chunks_int64;
           void *dst = (char *)dev_staging +
               (int64_t)seg.start_k * total_iters * chunk_size_in_bytes;
-          cudaMemcpy2DAsync(dst, width, cpu_src, spitch,
-                            width, (size_t)seg.nr_blocks,
-                            cudaMemcpyHostToDevice, stream);
+#if CUDART_VERSION >= 12000
+          if (ce_config.enable_memcpy_batch) {
+            cudaMemcpyParams p;
+            p.srcMemoryType = cudaMemoryTypeHost;
+            p.dstMemoryType = cudaMemoryTypeDevice;
+            p.src = cpu_src;
+            p.dst = dst;
+            p.extent.pitch2D.srcPitch = spitch;
+            p.extent.pitch2D.dstPitch = width;
+            p.extent.pitch2D.width = width;
+            p.extent.pitch2D.height = (size_t)seg.nr_blocks;
+            p.reserved = nullptr;
+            params.push_back(p);
+          } else
+#endif
+          {
+            cudaMemcpy2DAsync(dst, width, cpu_src, spitch,
+                              width, (size_t)seg.nr_blocks,
+                              cudaMemcpyHostToDevice, stream);
+          }
           FLEXKV_GPU_CPU_TRANSFER(true, width * seg.nr_blocks);
         }
+#if CUDART_VERSION >= 12000
+        // CUDA<12: falls through to per-call path above (no batch symbol).
+        if (ce_config.enable_memcpy_batch && !params.empty()) {
+          cudaMemcpyBatchAsync(params.data(), (unsigned long)params.size(), stream);
+        }
+#endif
       } else {
         for (int b = 0; b < num_blocks; ++b) {
           int64_t cb = cpu_block_ids[b];

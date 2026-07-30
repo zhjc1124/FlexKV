@@ -673,6 +673,7 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
         self.ce_path_opt = GLOBAL_CONFIG_FROM_ENV.ce_path_opt
         self.ce_segment_threshold = GLOBAL_CONFIG_FROM_ENV.ce_segment_threshold
         self.ce_enable_memcpy2d = GLOBAL_CONFIG_FROM_ENV.enable_ce_memcpy2d
+        self.ce_enable_memcpy_batch = GLOBAL_CONFIG_FROM_ENV.enable_ce_memcpy_batch
 
         self._compressor = compressor or NullCompressionStrategy()
         self._compressor.attach(self)
@@ -838,6 +839,7 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
                     self.ce_segment_threshold,
                     -1,  # ce_force_path
                     self.ce_enable_memcpy2d,
+                    self.ce_enable_memcpy_batch,
                     self.cpu_is_blockfirst,
                 )
         else:
@@ -866,6 +868,7 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
                 self.ce_segment_threshold,
                 -1,  # ce_force_path
                 self.ce_enable_memcpy2d,
+                self.ce_enable_memcpy_batch,
                 self.cpu_is_blockfirst,
             )
 
@@ -1037,6 +1040,7 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
                 ce_segment_threshold=GLOBAL_CONFIG_FROM_ENV.ce_segment_threshold,
                 ce_path_opt=GLOBAL_CONFIG_FROM_ENV.ce_path_opt,
                 ce_enable_memcpy2d=GLOBAL_CONFIG_FROM_ENV.enable_ce_memcpy2d,
+                ce_enable_memcpy_batch=GLOBAL_CONFIG_FROM_ENV.enable_ce_memcpy_batch,
                 is_blockfirst=self.cpu_is_blockfirst,
                 is_mla=self.is_mla,
                 ce_gather_threads=GLOBAL_CONFIG_FROM_ENV.ce_gather_threads,
@@ -1161,6 +1165,7 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
                 ce_segment_threshold=GLOBAL_CONFIG_FROM_ENV.ce_segment_threshold,
                 ce_path_opt=GLOBAL_CONFIG_FROM_ENV.ce_path_opt,
                 ce_enable_memcpy2d=GLOBAL_CONFIG_FROM_ENV.enable_ce_memcpy2d,
+                ce_enable_memcpy_batch=GLOBAL_CONFIG_FROM_ENV.enable_ce_memcpy_batch,
                 is_blockfirst=(cpu_layout_type == KVCacheLayoutType.BLOCKFIRST),
                 is_mla=self.is_mla,
             )

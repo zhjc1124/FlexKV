@@ -155,6 +155,7 @@ ENGINES = [
 MLA_MODES = ["sharded", "all_write", "rank0_only", "layer_parallel", "rank_rotate"]
 
 CE_MEMCPY2D_CONFIGS = [False, True]
+CE_MEMCPY_BATCH_CONFIGS = [False, True]
 
 
 # Helpers (matching production code in worker.py / layerwise.py)
@@ -284,6 +285,7 @@ def make_tp_group(cpu_ptr, all_gpu, num_gpus, gpu_layout, num_layers,
                   ce_segment_threshold=None,
                   ce_path_opt=None,
                   ce_enable_memcpy2d=None,
+                  ce_enable_memcpy_batch=None,
                   ce_gather_threads=None,
                   ce_gather_nt=None,
                   is_blockfirst=None,
@@ -302,6 +304,8 @@ def make_tp_group(cpu_ptr, all_gpu, num_gpus, gpu_layout, num_layers,
         ce_path_opt = GLOBAL_CONFIG_FROM_ENV.ce_path_opt
     if ce_enable_memcpy2d is None:
         ce_enable_memcpy2d = GLOBAL_CONFIG_FROM_ENV.enable_ce_memcpy2d
+    if ce_enable_memcpy_batch is None:
+        ce_enable_memcpy_batch = GLOBAL_CONFIG_FROM_ENV.enable_ce_memcpy_batch
     if ce_gather_threads is None:
         ce_gather_threads = GLOBAL_CONFIG_FROM_ENV.ce_gather_threads
     if ce_gather_nt is None:
@@ -331,6 +335,7 @@ def make_tp_group(cpu_ptr, all_gpu, num_gpus, gpu_layout, num_layers,
         ce_segment_threshold=ce_segment_threshold,
         ce_path_opt=ce_path_opt,
         ce_enable_memcpy2d=ce_enable_memcpy2d,
+        ce_enable_memcpy_batch=ce_enable_memcpy_batch,
         ce_gather_threads=ce_gather_threads,
         ce_gather_nt=ce_gather_nt,
         is_blockfirst=is_blockfirst,
@@ -342,6 +347,7 @@ def make_layerwise_group(cpu_tensor, all_gpu, num_gpus, gpu_layout, num_layers,
                          ce_segment_threshold=None,
                          ce_path_opt=None,
                          ce_enable_memcpy2d=None,
+                         ce_enable_memcpy_batch=None,
                          ce_gather_threads=None,
                          ce_gather_nt=None,
                          is_blockfirst=None,
@@ -364,6 +370,8 @@ def make_layerwise_group(cpu_tensor, all_gpu, num_gpus, gpu_layout, num_layers,
         ce_path_opt = GLOBAL_CONFIG_FROM_ENV.ce_path_opt
     if ce_enable_memcpy2d is None:
         ce_enable_memcpy2d = GLOBAL_CONFIG_FROM_ENV.enable_ce_memcpy2d
+    if ce_enable_memcpy_batch is None:
+        ce_enable_memcpy_batch = GLOBAL_CONFIG_FROM_ENV.enable_ce_memcpy_batch
     if ce_gather_threads is None:
         ce_gather_threads = GLOBAL_CONFIG_FROM_ENV.ce_gather_threads
     if ce_gather_nt is None:
@@ -407,6 +415,7 @@ def make_layerwise_group(cpu_tensor, all_gpu, num_gpus, gpu_layout, num_layers,
         ce_segment_threshold=ce_segment_threshold,
         ce_path_opt=ce_path_opt,
         ce_enable_memcpy2d=ce_enable_memcpy2d,
+        ce_enable_memcpy_batch=ce_enable_memcpy_batch,
         ce_gather_threads=ce_gather_threads,
         ce_gather_nt=ce_gather_nt,
         is_blockfirst=is_blockfirst,
@@ -423,6 +432,7 @@ def layerwise_h2d_readback(all_gpu, cpu_kv, num_gpus, gpu_layout, num_layers,
                            notify_mode="hostfunc", layer_granularity=None,
                            is_blockfirst=None,
                            enable_memcpy2d=None,
+                           ce_enable_memcpy_batch=None,
                            ce_gather_threads=None,
                            ce_gather_nt=None):
     """Run a single CE H2D via LayerwiseTransferGroup, reading `cpu_kv` back
@@ -444,7 +454,8 @@ def layerwise_h2d_readback(all_gpu, cpu_kv, num_gpus, gpu_layout, num_layers,
                                     ce_gather_threads=ce_gather_threads,
                                     ce_gather_nt=ce_gather_nt,
                                     is_blockfirst=is_blockfirst,
-                                    ce_enable_memcpy2d=enable_memcpy2d)
+                                    ce_enable_memcpy2d=enable_memcpy2d,
+                                    ce_enable_memcpy_batch=ce_enable_memcpy_batch)
     empty_ids = torch.empty(0, dtype=torch.int64).pin_memory()
     lw_group.layerwise_transfer(
         ssd_block_ids=empty_ids,
@@ -1177,8 +1188,10 @@ def _expected_strategy(pattern_name, cpu_layout_name, is_mla, mode,
                          ids=lambda t: "thr{}".format(t))
 @pytest.mark.parametrize("path_opt", [False, True], ids=["baseline", "optimized"])
 @pytest.mark.parametrize("enable_memcpy2d", CE_MEMCPY2D_CONFIGS, ids=["no_memcpy2d", "memcpy2d"])
+@pytest.mark.parametrize("enable_memcpy_batch", CE_MEMCPY_BATCH_CONFIGS, ids=["no_batch", "batch"])
 def test_ce_paths_roundtrip(data_config, is_mla, cpu_layout_name, pattern,
-                            path_opt, mode, segment_threshold, enable_memcpy2d):
+                            path_opt, mode, segment_threshold, enable_memcpy2d,
+                            enable_memcpy_batch):
     """CE strategy round-trip correctness via block-id patterns.
 
     Combos come from CE_MODE_CONFIGS: MLA sizes x {sharded, all_write,
@@ -1231,7 +1244,8 @@ def test_ce_paths_roundtrip(data_config, is_mla, cpu_layout_name, pattern,
                        gpu_layout, num_layers, ce_path_opt=path_opt,
                        ce_segment_threshold=segment_threshold,
                        is_blockfirst=(cpu_layout_name == "BLOCKFIRST"),
-                       ce_enable_memcpy2d=enable_memcpy2d)
+                       ce_enable_memcpy2d=enable_memcpy2d,
+                       ce_enable_memcpy_batch=enable_memcpy_batch)
 
     ids = make_block_id_pattern(pattern, num_blocks)
     gpu_block_ids = ids
@@ -1298,9 +1312,11 @@ def test_ce_paths_roundtrip(data_config, is_mla, cpu_layout_name, pattern,
 @pytest.mark.parametrize("notify_mode", ["polling"], ids=["polling"])
 @pytest.mark.parametrize("layer_granularity", [1, None], ids=["lg1", "lg_all"])
 @pytest.mark.parametrize("enable_memcpy2d", CE_MEMCPY2D_CONFIGS, ids=["no_memcpy2d", "memcpy2d"])
+@pytest.mark.parametrize("enable_memcpy_batch", CE_MEMCPY_BATCH_CONFIGS, ids=["no_batch", "batch"])
 def test_ce_paths_layerwise_h2d(data_config, is_mla, cpu_layout_name, pattern,
                                 path_opt, mode, segment_threshold,
-                                notify_mode, layer_granularity, enable_memcpy2d):
+                                notify_mode, layer_granularity, enable_memcpy2d,
+                                enable_memcpy_batch):
     """CE strategy correctness for LayerwiseTransferGroup H2D.
 
     Uses TPTransferThreadGroup D2H (already verified correct) to prepare
@@ -1365,7 +1381,8 @@ def test_ce_paths_layerwise_h2d(data_config, is_mla, cpu_layout_name, pattern,
     tp = make_tp_group(cpu_kv.data_ptr(), all_gpu, num_gpus,
                        gpu_layout, num_layers,
                        is_blockfirst=(cpu_layout_name == "BLOCKFIRST"),
-                       ce_enable_memcpy2d=enable_memcpy2d)
+                       ce_enable_memcpy2d=enable_memcpy2d,
+                       ce_enable_memcpy_batch=enable_memcpy_batch)
     tp.tp_group_transfer(
         gpu_block_id_tensor=ids, cpu_block_id_tensor=ids,
         cpu_kv_stride_in_bytes=cpu_stride_kv,
@@ -1398,7 +1415,8 @@ def test_ce_paths_layerwise_h2d(data_config, is_mla, cpu_layout_name, pattern,
         ce_segment_threshold=segment_threshold, notify_mode=notify_mode,
         layer_granularity=layer_granularity,
         is_blockfirst=(cpu_layout_name == "BLOCKFIRST"),
-        enable_memcpy2d=enable_memcpy2d)
+        enable_memcpy2d=enable_memcpy2d,
+        ce_enable_memcpy_batch=enable_memcpy_batch)
 
     # Verify GPU data == original
     expected_gpu = 0 if is_mla else None

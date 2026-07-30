@@ -204,7 +204,7 @@ void transfer_kv_blocks(
           gpu_startoff_inside_chunks_int64, cpu_block_ids, cpu_ptr_int64,
           cpu_kv_stride_int64, cpu_layer_stride_int64,
           cpu_block_stride_int64, cpu_startoff_inside_chunks_int64,
-          chunk_size_in_bytes, stream, is_host_to_device);
+          chunk_size_in_bytes, stream, is_host_to_device, ce_config);
     } else {
       // force_path: benchmark only
       CEPath path;
@@ -229,7 +229,7 @@ void transfer_kv_blocks(
               gpu_startoff_inside_chunks_int64, cpu_block_ids, cpu_ptr_int64,
               cpu_kv_stride_int64, cpu_layer_stride_int64,
               cpu_block_stride_int64, cpu_startoff_inside_chunks_int64,
-              chunk_size_in_bytes, stream, is_host_to_device);
+              chunk_size_in_bytes, stream, is_host_to_device, ce_config);
           break;
         case CEPath::SEGMENT_DIRECT:
           ce_transfer_segment_direct<Type>(

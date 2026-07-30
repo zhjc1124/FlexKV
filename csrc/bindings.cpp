@@ -58,7 +58,8 @@ void transfer_kv_blocks_binding(
     bool sync = true,
     bool ce_path_opt = false,
     int ce_segment_threshold = 8, int ce_force_path = -1,
-    bool ce_enable_memcpy2d = false, bool is_blockfirst = false,
+    bool ce_enable_memcpy2d = false, bool ce_enable_memcpy_batch = false,
+    bool is_blockfirst = false,
     int ce_gather_threads = 4, bool ce_gather_nt = true) {
   int num_blocks = gpu_block_id_tensor.numel();
 
@@ -91,6 +92,7 @@ void transfer_kv_blocks_binding(
   ce_config.segment_threshold = ce_segment_threshold;
   ce_config.force_path = ce_force_path;
   ce_config.enable_memcpy2d = ce_enable_memcpy2d;
+  ce_config.enable_memcpy_batch = ce_enable_memcpy_batch;
   ce_config.is_blockfirst = is_blockfirst;
   ce_config.is_mla = is_mla;
   ce_config.gather_threads = ce_gather_threads;
@@ -439,6 +441,7 @@ PYBIND11_MODULE(c_ext, m) {
         py::arg("ce_path_opt") = false,
         py::arg("ce_segment_threshold") = 8, py::arg("ce_force_path") = -1,
         py::arg("ce_enable_memcpy2d") = false,
+        py::arg("ce_enable_memcpy_batch") = false,
         py::arg("is_blockfirst") = false,
         py::arg("ce_gather_threads") = 4,
         py::arg("ce_gather_nt") = true);
@@ -474,7 +477,7 @@ PYBIND11_MODULE(c_ext, m) {
                        int64_t ce_segment_threshold,
                        bool ce_path_opt,
                        int ce_force_path,
-                       bool ce_enable_memcpy2d,
+                       bool ce_enable_memcpy2d, bool ce_enable_memcpy_batch,
                        bool is_blockfirst,
                        bool is_mla,
                        int ce_gather_threads,
@@ -484,6 +487,7 @@ PYBIND11_MODULE(c_ext, m) {
             cfg.path_opt_enabled = ce_path_opt;
             cfg.force_path = ce_force_path;
             cfg.enable_memcpy2d = ce_enable_memcpy2d;
+            cfg.enable_memcpy_batch = ce_enable_memcpy_batch;
             cfg.is_blockfirst = is_blockfirst;
             cfg.is_mla = is_mla;
             cfg.gather_threads = ce_gather_threads;
@@ -520,6 +524,7 @@ PYBIND11_MODULE(c_ext, m) {
            py::arg("ce_path_opt") = true,
            py::arg("ce_force_path") = -1,
            py::arg("ce_enable_memcpy2d") = false,
+           py::arg("ce_enable_memcpy_batch") = false,
            py::arg("is_blockfirst") = false,
            py::arg("is_mla") = false,
            py::arg("ce_gather_threads") = 4,
@@ -558,13 +563,14 @@ PYBIND11_MODULE(c_ext, m) {
           torch::Tensor swa_gpu_layer_strides_tensor,
           torch::Tensor swa_gpu_chunk_sizes_tensor,
           int64_t ce_segment_threshold, bool ce_path_opt, int ce_force_path,
-          bool ce_enable_memcpy2d, bool is_blockfirst, bool is_mla,
+          bool ce_enable_memcpy2d, bool ce_enable_memcpy_batch, bool is_blockfirst, bool is_mla,
           int ce_gather_threads, bool ce_gather_nt, bool ssd_io_opt) {
             flexkv::CETransferConfig cfg;
             cfg.segment_threshold = ce_segment_threshold;
             cfg.path_opt_enabled = ce_path_opt;
             cfg.force_path = ce_force_path;
             cfg.enable_memcpy2d = ce_enable_memcpy2d;
+            cfg.enable_memcpy_batch = ce_enable_memcpy_batch;
             cfg.is_blockfirst = is_blockfirst;
             cfg.is_mla = is_mla;
             cfg.gather_threads = ce_gather_threads;
@@ -613,6 +619,7 @@ PYBIND11_MODULE(c_ext, m) {
           py::arg("ce_path_opt") = true,
           py::arg("ce_force_path") = -1,
           py::arg("ce_enable_memcpy2d") = false,
+          py::arg("ce_enable_memcpy_batch") = false,
           py::arg("is_blockfirst") = false,
           py::arg("is_mla") = false,
           py::arg("ce_gather_threads") = 4,
@@ -752,7 +759,7 @@ PYBIND11_MODULE(c_ext, m) {
                        int64_t ce_segment_threshold,
                        bool ce_path_opt,
                        int ce_force_path,
-                       bool ce_enable_memcpy2d,
+                       bool ce_enable_memcpy2d, bool ce_enable_memcpy_batch,
                        bool is_blockfirst,
                        bool is_mla,
                        int ce_gather_threads,
@@ -762,6 +769,7 @@ PYBIND11_MODULE(c_ext, m) {
             cfg.path_opt_enabled = ce_path_opt;
             cfg.force_path = ce_force_path;
             cfg.enable_memcpy2d = ce_enable_memcpy2d;
+            cfg.enable_memcpy_batch = ce_enable_memcpy_batch;
             cfg.is_blockfirst = is_blockfirst;
             cfg.is_mla = is_mla;
             cfg.gather_threads = ce_gather_threads;
@@ -787,6 +795,7 @@ PYBIND11_MODULE(c_ext, m) {
            py::arg("ce_path_opt") = true,
            py::arg("ce_force_path") = -1,
            py::arg("ce_enable_memcpy2d") = false,
+           py::arg("ce_enable_memcpy_batch") = false,
            py::arg("is_blockfirst") = false,
            py::arg("is_mla") = false,
            py::arg("ce_gather_threads") = 4,

@@ -31,9 +31,19 @@ cudaMemcpy2DAsync is slow or unsupported, set FLEXKV_ENABLE_CE_MEMCPY2D=0 to
 use the portable staging + CPU scatter path. Default is ON (NVIDIA fast);
 pass --memcpy2d off to disable.
 
+batch (FLEXKV_ENABLE_CE_MEMCPY_BATCH, default OFF) is ORTHOGONAL to memcpy2d
+and path_opt. When ON (and CUDA >= 12.0), N per-call cudaMemcpy*Async submits
+are merged into one cudaMemcpyBatchAsync driver submission (1D array version
+for PER_BLOCK / non-2D branches; 2D cudaMemcpyParams version for the memcpy2d
+branches of paths 2/3/4). It only reduces host/driver SUBMIT overhead — GPU
+bytes copied are byte-identical to the per-call path. On P800 / CUDA < 12 it
+compile-time degrades to per-call (no symbol referenced). Default OFF for the
+first release; pass --batch on to measure it.
+
 Usage:
     python benchmarks/microbenchmark_ce_strategy.py --num-gpus 4 --iters 20
     python benchmarks/microbenchmark_ce_strategy.py --num-gpus 4 --iters 20 --memcpy2d off
+    python benchmarks/microbenchmark_ce_strategy.py --num-gpus 4 --iters 20 --batch on
 """
 
 import argparse
@@ -53,6 +63,7 @@ except ImportError:
 
 try:
     from flexkv.c_ext import TPTransferThreadGroup
+    from flexkv.common.config import GLOBAL_CONFIG_FROM_ENV
     from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
     FLEXKV_AVAILABLE = True
 except ImportError as e:
@@ -146,7 +157,8 @@ def make_tp_group(cpu_ptr, all_gpu, num_gpus, gpu_layout, num_layers,
                   ce_path_opt=True,
                   ce_segment_threshold=8, ce_force_path=-1,
                   is_mla=False, is_blockfirst=False,
-                  ce_enable_memcpy2d=False):
+                  ce_enable_memcpy2d=False,
+                  ce_enable_memcpy_batch=False):
     """TPTransferThreadGroup with CE config passed per-construction."""
     gpu_ptrs = []
     for g in range(num_gpus):
@@ -167,7 +179,8 @@ def make_tp_group(cpu_ptr, all_gpu, num_gpus, gpu_layout, num_layers,
         ce_force_path=ce_force_path,
         is_mla=is_mla,
         is_blockfirst=is_blockfirst,
-        ce_enable_memcpy2d=ce_enable_memcpy2d)
+        ce_enable_memcpy2d=ce_enable_memcpy2d,
+        ce_enable_memcpy_batch=ce_enable_memcpy_batch)
 
 
 def fill_gpu(all_gpu, gpu_id, num_layers, num_blocks, head_dim):
@@ -446,6 +459,7 @@ def run_strategy_compare(args):
     # PER_BLOCK baseline is pattern-independent. Cache by (size, layout, mode,
     # dir) so we only time it once per unique combo.
     baseline_cache = {}
+    baseline_batch_cache = {}
     # MLA H2D is mode-independent — cache first mode's timings for reuse.
     h2d_mla_cache = {}
 
@@ -461,6 +475,9 @@ def run_strategy_compare(args):
         "on (default) — SEGMENT_SCATTER/GATHER_SCATTER/GATHER_DIRECT also timed "
         "with cudaMemcpy2DAsync"
         if args.memcpy2d == "on" else "off"))
+    print("  batch:      {}".format(
+        "on — each strategy + auto + baseline also timed with cudaMemcpyBatchAsync"
+        if args.batch == "on" else "off (default)"))
     print("=" * 100)
 
     # results[size][(form_name, dir_name)][strategy_name] = median_ms
@@ -604,6 +621,34 @@ def run_strategy_compare(args):
                     except Exception as e:
                         print("FAILED: {}".format(e))
 
+                # Baseline batch variant (PER_BLOCK + cudaMemcpyBatchAsync, combo 1).
+                if args.batch == "on":
+                    bk_b = (size_name, layout_key, mode, dir_name)
+                    cached_bsb = baseline_batch_cache.get(bk_b)
+                    if cached_bsb is not None:
+                        results[key]["baseline [batch]"] = cached_bsb
+                        print("  baseline [batch] {:.3f} ms (cached)".format(cached_bsb))
+                    else:
+                        print("  baseline [batch] ...", end=" ", flush=True)
+                        try:
+                            tp = make_tp_group(
+                                cpu_kv.data_ptr(), all_gpu, num_gpus, gpu_layout,
+                                num_layers, ce_path_opt=False,
+                                ce_segment_threshold=threshold,
+                                is_mla=is_mla,
+                                is_blockfirst=(layout_key == "bfirst"),
+                                ce_enable_memcpy_batch=True)
+                            med = bench_one_dir(
+                                tp, ids, cpu_kv_sb, cpu_ly_sb, cpu_bl_sb, cpu_tp_sb,
+                                num_layers, is_h2d, num_gpus, args.iters, is_mla, mode,
+                                transfer_num_cta=cta)
+                            results[key]["baseline [batch]"] = med
+                            baseline_batch_cache[bk_b] = med
+                            print("{:.3f} ms".format(med))
+                            del tp
+                        except Exception as e:
+                            print("FAILED: {}".format(e))
+
                 # Time every viable strategy (auto measured separately above).
                 for fp_id, fp_name in viable:
                     m2d_settings = [False]
@@ -621,7 +666,8 @@ def run_strategy_compare(args):
                                 ce_force_path=fp_id,
                                 is_mla=is_mla,
                                 is_blockfirst=(layout_key == "bfirst"),
-                                ce_enable_memcpy2d=m2d)
+                                ce_enable_memcpy2d=m2d,
+                                ce_enable_memcpy_batch=False)
                             med = bench_one_dir(
                                 tp, ids, cpu_kv_sb, cpu_ly_sb, cpu_bl_sb, cpu_tp_sb,
                                 num_layers, is_h2d, num_gpus, args.iters, is_mla, mode,
@@ -632,6 +678,26 @@ def run_strategy_compare(args):
                         except Exception as e:
                             results[key][label] = None
                             print("FAILED: {}".format(e))
+                        if args.batch == "on":
+                            try:
+                                tp = make_tp_group(
+                                    cpu_kv.data_ptr(), all_gpu, num_gpus, gpu_layout,
+                                    num_layers, ce_path_opt=True,
+                                    ce_segment_threshold=threshold,
+                                    ce_force_path=fp_id,
+                                    is_mla=is_mla,
+                                    is_blockfirst=(layout_key == "bfirst"),
+                                    ce_enable_memcpy2d=m2d,
+                                    ce_enable_memcpy_batch=True)
+                                med = bench_one_dir(
+                                    tp, ids, cpu_kv_sb, cpu_ly_sb, cpu_bl_sb, cpu_tp_sb,
+                                    num_layers, is_h2d, num_gpus, args.iters, is_mla,
+                                    mode, transfer_num_cta=cta)
+                                results[key][label + " [batch]"] = med
+                                del tp
+                            except Exception as e:
+                                results[key][label + " [batch]"] = None
+                                print("  [batch] FAILED: {}".format(e))
 
                 # Run auto after force-runs to reuse warmup state.
                 print("  auto [{}] ...".format(auto_path), end=" ", flush=True)
@@ -643,7 +709,8 @@ def run_strategy_compare(args):
                         ce_force_path=-1,
                         is_mla=is_mla,
                         is_blockfirst=(layout_key == "bfirst"),
-                        ce_enable_memcpy2d=(args.memcpy2d == "on"))
+                        ce_enable_memcpy2d=(args.memcpy2d == "on"),
+                        ce_enable_memcpy_batch=False)
                     med = bench_one_dir(
                         tp, ids, cpu_kv_sb, cpu_ly_sb, cpu_bl_sb, cpu_tp_sb,
                         num_layers, is_h2d, num_gpus, args.iters, is_mla, mode,
@@ -653,6 +720,25 @@ def run_strategy_compare(args):
                     del tp
                 except Exception as e:
                     print("FAILED: {}".format(e))
+                if args.batch == "on":
+                    try:
+                        tp = make_tp_group(
+                            cpu_kv.data_ptr(), all_gpu, num_gpus, gpu_layout,
+                            num_layers, ce_path_opt=True,
+                            ce_segment_threshold=threshold,
+                            ce_force_path=-1,
+                            is_mla=is_mla,
+                            is_blockfirst=(layout_key == "bfirst"),
+                            ce_enable_memcpy2d=(args.memcpy2d == "on"),
+                            ce_enable_memcpy_batch=True)
+                        med = bench_one_dir(
+                            tp, ids, cpu_kv_sb, cpu_ly_sb, cpu_bl_sb, cpu_tp_sb,
+                            num_layers, is_h2d, num_gpus, args.iters, is_mla,
+                            mode, transfer_num_cta=cta)
+                        results[key]["auto [batch]"] = med
+                        del tp
+                    except Exception as e:
+                        print("  auto [batch] FAILED: {}".format(e))
 
                 # Cache H2D results for MLA reuse (mode-independent, see above).
                 if is_h2d and is_mla:
@@ -831,6 +917,8 @@ def run_strategy_compare(args):
                     fn, dn, ap, au, fv, oh))
         if args.memcpy2d == "on":
             print_memcpy2d_benefit(results, run_rows)
+        if args.batch == "on":
+            print_batch_benefit(results, run_rows)
         print("=" * 100)
 
     # -- Print recommendation summary across all sizes --------------------------
@@ -885,6 +973,82 @@ def print_memcpy2d_benefit(results, run_rows):
     print("  " + "-" * (len(hdr) - 2))
     print("  Non-NVIDIA platforms: memcpy2d=1 is slow/unsupported (keep off).")
     print("  NVIDIA: memcpy2d=1 is fast — enable it there.")
+    print("=" * 100)
+
+
+def print_batch_benefit(results, run_rows):
+    """Focused block: for each (form, dir), compare the best end-to-end latency
+    with cudaMemcpyBatchAsync OFF vs ON, and declare which config is fastest.
+
+    batch (FLEXKV_ENABLE_CE_MEMCPY_BATCH=1) only merges driver submissions
+    (CUDA >= 12.0); GPU bytes copied are byte-identical. On NVIDIA it can cut
+    CPU submit overhead when there are many small chunks (PER_BLOCK, scattered
+    layouts); on P800 / CUDA < 12 it is a no-op compiled fallback. The block
+    prints speedup = off / on and a single global recommendation.
+    """
+    print("\n" + "=" * 100)
+    print("  batch benefit (FLEXKV_ENABLE_CE_MEMCPY_BATCH=1) — per (form, dir)")
+    print("=" * 100)
+    print("  speedup = best_off / best_on  (>1: batch FASTER, <1: SLOWER, ~1: noise)")
+    hdr = "  {:>32s}  {:>4s}  {:>10s}  {:>10s}  {:>9s}  {:>12s}".format(
+        "Form", "Dir", "best_off", "best_on", "speed", "auto_off->on")
+    print(hdr)
+    print("  " + "-" * (len(hdr) - 2))
+    any_row = False
+    faster = 0
+    slower = 0
+    tied = 0
+    for form_name, dir_name, viable in run_rows:
+        cfgs = results.get((form_name, dir_name), {})
+        auto_path = cfgs.get("auto_path", "")
+        viable_names = {pn for _, pn in viable}
+        # Off timings for all viable paths (+ auto fallback).
+        off_vals = []
+        for pname in viable_names:
+            v = cfgs.get(pname)
+            if v is None and pname == auto_path:
+                v = cfgs.get("auto")
+            if v is not None:
+                off_vals.append(v)
+        # On timings (batch variants for each viable path).
+        on_vals = []
+        for pname in viable_names:
+            v = cfgs.get(pname + " [batch]")
+            if v is not None:
+                on_vals.append(v)
+        if not off_vals or not on_vals:
+            continue
+        any_row = True
+        best_off = min(off_vals)
+        best_on = min(on_vals)
+        sp = best_off / best_on if best_on > 0 else float("nan")
+        auto_off = cfgs.get("auto")
+        auto_on = cfgs.get("auto [batch]")
+        if auto_off is not None and auto_on is not None and auto_on > 0:
+            auto_sp_str = "{:.2f}x".format(auto_off / auto_on)
+        else:
+            auto_sp_str = "-"
+        if sp > 1.01:
+            faster += 1
+        elif sp < 0.99:
+            slower += 1
+        else:
+            tied += 1
+        line = "  {:>32s}  {:>4s}  {:>9.3f}  {:>9.3f}  {:>8.2f}x  {:>12s}".format(
+            form_name, dir_name, best_off, best_on, sp, auto_sp_str)
+        print(line)
+    if not any_row:
+        print("  (no batch-timed forms in this size)")
+    else:
+        print("  " + "-" * (len(hdr) - 2))
+        print("  Forms: batch FASTER in {}, SLOWER in {}, ~tie in {}.".format(
+            faster, slower, tied))
+        if faster >= slower:
+            print("  => RECOMMENDED: enable FLEXKV_ENABLE_CE_MEMCPY_BATCH on "
+                  "NVIDIA CUDA >= 12.0 (per-call fallback elsewhere is byte-identical).")
+        else:
+            print("  => NOT clearly beneficial here; keep default OFF unless a "
+                  "specific workload shows batch speedup.")
     print("=" * 100)
 
 
@@ -1063,6 +1227,14 @@ def main():
                              "and print a benefit block. "
                              "On by default (NVIDIA fast); set 'off' on non-NVIDIA "
                              "platforms where cudaMemcpy2DAsync is slow/unsupported.")
+    default_batch = "on" if GLOBAL_CONFIG_FROM_ENV.enable_ce_memcpy_batch else "off"
+    parser.add_argument("--batch", choices=["off", "on"], default=default_batch,
+                        help="When 'on', also time each strategy (and the auto / "
+                             "baseline) with cudaMemcpyBatchAsync coalescing "
+                             "(FLEXKV_ENABLE_CE_MEMCPY_BATCH=1, CUDA >= 12.0). Prints "
+                             "a benefit block (speedup = off / on). The default "
+                             "follows the env var (FLEXKV_ENABLE_CE_MEMCPY_BATCH, "
+                             "OFF by default).")
     args = parser.parse_args()
 
     num_gpus = NUM_GPUS if args.num_gpus <= 0 else min(args.num_gpus, NUM_GPUS)
