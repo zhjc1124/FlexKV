@@ -1,6 +1,9 @@
 // Diagnostic reproducer for cudaMemcpyBatchAsync (CUDA 12.x).
 // Build: nvcc -o /tmp/t benchmarks/test_cuda_batch_api.cu -lcudart && /tmp/t
-// Tries several attribute/buffer configurations to isolate the "invalid argument" cause.
+// Proves the API works ONLY for managed memory (direction comes solely from
+// srcLocHint/dstLocHint, which the CUDA header says are "ignored when the
+// pointers are not managed memory"). FlexKV's buffers are cudaMalloc + pinned
+// (non-managed) -> hints ignored -> invalid argument -> feature must degrade.
 #include <cstdio>
 #include <vector>
 #include <cuda_runtime.h>
@@ -15,24 +18,30 @@ static void dump_enums() {
   printf("=====================\n");
 }
 
-// buf_kind: 0 = pinned host (cudaMallocHost), 1 = managed (cudaMallocManaged)
+// buf_kind: 0 = pinned host + cudaMalloc dev (FlexKV-like),
+//           1 = managed host + cudaMalloc dev (fake managed),
+//           2 = BOTH managed (the API's intended happy path)
 // h2d: false = D2H (src dev, dst host), true = H2D (src host, dst dev)
-// sao: srcAccessOrder value
-// flags: attribute flags
 static bool run_batch(int buf_kind, bool h2d, int sao, unsigned flags) {
   const int N = 8;
   const size_t SZ = 4096;
-  char *hostA = nullptr, *hostB = nullptr;
+  char *hostA = nullptr, *hostB = nullptr, *devA = nullptr, *devB = nullptr;
   if (buf_kind == 0) {
     if (cudaMallocHost(&hostA, N*SZ) != cudaSuccess) return false;
     if (cudaMallocHost(&hostB, N*SZ) != cudaSuccess) return false;
+    if (cudaMalloc(&devA, N*SZ)     != cudaSuccess) return false;
+    if (cudaMalloc(&devB, N*SZ)     != cudaSuccess) return false;
+  } else if (buf_kind == 1) {
+    if (cudaMallocManaged(&hostA, N*SZ) != cudaSuccess) return false;
+    if (cudaMallocManaged(&hostB, N*SZ) != cudaSuccess) return false;
+    if (cudaMalloc(&devA, N*SZ)         != cudaSuccess) return false;
+    if (cudaMalloc(&devB, N*SZ)         != cudaSuccess) return false;
   } else {
     if (cudaMallocManaged(&hostA, N*SZ) != cudaSuccess) return false;
     if (cudaMallocManaged(&hostB, N*SZ) != cudaSuccess) return false;
+    if (cudaMallocManaged(&devA, N*SZ)  != cudaSuccess) return false;
+    if (cudaMallocManaged(&devB, N*SZ)  != cudaSuccess) return false;
   }
-  char *devA = nullptr, *devB = nullptr;
-  if (cudaMalloc(&devA, N*SZ) != cudaSuccess) return false;
-  if (cudaMalloc(&devB, N*SZ) != cudaSuccess) return false;
 
   char *src, *dst;
   if (!h2d) { src = devA; dst = hostB; } else { src = hostA; dst = devB; }
@@ -64,7 +73,7 @@ static bool run_batch(int buf_kind, bool h2d, int sao, unsigned flags) {
     cudaMemcpy(got.data(), dst, N*SZ, h2d ? cudaMemcpyDeviceToHost : cudaMemcpyHostToDevice);
     for (size_t i=0;i<(size_t)N*SZ;++i) if (got[i]!=(char)i) { ok=false; break; }
   }
-  const char* bk = buf_kind==0 ? "pinned" : "managed";
+  const char* bk = buf_kind==0 ? "pinned " : (buf_kind==1 ? "managed-host " : "managed-both ");
   const char* dir = h2d ? "H2D" : "D2H";
   const char* saon = sao==(int)cudaMemcpySrcAccessOrderAny ? "Any" : "Stream";
   if (ok) printf("[PASS] %s %s sao=%s flags=%u\n", bk, dir, saon, flags);
@@ -79,12 +88,11 @@ int main() {
   cudaSetDevice(0);
   dump_enums();
   int any = (int)cudaMemcpySrcAccessOrderAny;
-  int stream = (int)cudaMemcpySrcAccessOrderStream;
   unsigned fd = (unsigned)cudaMemcpyFlagDefault;
-  run_batch(0, false, any, fd);    // A: pinned D2H, Any    (current repro, known FAIL)
-  run_batch(1, false, any, fd);    // B: managed D2H, Any
-  run_batch(1, false, stream, fd); // C: managed D2H, Stream
-  run_batch(0, true,  any, fd);    // D: pinned H2D, Any
-  run_batch(0, false, any, 0u);    // E: pinned D2H, Any, flags=0
+  run_batch(0, false, any, fd);    // A: pinned D2H   (FlexKV-like)   -> expect FAIL
+  run_batch(1, false, any, fd);    // B: managed-host D2H, plain dev  -> expect FAIL (src non-managed)
+  run_batch(2, false, any, fd);    // F: managed-both D2H             -> expect PASS (API happy path)
+  run_batch(2, true,  any, fd);    // G: managed-both H2D             -> expect PASS
+  run_batch(0, true,  any, fd);    // D: pinned H2D   (FlexKV-like)   -> expect FAIL
   return 0;
 }
