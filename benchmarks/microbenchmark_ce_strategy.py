@@ -918,7 +918,7 @@ def run_strategy_compare(args):
         if args.memcpy2d == "on":
             print_memcpy2d_benefit(results, run_rows)
         if args.batch == "on":
-            print_batch_benefit(results, run_rows)
+            print_batch_benefit(results, run_rows, args)
         print("=" * 100)
 
     # -- Print recommendation summary across all sizes --------------------------
@@ -976,79 +976,87 @@ def print_memcpy2d_benefit(results, run_rows):
     print("=" * 100)
 
 
-def print_batch_benefit(results, run_rows):
-    """Focused block: for each (form, dir), compare the best end-to-end latency
-    with cudaMemcpyBatchAsync OFF vs ON, and declare which config is fastest.
+def print_batch_benefit(results, run_rows, args):
+    """Full cross-product batch comparison for the batch decision.
 
-    batch (FLEXKV_ENABLE_CE_MEMCPY_BATCH=1) only merges driver submissions
-    (CUDA >= 12.0); GPU bytes copied are byte-identical. On NVIDIA it can cut
-    CPU submit overhead when there are many small chunks (PER_BLOCK, scattered
-    layouts); on P800 / CUDA < 12 it is a no-op compiled fallback. The block
-    prints speedup = off / on and a single global recommendation.
+    For every (form, dir), compares cudaMemcpyBatchAsync OFF vs ON across:
+      - both memcpy2d settings (off, and on for the 3 affected paths),
+      - all configs: baseline (PER_BLOCK), each viable ce_opt path, auto.
+    speedup = off / on  (>1: batch faster, <1: slower, ~1: noise).
+
+    The raw per-path timings stay in the main table; this block distills them
+    into the exact batch/no-batch x memcpy2d/no-memcpy2d x
+    ce_opt/baseline matrix needed to decide whether to enable
+    FLEXKV_ENABLE_CE_MEMCPY_BATCH.
     """
     print("\n" + "=" * 100)
-    print("  batch benefit (FLEXKV_ENABLE_CE_MEMCPY_BATCH=1) — per (form, dir)")
+    print("  batch benefit (FLEXKV_ENABLE_CE_MEMCPY_BATCH=1) — full cross product")
     print("=" * 100)
-    print("  speedup = best_off / best_on  (>1: batch FASTER, <1: SLOWER, ~1: noise)")
-    hdr = "  {:>32s}  {:>4s}  {:>10s}  {:>10s}  {:>9s}  {:>12s}".format(
-        "Form", "Dir", "best_off", "best_on", "speed", "auto_off->on")
-    print(hdr)
-    print("  " + "-" * (len(hdr) - 2))
-    any_row = False
-    faster = 0
-    slower = 0
-    tied = 0
+    print("  speedup = off / on  (>1: batch FASTER, <1: SLOWER, ~1: noise)")
+    show_on = (args.memcpy2d == "on")
+    faster = slower = tied = 0
     for form_name, dir_name, viable in run_rows:
         cfgs = results.get((form_name, dir_name), {})
-        auto_path = cfgs.get("auto_path", "")
         viable_names = {pn for _, pn in viable}
-        # Off timings for all viable paths (+ auto fallback).
-        off_vals = []
-        for pname in viable_names:
-            v = cfgs.get(pname)
-            if v is None and pname == auto_path:
-                v = cfgs.get("auto")
-            if v is not None:
-                off_vals.append(v)
-        # On timings (batch variants for each viable path).
-        on_vals = []
-        for pname in viable_names:
-            v = cfgs.get(pname + " [batch]")
-            if v is not None:
-                on_vals.append(v)
-        if not off_vals or not on_vals:
-            continue
-        any_row = True
-        best_off = min(off_vals)
-        best_on = min(on_vals)
-        sp = best_off / best_on if best_on > 0 else float("nan")
-        auto_off = cfgs.get("auto")
-        auto_on = cfgs.get("auto [batch]")
-        if auto_off is not None and auto_on is not None and auto_on > 0:
-            auto_sp_str = "{:.2f}x".format(auto_off / auto_on)
-        else:
-            auto_sp_str = "-"
-        if sp > 1.01:
-            faster += 1
-        elif sp < 0.99:
-            slower += 1
-        else:
-            tied += 1
-        line = "  {:>32s}  {:>4s}  {:>9.3f}  {:>9.3f}  {:>8.2f}x  {:>12s}".format(
-            form_name, dir_name, best_off, best_on, sp, auto_sp_str)
-        print(line)
-    if not any_row:
-        print("  (no batch-timed forms in this size)")
+        auto_path = cfgs.get("auto_path", "")
+        m2d_settings = [False]
+        if show_on:
+            m2d_settings.append(True)
+        print("\n  -- {} | {} --".format(form_name, dir_name))
+        any_cell = False
+        for m2d in m2d_settings:
+            m2d_tag = "memcpy2d=on" if m2d else "memcpy2d=off"
+            rows = []
+            if not m2d:
+                rows.append(("baseline (PER_BLOCK)",
+                             cfgs.get("baseline"),
+                             cfgs.get("baseline [batch]")))
+            for pname in sorted(viable_names):
+                if m2d and pname not in AFFECTED_PATHS:
+                    continue
+                suffix = " [2d]" if m2d else ""
+                off_v = cfgs.get(pname + suffix)
+                if off_v is None and pname == auto_path and not m2d:
+                    off_v = cfgs.get("auto")
+                on_v = cfgs.get(pname + suffix + " [batch]")
+                rows.append((pname, off_v, on_v))
+            if not m2d:
+                rows.append(("auto (choose_path)",
+                             cfgs.get("auto"), cfgs.get("auto [batch]")))
+            hdr = "    [{:<12s}]  {:>10s}  {:>10s}  {:>8s}".format(
+                m2d_tag, "off(ms)", "on(ms)", "speed")
+            print(hdr)
+            print("    " + "-" * (len(hdr) - 4))
+            for label, off_v, on_v in rows:
+                if off_v is None and on_v is None:
+                    continue
+                any_cell = True
+                if off_v is not None and on_v is not None and on_v > 0:
+                    sp = off_v / on_v
+                    sp_str = "{:.2f}x".format(sp)
+                    if sp > 1.01:
+                        faster += 1
+                    elif sp < 0.99:
+                        slower += 1
+                    else:
+                        tied += 1
+                else:
+                    sp_str = "-"
+                off_str = "{:.3f}".format(off_v) if off_v is not None else "-"
+                on_str = "{:.3f}".format(on_v) if on_v is not None else "-"
+                print("    {:>22s}  {:>10s}  {:>10s}  {:>8s}".format(
+                    label, off_str, on_str, sp_str))
+        if not any_cell:
+            print("    (no batch-timed cells for this form)")
+    print("\n  " + "-" * 96)
+    print("  Cells: batch FASTER in {}, SLOWER in {}, ~tie in {}.".format(
+        faster, slower, tied))
+    if faster >= slower:
+        print("  => RECOMMENDED: enable FLEXKV_ENABLE_CE_MEMCPY_BATCH on "
+              "NVIDIA CUDA >= 12.0 (per-call fallback elsewhere is byte-identical).")
     else:
-        print("  " + "-" * (len(hdr) - 2))
-        print("  Forms: batch FASTER in {}, SLOWER in {}, ~tie in {}.".format(
-            faster, slower, tied))
-        if faster >= slower:
-            print("  => RECOMMENDED: enable FLEXKV_ENABLE_CE_MEMCPY_BATCH on "
-                  "NVIDIA CUDA >= 12.0 (per-call fallback elsewhere is byte-identical).")
-        else:
-            print("  => NOT clearly beneficial here; keep default OFF unless a "
-                  "specific workload shows batch speedup.")
+        print("  => NOT clearly beneficial here; keep default OFF unless a "
+              "specific workload shows batch speedup.")
     print("=" * 100)
 
 

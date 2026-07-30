@@ -26,6 +26,7 @@ Usage:
     python benchmarks/microbenchmark_ce_simulation.py --sizes small medium --layouts bfirst
     python benchmarks/microbenchmark_ce_simulation.py --skip-kernel   # non-NVIDIA: omit CUDA kernel config
     python benchmarks/microbenchmark_ce_simulation.py --num-gpus 8 --batch   # also compare FLEXKV_ENABLE_CE_MEMCPY_BATCH ON vs OFF for CE configs
+    python benchmarks/microbenchmark_ce_simulation.py --num-gpus 8 --batch --memcpy2d on  # also sweep the memcpy2d axis (batch compared per setting)
 """
 
 import argparse
@@ -101,6 +102,17 @@ CE_CONFIGS = [
     ("baseline", True,  False),
     ("opt",      True,  True),
 ]
+
+
+def _cfg_name(cfg_label, m2d, batch):
+    """Build a variant label: 'baseline', 'baseline+m2d', 'baseline+batch',
+    'baseline+m2d+batch'. Kernel stays 'kernel' (no m2d/batch concept)."""
+    parts = [cfg_label]
+    if m2d:
+        parts.append("m2d")
+    if batch:
+        parts.append("batch")
+    return "+".join(parts)
 
 
 # Helpers (mirrors microbenchmark_ce_strategy.py)
@@ -360,14 +372,30 @@ def run_simulation(args):
     #   batch_flag = False -> CE force-OFF (byte-identical baseline comparison)
     #   batch_flag = True  -> CE force-ON  (cudaMemcpyBatchAsync coalescing)
     effective = []
-    for cfg_label, use_ce, path_opt in configs:
-        if not use_ce:
-            effective.append((cfg_label, use_ce, path_opt, None))
-        elif args.enable_batch:
-            effective.append((cfg_label, use_ce, path_opt, False))
-            effective.append((cfg_label + "+batch", use_ce, path_opt, True))
-        else:
-            effective.append((cfg_label, use_ce, path_opt, None))
+    if args.force_m2d is None:
+        # Old behavior: single run at the global memcpy2d default; labels and
+        # batch handling unchanged.
+        for cfg_label, use_ce, path_opt in configs:
+            if not use_ce:
+                effective.append((cfg_label, use_ce, path_opt, None, None))
+            elif args.enable_batch:
+                effective.append((cfg_label, use_ce, path_opt, False, None))
+                effective.append((cfg_label + "+batch", use_ce, path_opt, True, None))
+            else:
+                effective.append((cfg_label, use_ce, path_opt, None, None))
+    else:
+        # Explicit --memcpy2d sweep: label carries m2d tag, batch adds +batch.
+        m2d_settings = [False, True] if args.force_m2d == "on" else [False]
+        for cfg_label, use_ce, path_opt in configs:
+            if not use_ce:
+                effective.append((cfg_label, use_ce, path_opt, None, None))
+                continue
+            for m2d in m2d_settings:
+                effective.append((_cfg_name(cfg_label, m2d, False),
+                                  use_ce, path_opt, False, m2d))
+                if args.enable_batch:
+                    effective.append((_cfg_name(cfg_label, m2d, True),
+                                      use_ce, path_opt, True, m2d))
 
     print("=" * 96)
     print("  CE Transfer Monte Carlo Simulation (controlled random fragmentation)")
@@ -459,13 +487,14 @@ def run_simulation(args):
 
                     # Run all configs (and batch variants) for this round's ids
                     round_times = {}
-                    for cfg_label, use_ce, path_opt, batch_flag in effective:
+                    for cfg_label, use_ce, path_opt, batch_flag, m2d_flag in effective:
                         tp = make_tp_group(
                             cpu_kv.data_ptr(), all_gpu, num_gpus, gpu_layout,
                             num_layers, ce_path_opt=path_opt,
                             ce_segment_threshold=threshold,
                             is_mla=is_mla,
                             is_blockfirst=(cpu_layout_type == KVCacheLayoutType.BLOCKFIRST),
+                            ce_enable_memcpy2d=m2d_flag,
                             ce_enable_memcpy_batch=batch_flag)
 
                         try:
@@ -495,7 +524,7 @@ def run_simulation(args):
                     # Print this round
                     seg_str = "blk={:>5d} seg={:>5d}".format(batch_size, actual_seg)
                     parts = []
-                    for cfg_label, _, _, _ in effective:
+                    for cfg_label, _, _, _, _ in effective:
                         t = round_times.get(cfg_label, {})
                         d2h = t.get("d2h")
                         h2d = t.get("h2d")
@@ -537,7 +566,7 @@ def run_simulation(args):
         base_h2d = _median(all_results[combo].get("baseline", {}).get("h2d", []))
         base_rt = _median(all_results[combo].get("baseline", {}).get("rt", []))
 
-        for cfg_label, _, _, _ in effective:
+        for cfg_label, _, _, _, _ in effective:
             d2h = _median(all_results[combo][cfg_label]["d2h"])
             h2d = _median(all_results[combo][cfg_label]["h2d"])
             rt = _median(all_results[combo][cfg_label]["rt"])
@@ -556,6 +585,35 @@ def run_simulation(args):
     print("        All combos use the SAME (batch_size, segment_count) pairs per round")
     print("        — fair controlled comparison across configs.")
     print("=" * 110)
+
+    # ── Batch benefit block (per config × memcpy2d setting) ───────────────
+    if args.enable_batch:
+        print("\n" + "=" * 96)
+        print("  Batch benefit (FLEXKV_ENABLE_CE_MEMCPY_BATCH=1): off vs on per config")
+        print("=" * 96)
+        m2d_settings = [False]
+        if args.force_m2d == "on":
+            m2d_settings.append(True)
+        for combo in sorted(all_results.keys()):
+            print("\n  {}:".format(combo))
+            for cfg_label, use_ce, path_opt in configs:
+                if not use_ce:
+                    continue
+                parts = []
+                for m2d in m2d_settings:
+                    off_key = _cfg_name(cfg_label, m2d, False)
+                    on_key = _cfg_name(cfg_label, m2d, True)
+                    off_rt = _median(all_results[combo].get(off_key, {}).get("rt", []))
+                    on_rt = _median(all_results[combo].get(on_key, {}).get("rt", []))
+                    if off_rt and on_rt and on_rt > 0:
+                        sp = off_rt / on_rt
+                        parts.append("m2d={:<3s} off={:.3f} on={:.3f} spd={:.2f}x".format(
+                            "on" if m2d else "off", off_rt, on_rt, sp))
+                if parts:
+                    print("    {:<8s}  {}".format(cfg_label, "  |  ".join(parts)))
+        print("\n  spd = off / on (>1: batch faster, <1: slower, ~1: noise).")
+        print("  (baseline = PER_BLOCK; opt = choose_path auto-select)")
+        print("=" * 96)
 
 
 def _median(vals):
@@ -596,6 +654,13 @@ def main():
     batch_group.add_argument("--no-batch", action="store_true",
                              help="Do NOT run the batch variant. Default follows "
                                   "FLEXKV_ENABLE_CE_MEMCPY_BATCH (OFF).")
+    parser.add_argument("--memcpy2d", choices=["off", "on"], default=None,
+                        help="Sweep the FLEXKV_ENABLE_CE_MEMCPY2D axis. 'on' "
+                             "runs each CE config at both memcpy2d=off and "
+                             "memcpy2d=on (so the batch comparison is reported "
+                             "per memcpy2d setting); 'off' forces memcpy2d off; "
+                             "omit to run once at the global default (old "
+                             "behavior).")
     args = parser.parse_args()
     if args.batch:
         args.enable_batch = True
@@ -603,6 +668,7 @@ def main():
         args.enable_batch = False
     else:
         args.enable_batch = GLOBAL_CONFIG_FROM_ENV.enable_ce_memcpy_batch
+    args.force_m2d = args.memcpy2d
 
     num_gpus = NUM_GPUS if args.num_gpus <= 0 else min(args.num_gpus, NUM_GPUS)
     if num_gpus < 2:
