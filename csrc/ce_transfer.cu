@@ -264,10 +264,10 @@ void ce_transfer_per_block(
     attr.dstLocHint.id = 0;
     attr.flags = cudaMemcpyDefault;
     cudaMemcpyAttributes attrs[1] = {attr};
-    size_t attrsIdxs[1] = {0};
+    std::vector<size_t> attrsIdxs(b_dst.size(), 0);
     size_t failIdx = 0;
     cudaError_t e = cudaMemcpyBatchAsync(b_dst.data(), b_src.data(), b_cnt.data(),
-                         (size_t)b_dst.size(), attrs, attrsIdxs, 1, &failIdx,
+                         (size_t)b_dst.size(), attrs, attrsIdxs.data(), 1, &failIdx,
                          stream);
     if (e != cudaSuccess) {
       // Fallback to per-element copies so correctness is preserved even if
@@ -353,10 +353,10 @@ void ce_transfer_contig_direct(
     attr.dstLocHint.id = 0;
     attr.flags = cudaMemcpyDefault;
     cudaMemcpyAttributes attrs[1] = {attr};
-    size_t attrsIdxs[1] = {0};
+    std::vector<size_t> attrsIdxs(b_dst.size(), 0);
     size_t failIdx = 0;
     cudaError_t e = cudaMemcpyBatchAsync(b_dst.data(), b_src.data(), b_cnt.data(),
-                         (size_t)b_dst.size(), attrs, attrsIdxs, 1, &failIdx,
+                         (size_t)b_dst.size(), attrs, attrsIdxs.data(), 1, &failIdx,
                          stream);
     if (e != cudaSuccess) {
       // Fallback to per-element copies so correctness is preserved even if
@@ -445,10 +445,10 @@ void ce_transfer_segment_direct(
     attr.dstLocHint.id = 0;
     attr.flags = cudaMemcpyDefault;
     cudaMemcpyAttributes attrs[1] = {attr};
-    size_t attrsIdxs[1] = {0};
+    std::vector<size_t> attrsIdxs(b_dst.size(), 0);
     size_t failIdx = 0;
     cudaError_t e = cudaMemcpyBatchAsync(b_dst.data(), b_src.data(), b_cnt.data(),
-                         (size_t)b_dst.size(), attrs, attrsIdxs, 1, &failIdx,
+                         (size_t)b_dst.size(), attrs, attrsIdxs.data(), 1, &failIdx,
                          stream);
     if (e != cudaSuccess) {
       // Fallback to per-element copies so correctness is preserved even if
@@ -884,10 +884,10 @@ void ce_transfer_segment_scatter(
       attr.dstLocHint.id = 0;
       attr.flags = cudaMemcpyDefault;
       cudaMemcpyAttributes attrs[1] = {attr};
-      size_t attrsIdxs[1] = {0};
+      std::vector<size_t> attrsIdxs(b_dst.size(), 0);
       size_t failIdx = 0;
       cudaError_t e = cudaMemcpyBatchAsync(b_dst.data(), b_src.data(), b_cnt.data(),
-                           (size_t)b_dst.size(), attrs, attrsIdxs, 1, &failIdx,
+                           (size_t)b_dst.size(), attrs, attrsIdxs.data(), 1, &failIdx,
                            stream);
       if (e != cudaSuccess) {
         // Fallback to per-element copies so correctness is preserved even if
@@ -1219,10 +1219,10 @@ void ce_transfer_gather_scatter(
           attr.dstLocHint.id = 0;
           attr.flags = cudaMemcpyDefault;
           cudaMemcpyAttributes attrs[1] = {attr};
-          size_t attrsIdxs[1] = {0};
+          std::vector<size_t> attrsIdxs(b_dst.size(), 0);
           size_t failIdx = 0;
           cudaError_t e = cudaMemcpyBatchAsync(b_dst.data(), b_src.data(), b_cnt.data(),
-                               (size_t)b_dst.size(), attrs, attrsIdxs, 1, &failIdx,
+                               (size_t)b_dst.size(), attrs, attrsIdxs.data(), 1, &failIdx,
                                stream);
           if (e != cudaSuccess) {
             // Fallback to per-element copies so correctness is preserved even if
@@ -1285,10 +1285,10 @@ void ce_transfer_gather_scatter(
           attr.dstLocHint.id = 0;
           attr.flags = cudaMemcpyDefault;
           cudaMemcpyAttributes attrs[1] = {attr};
-          size_t attrsIdxs[1] = {0};
+          std::vector<size_t> attrsIdxs(b_dst.size(), 0);
           size_t failIdx = 0;
           cudaError_t e = cudaMemcpyBatchAsync(b_dst.data(), b_src.data(), b_cnt.data(),
-                               (size_t)b_dst.size(), attrs, attrsIdxs, 1, &failIdx,
+                               (size_t)b_dst.size(), attrs, attrsIdxs.data(), 1, &failIdx,
                                stream);
           if (e != cudaSuccess) {
             // Fallback to per-element copies so correctness is preserved even if
@@ -1632,10 +1632,10 @@ void ce_transfer_gather_direct(
           attr.dstLocHint.id = 0;
           attr.flags = cudaMemcpyDefault;
           cudaMemcpyAttributes attrs[1] = {attr};
-          size_t attrsIdxs[1] = {0};
+          std::vector<size_t> attrsIdxs(b_dst.size(), 0);
           size_t failIdx = 0;
           cudaError_t e = cudaMemcpyBatchAsync(b_dst.data(), b_src.data(), b_cnt.data(),
-                               (size_t)b_dst.size(), attrs, attrsIdxs, 1, &failIdx,
+                               (size_t)b_dst.size(), attrs, attrsIdxs.data(), 1, &failIdx,
                                stream);
           if (e != cudaSuccess) {
             // Fallback to per-element copies so correctness is preserved even if
@@ -1738,10 +1738,10 @@ void ce_transfer_gather_direct(
           attr.dstLocHint.id = 0;
           attr.flags = cudaMemcpyDefault;
           cudaMemcpyAttributes attrs[1] = {attr};
-          size_t attrsIdxs[1] = {0};
+          std::vector<size_t> attrsIdxs(b_dst.size(), 0);
           size_t failIdx = 0;
           cudaError_t e = cudaMemcpyBatchAsync(b_dst.data(), b_src.data(), b_cnt.data(),
-                               (size_t)b_dst.size(), attrs, attrsIdxs, 1, &failIdx,
+                               (size_t)b_dst.size(), attrs, attrsIdxs.data(), 1, &failIdx,
                                stream);
           if (e != cudaSuccess) {
             // Fallback to per-element copies so correctness is preserved even if
