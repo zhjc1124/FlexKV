@@ -192,6 +192,42 @@ cudaEvent_t *get_cached_event_pair(bool need, bool &created) {
 }
 
 
+// One-time probe: cudaMemcpyBatchAsync direction is determined ONLY by srcLocHint/dstLocHint,
+// which the CUDA header says are ignored for non-managed memory. FlexKV's buffers are
+// cudaMalloc + pinned (non-managed), so the API returns invalid argument there. We probe once
+// with NON-managed (FlexKV-like) buffers and permanently disable the batch path on failure,
+// so the feature cleanly degrades to per-element cudaMemcpyAsync (correctness-preserving).
+#if CUDART_VERSION >= 12000
+static bool g_ce_batch_probed = false;
+static bool g_ce_batch_supported = false;
+static bool ce_batch_is_supported() {
+  if (g_ce_batch_probed) return g_ce_batch_supported;
+  g_ce_batch_probed = true;
+  char *d = nullptr, *h = nullptr;
+  if (cudaMalloc(&d, 64) != cudaSuccess) { cudaGetLastError(); g_ce_batch_supported = false; return false; }
+  if (cudaMallocHost(&h, 64) != cudaSuccess) { cudaGetLastError(); cudaFree(d); g_ce_batch_supported = false; return false; }
+  void *dst = h;
+  void *src = d;
+  size_t cnt = 64;
+  cudaMemcpyAttributes attr{};
+  attr.srcAccessOrder = cudaMemcpySrcAccessOrderAny;
+  attr.srcLocHint.type = cudaMemLocationTypeDevice; attr.srcLocHint.id = 0;
+  attr.dstLocHint.type = cudaMemLocationTypeHost;   attr.dstLocHint.id = 0;
+  attr.flags = cudaMemcpyFlagDefault;
+  cudaMemcpyAttributes attrs[1] = {attr};
+  size_t idxs[1] = {0};
+  size_t failIdx = 0;
+  cudaError_t e = cudaMemcpyBatchAsync(&dst, &src, &cnt, 1, attrs, idxs, 1, &failIdx, cudaStreamDefault);
+  cudaGetLastError();  // always clear sticky error from probe
+  cudaFree(d);
+  cudaFreeHost(h);
+  g_ce_batch_supported = (e == cudaSuccess);
+  return g_ce_batch_supported;
+}
+#else
+static inline bool ce_batch_is_supported() { return false; }
+#endif
+
 // ---- PER_BLOCK: one memcpy/block, slowest, always-correct ----
 template <BackendType Type>
 void ce_transfer_per_block(
@@ -250,7 +286,7 @@ void ce_transfer_per_block(
   }
 #if CUDART_VERSION >= 12000
   // CUDA<12: falls through to per-call path above (no batch symbol).
-  if (ce_config.enable_memcpy_batch && !b_dst.empty()) {
+  if (ce_config.enable_memcpy_batch && !b_dst.empty() && ce_batch_is_supported()) {
     cudaMemcpyAttributes attr{};
     attr.srcAccessOrder = cudaMemcpySrcAccessOrderAny;
     if (is_host_to_device) {
@@ -270,6 +306,7 @@ void ce_transfer_per_block(
                          (size_t)b_dst.size(), attrs, attrsIdxs.data(), 1, &failIdx,
                          stream);
     if (e != cudaSuccess) {
+      cudaGetLastError();  // clear sticky error so fallback copies actually execute
       // Fallback to per-element copies so correctness is preserved even if
       // the batch API is unavailable / rejects the attributes.
       for (size_t k = 0; k < b_dst.size(); ++k)
@@ -339,7 +376,7 @@ void ce_transfer_contig_direct(
     }
   }
 #if CUDART_VERSION >= 12000
-  if (ce_config.enable_memcpy_batch && !b_dst.empty()) {
+  if (ce_config.enable_memcpy_batch && !b_dst.empty() && ce_batch_is_supported()) {
     cudaMemcpyAttributes attr{};
     attr.srcAccessOrder = cudaMemcpySrcAccessOrderAny;
     if (is_host_to_device) {
@@ -359,6 +396,7 @@ void ce_transfer_contig_direct(
                          (size_t)b_dst.size(), attrs, attrsIdxs.data(), 1, &failIdx,
                          stream);
     if (e != cudaSuccess) {
+      cudaGetLastError();  // clear sticky error so fallback copies actually execute
       // Fallback to per-element copies so correctness is preserved even if
       // the batch API is unavailable / rejects the attributes.
       for (size_t k = 0; k < b_dst.size(); ++k)
@@ -431,7 +469,7 @@ void ce_transfer_segment_direct(
     }
   }
 #if CUDART_VERSION >= 12000
-  if (ce_config.enable_memcpy_batch && !b_dst.empty()) {
+  if (ce_config.enable_memcpy_batch && !b_dst.empty() && ce_batch_is_supported()) {
     cudaMemcpyAttributes attr{};
     attr.srcAccessOrder = cudaMemcpySrcAccessOrderAny;
     if (is_host_to_device) {
@@ -451,6 +489,7 @@ void ce_transfer_segment_direct(
                          (size_t)b_dst.size(), attrs, attrsIdxs.data(), 1, &failIdx,
                          stream);
     if (e != cudaSuccess) {
+      cudaGetLastError();  // clear sticky error so fallback copies actually execute
       // Fallback to per-element copies so correctness is preserved even if
       // the batch API is unavailable / rejects the attributes.
       for (size_t k = 0; k < b_dst.size(); ++k)
@@ -870,7 +909,7 @@ void ce_transfer_segment_scatter(
     }
 #if CUDART_VERSION >= 12000
     // CUDA<12: falls through to per-call path above (no batch symbol).
-    if (ce_config.enable_memcpy_batch && !b_dst.empty()) {
+    if (ce_config.enable_memcpy_batch && !b_dst.empty() && ce_batch_is_supported()) {
       cudaMemcpyAttributes attr{};
       attr.srcAccessOrder = cudaMemcpySrcAccessOrderAny;
       if (is_host_to_device) {
@@ -890,6 +929,7 @@ void ce_transfer_segment_scatter(
                            (size_t)b_dst.size(), attrs, attrsIdxs.data(), 1, &failIdx,
                            stream);
       if (e != cudaSuccess) {
+        cudaGetLastError();  // clear sticky error so fallback copies actually execute
         // Fallback to per-element copies so correctness is preserved even if
         // the batch API is unavailable / rejects the attributes.
         for (size_t k = 0; k < b_dst.size(); ++k)
@@ -1205,7 +1245,7 @@ void ce_transfer_gather_scatter(
           FLEXKV_GPU_CPU_TRANSFER(false, chunk_size_in_bytes * seg.nr_blocks);
         }
 #if CUDART_VERSION >= 12000
-        if (ce_config.enable_memcpy_batch && !b_dst.empty()) {
+        if (ce_config.enable_memcpy_batch && !b_dst.empty() && ce_batch_is_supported()) {
           cudaMemcpyAttributes attr{};
           attr.srcAccessOrder = cudaMemcpySrcAccessOrderAny;
           if (is_host_to_device) {
@@ -1225,6 +1265,7 @@ void ce_transfer_gather_scatter(
                                (size_t)b_dst.size(), attrs, attrsIdxs.data(), 1, &failIdx,
                                stream);
           if (e != cudaSuccess) {
+            cudaGetLastError();  // clear sticky error so fallback copies actually execute
             // Fallback to per-element copies so correctness is preserved even if
             // the batch API is unavailable / rejects the attributes.
             for (size_t k = 0; k < b_dst.size(); ++k)
@@ -1271,7 +1312,7 @@ void ce_transfer_gather_scatter(
           FLEXKV_GPU_CPU_TRANSFER(true, chunk_size_in_bytes * seg.nr_blocks);
         }
 #if CUDART_VERSION >= 12000
-        if (ce_config.enable_memcpy_batch && !b_dst.empty()) {
+        if (ce_config.enable_memcpy_batch && !b_dst.empty() && ce_batch_is_supported()) {
           cudaMemcpyAttributes attr{};
           attr.srcAccessOrder = cudaMemcpySrcAccessOrderAny;
           if (is_host_to_device) {
@@ -1291,6 +1332,7 @@ void ce_transfer_gather_scatter(
                                (size_t)b_dst.size(), attrs, attrsIdxs.data(), 1, &failIdx,
                                stream);
           if (e != cudaSuccess) {
+            cudaGetLastError();  // clear sticky error so fallback copies actually execute
             // Fallback to per-element copies so correctness is preserved even if
             // the batch API is unavailable / rejects the attributes.
             for (size_t k = 0; k < b_dst.size(); ++k)
@@ -1618,7 +1660,7 @@ void ce_transfer_gather_direct(
         }
 #if CUDART_VERSION >= 12000
         // CUDA<12: falls through to per-call path above (no batch symbol).
-        if (ce_config.enable_memcpy_batch && !b_dst.empty()) {
+        if (ce_config.enable_memcpy_batch && !b_dst.empty() && ce_batch_is_supported()) {
           cudaMemcpyAttributes attr{};
           attr.srcAccessOrder = cudaMemcpySrcAccessOrderAny;
           if (is_host_to_device) {
@@ -1638,6 +1680,7 @@ void ce_transfer_gather_direct(
                                (size_t)b_dst.size(), attrs, attrsIdxs.data(), 1, &failIdx,
                                stream);
           if (e != cudaSuccess) {
+            cudaGetLastError();  // clear sticky error so fallback copies actually execute
             // Fallback to per-element copies so correctness is preserved even if
             // the batch API is unavailable / rejects the attributes.
             for (size_t k = 0; k < b_dst.size(); ++k)
@@ -1724,7 +1767,7 @@ void ce_transfer_gather_direct(
         }
 #if CUDART_VERSION >= 12000
         // CUDA<12: falls through to per-call path above (no batch symbol).
-        if (ce_config.enable_memcpy_batch && !b_dst.empty()) {
+        if (ce_config.enable_memcpy_batch && !b_dst.empty() && ce_batch_is_supported()) {
           cudaMemcpyAttributes attr{};
           attr.srcAccessOrder = cudaMemcpySrcAccessOrderAny;
           if (is_host_to_device) {
@@ -1744,6 +1787,7 @@ void ce_transfer_gather_direct(
                                (size_t)b_dst.size(), attrs, attrsIdxs.data(), 1, &failIdx,
                                stream);
           if (e != cudaSuccess) {
+            cudaGetLastError();  // clear sticky error so fallback copies actually execute
             // Fallback to per-element copies so correctness is preserved even if
             // the batch API is unavailable / rejects the attributes.
             for (size_t k = 0; k < b_dst.size(); ++k)
