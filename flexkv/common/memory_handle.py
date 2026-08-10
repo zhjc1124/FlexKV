@@ -23,7 +23,10 @@ except:
     try:
         cudart = ctypes.CDLL("libcudart.so.12")
     except:
-        cudart = ctypes.CDLL("libcudart.so.11")
+        try:
+            cudart = ctypes.CDLL("libcudart.so.11")
+        except:
+            cudart = None  # Non-CUDA host: importable, IPC fails on use
 
 # CUDA IPC handle size (64 bytes on Linux)
 CUDA_IPC_HANDLE_SIZE = 64
@@ -353,6 +356,8 @@ class TensorSharedHandle:
         # ipc_handle = ctypes.create_string_buffer(CUDA_IPC_HANDLE_SIZE)
         ipc_handle = cudaIpcMemHandle_t()
 
+        if cudart is None:
+            raise RuntimeError("libcudart not loaded")
         # Call cudaIpcGetMemHandle
         result = cudart.cudaIpcGetMemHandle(
             ctypes.byref(ipc_handle), ctypes.c_void_p(data_ptr)
@@ -409,6 +414,8 @@ class TensorSharedHandle:
         handle = cudaIpcMemHandle_t()
         ctypes.memmove(ctypes.byref(handle), ipc_handle, 64)
 
+        if cudart is None:
+            raise RuntimeError("libcudart not loaded")
         # Open IPC memory handle to get base pointer
         base_ptr = ctypes.c_void_p()
         result = cudart.cudaIpcOpenMemHandle(

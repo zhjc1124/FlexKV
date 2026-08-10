@@ -180,6 +180,10 @@ class TransferEngine:
         # Create shutdown pipe for zero-latency selector
         self.shutdown_read_fd, self.shutdown_write_fd = os.pipe()
         self.gpu_handle_groups = gpu_handles  # WorkerKey -> list of GPU handles for that TP group
+        local_pp_ranks = {wk.pp_rank for wk in gpu_handles}
+        self._node_min_start_layer = min(
+            (model_config.get_pp_indices(p)[0] for p in local_pp_ranks),
+            default=0)
         self._cpu_handle = cpu_handle
         self._ssd_handle = ssd_handle
         self._remote_handle = remote_handle
@@ -246,6 +250,11 @@ class TransferEngine:
         # Ops with at least one failed replica: must be discarded, not
         # finalized, when their pending_count drains to zero.
         self._failed_parent_op_ids: Set[int] = set()
+
+
+    def _pp_offset(self, worker_key: WorkerKey) -> int:
+        """Pool-local layer offset for this worker's PP stage."""
+        return self.model_config.get_pp_indices(worker_key.pp_rank)[0] - self._node_min_start_layer
 
     def _get_multi_group_kwargs_tp1(self, worker_key: WorkerKey) -> dict:
         """Get multi-group kwargs for TP=1 workers (GPUCPU / GDS)."""
@@ -464,6 +473,7 @@ class TransferEngine:
                         cpu_kv_layout=self._cpu_handle.kv_layout,
                         dtype=gpu_handles[0].dtype,
                         gpu_device_id=gpu_handles[0].gpu_device_id,
+                        start_layer_id=self._pp_offset(worker_key),
                         use_ce_transfer_h2d=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_h2d,
                         use_ce_transfer_d2h=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h,
                         transfer_num_cta_h2d=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_h2d,
@@ -485,6 +495,7 @@ class TransferEngine:
                         cpu_kv_layout=self._cpu_handle.kv_layout,
                         dtype=gpu_handles[0].dtype,
                         tp_group_size=self.model_config.effective_tp_size_per_node,
+                        start_layer_id=self._pp_offset(worker_key),
                         use_ce_transfer_h2d=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_h2d,
                         use_ce_transfer_d2h=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h,
                         transfer_num_cta_h2d=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_h2d,
@@ -509,6 +520,7 @@ class TransferEngine:
                     cpu_kv_layout=self._cpu_handle.kv_layout,
                     dtype=gpu_handles[0].dtype,
                     gpu_device_id=gpu_handles[0].gpu_device_id,
+                    start_layer_id=self._pp_offset(worker_key),
                     use_ce_transfer_h2d=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_h2d,
                     use_ce_transfer_d2h=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h,
                     transfer_num_cta_h2d=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_h2d,
@@ -530,6 +542,7 @@ class TransferEngine:
                     cpu_kv_layout=self._cpu_handle.kv_layout,
                     dtype=gpu_handles[0].dtype,
                     tp_group_size=self.model_config.effective_tp_size_per_node,
+                    start_layer_id=self._pp_offset(worker_key),
                     use_ce_transfer_h2d=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_h2d,
                     use_ce_transfer_d2h=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h,
                     transfer_num_cta_h2d=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_h2d,
@@ -661,6 +674,7 @@ class TransferEngine:
                         ssd_kv_layout=self._ssd_handle.kv_layout,
                         dtype=self._ssd_handle.dtype,
                         gpu_device_id=gpu_handles[0].gpu_device_id,
+                        start_layer_id=self._pp_offset(worker_key),
                         **self._get_multi_group_kwargs_tp1(worker_key),
                     )
                     for worker_key, gpu_handles in self.gpu_handle_groups.items()
@@ -678,6 +692,7 @@ class TransferEngine:
                         ssd_kv_layout=self._ssd_handle.kv_layout,
                         dtype=self._ssd_handle.dtype,
                         tp_group_size=self.model_config.effective_tp_size_per_node,
+                        start_layer_id=self._pp_offset(worker_key),
                         **self._get_multi_group_kwargs_tp(worker_key),
                     )
                     for worker_key, gpu_handles in self.gpu_handle_groups.items()
@@ -711,6 +726,7 @@ class TransferEngine:
                     tp_group_size=self.model_config.effective_tp_size_per_node,
                     layerwise_eventfd_socket=_layerwise_eventfd_socket,
                     num_blocks_per_file=num_blocks_per_file,
+                    start_layer_id=self._pp_offset(worker_key),
                     use_ce_transfer_h2d=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_h2d,
                     use_ce_transfer_d2h=GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h,
                     h2d_cta_num=GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_h2d,

@@ -641,6 +641,7 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
                  cpu_kv_layout: KVCacheLayout,
                  dtype: torch.dtype,
                  gpu_device_id: int,
+                 start_layer_id: int = 0,
                  use_ce_transfer_h2d: bool = False,
                  use_ce_transfer_d2h: bool = False,
                  transfer_num_cta_h2d: int = 4,
@@ -712,6 +713,27 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
             self.cpu_layer_stride_in_bytes = cpu_kv_layout.get_layer_stride() * self.dtype.itemsize
             self.cpu_kv_stride_in_bytes = cpu_kv_layout.get_kv_stride() * self.dtype.itemsize
             self.cpu_block_stride_in_bytes = cpu_kv_layout.get_block_stride() * self.dtype.itemsize
+
+        # PP stage offset into the shared per-node CPU pool: the C++ kernel
+        # always addresses the GPU tensor with layer_id=0 (GPU tensor is
+        # PP-stage-local, 0-indexed); each stage's worker advances its CPU
+        # base pointer by (start_layer_id * cpu_layer_stride) instead.
+        self.start_layer_id = start_layer_id
+        assert start_layer_id + self.num_layers <= cpu_kv_layout.num_layer, (
+            f"GPUCPUTransferWorker: start_layer_id({start_layer_id}) + "
+            f"num_layers({self.num_layers}) exceeds cpu pool layers"
+            f"({cpu_kv_layout.num_layer}). Same-node PP>1 requires the cpu "
+            f"pool to cover all co-located PP stages."
+        )
+        if start_layer_id > 0:
+            if self.group_transfer_params is not None:
+                raise ValueError(
+                    "GPUCPUTransferWorker: start_layer_id>0 (same-node PP>1) "
+                    "is not supported with multi-group layer_groups"
+                )
+            layer_offset_elems = start_layer_id * (
+                self.cpu_layer_stride_in_bytes // self.dtype.itemsize)
+            self.cpu_tensor = cpu_blocks.flatten()[layer_offset_elems:]
 
         # gpu_block_type_ is a framework-level tag (0=VLLM, 1=TRTLLM, 2=SGLANG).
         # In multi-group mode all groups share the same per-layer GPU layout, so
@@ -928,7 +950,8 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
                 self.cpu_layer_stride_in_bytes,
                 self.cpu_block_stride_in_bytes,
                 self.chunk_size_in_bytes,
-                0,                  # start_layer_id (whole-model)
+                0,                  # start_layer_id=0: GPU tensor is PP-stage-local;
+                                    # PP offset is baked into self.cpu_tensor.
                 self.num_layers,    # layer_granularity = all layers
                 transfer_num_cta,
                 transfer_type == TransferType.H2D,
@@ -995,6 +1018,7 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
                  cpu_kv_layout: KVCacheLayout,
                  dtype: torch.dtype,
                  tp_group_size: int,
+                 start_layer_id: int = 0,
                  use_ce_transfer_h2d: bool = False,
                  use_ce_transfer_d2h: bool = False,
                  transfer_num_cta_h2d: int = 4,
@@ -1040,6 +1064,22 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
         # Read MLA D2H mode from global config
         self.mla_d2h_mode = GLOBAL_CONFIG_FROM_ENV.mla_d2h_mode
         flexkv_logger.debug(f"[tpGPUCPUTransferWorker] mla_d2h_mode={self.mla_d2h_mode}")
+
+        # PP stage offset into the shared per-node CPU pool (baked into the
+        # cpu_blocks_ptr handed to the C++ thread group below; the kernel
+        # keeps layer_id=0 because the GPU tensor is PP-stage-local).
+        self.start_layer_id = start_layer_id
+        assert start_layer_id + self.num_layers <= cpu_kv_layout.num_layer, (
+            f"tpGPUCPUTransferWorker: start_layer_id({start_layer_id}) + "
+            f"num_layers({self.num_layers}) exceeds cpu pool layers"
+            f"({cpu_kv_layout.num_layer}). Same-node PP>1 requires the cpu "
+            f"pool to cover all co-located PP stages."
+        )
+        if start_layer_id > 0 and layer_groups is not None:
+            raise ValueError(
+                "tpGPUCPUTransferWorker: start_layer_id>0 (same-node PP>1) "
+                "is not supported with multi-group layer_groups"
+            )
 
         if layer_groups is not None and gpu_blocks_per_group is not None and gpu_layouts_per_group is not None:
             self._init_tp_multi_group(
@@ -1100,6 +1140,10 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
                 for j in range(len(self.gpu_blocks[i]))
             ]
             cpu_blocks_ptr = cpu_blocks.data_ptr()
+            # PP offset: must use the POST-div_head cpu_layer_stride_in_bytes —
+            # the same stride the C++ kernel uses for layer-wise addressing.
+            if start_layer_id > 0:
+                cpu_blocks_ptr += start_layer_id * self.cpu_layer_stride_in_bytes
             gpu_device_ids = [self.gpu_blocks[i][0].device.index for i in range(self.num_gpus)]
             num_tensors_per_gpu = len(self.gpu_blocks[0])
 
@@ -1331,7 +1375,8 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
                 transfer_num_cta,
                 transfer_type == TransferType.H2D,
                 use_ce_transfer,
-                0,                  # start_layer_id (whole-model)
+                0,                  # start_layer_id=0: GPU tensor is PP-stage-local;
+                                    # PP offset is baked into cpu_blocks_ptr.
                 self.num_layers,    # layer_granularity = all layers
                 self.is_mla,
                 self.mla_d2h_mode,  # Pass MLA D2H mode to C++ (#192)
@@ -1800,6 +1845,7 @@ class GDSTransferWorker(TransferWorkerBase):
         ssd_kv_layout: KVCacheLayout,
         dtype: torch.dtype,
         gpu_device_id: int = 0,
+        start_layer_id: int = 0,
         layer_groups: Optional[List[LayerGroupSpec]] = None,
         gpu_blocks_per_group: Optional[List[List[TensorSharedHandle]]] = None,
         gpu_layouts_per_group: Optional[List[KVCacheLayout]] = None,
@@ -1839,6 +1885,23 @@ class GDSTransferWorker(TransferWorkerBase):
 
         # Layout information
         self.num_layers = gpu_kv_layout.num_layer
+
+        # PP stage offset into the shared per-node SSD pool: applied to the
+        # layer_id_list at transfer time (the C++ GDS kernel reads
+        # layer_id_list[0] as the SSD-side seek offset; the GPU side stays
+        # PP-stage-local, 0-indexed).
+        self.start_layer_id = start_layer_id
+        assert start_layer_id + self.num_layers <= ssd_kv_layout.num_layer, (
+            f"GDSTransferWorker: start_layer_id({start_layer_id}) + "
+            f"num_layers({self.num_layers}) exceeds ssd pool layers"
+            f"({ssd_kv_layout.num_layer}). Same-node PP>1 requires the ssd "
+            f"pool to cover all co-located PP stages."
+        )
+        if start_layer_id > 0 and self.has_multi_group:
+            raise ValueError(
+                "GDSTransferWorker: start_layer_id>0 (same-node PP>1) "
+                "is not supported with multi-group layer_groups"
+            )
 
         if self.has_multi_group:
             self._init_multi_group_gds(
@@ -2027,8 +2090,12 @@ class GDSTransferWorker(TransferWorkerBase):
                         self.gpu_device_id,
                     )
             else:
-                # Uniform: whole-model transfer
-                layer_id_list = torch.arange(0, self.num_layers, dtype=torch.int32)
+                # Uniform: whole-stage transfer. layer_id_list[0] doubles as
+                # the SSD-side seek offset (start_layer * ssd_layer_stride),
+                # shifting this PP stage into its slice of the shared pool.
+                layer_id_list = torch.arange(
+                    self.start_layer_id, self.start_layer_id + self.num_layers,
+                    dtype=torch.int32)
                 transfer_kv_blocks_gds(
                     self.gds_manager,
                     layer_id_list,
@@ -2099,6 +2166,7 @@ class tpGDSTransferWorker(TransferWorkerBase):
         ssd_kv_layout: KVCacheLayout,
         dtype: torch.dtype,
         tp_group_size: int,
+        start_layer_id: int = 0,
         layer_groups: Optional[List[LayerGroupSpec]] = None,
         gpu_blocks_per_group: Optional[List[List[List[TensorSharedHandle]]]] = None,
         gpu_layouts_per_group: Optional[List[List[KVCacheLayout]]] = None,
@@ -2148,6 +2216,22 @@ class tpGDSTransferWorker(TransferWorkerBase):
 
         # Layout information
         self.num_layers = gpu_kv_layouts[0].num_layer
+
+        # PP stage offset: passed to the C++ tp_group_transfer kernel as the
+        # SSD-side layer seek offset (start_layer_id * ssd_layer_stride); the
+        # GPU side stays PP-stage-local (0-indexed).
+        self.start_layer_id = start_layer_id
+        assert start_layer_id + self.num_layers <= ssd_kv_layout.num_layer, (
+            f"tpGDSTransferWorker: start_layer_id({start_layer_id}) + "
+            f"num_layers({self.num_layers}) exceeds ssd pool layers"
+            f"({ssd_kv_layout.num_layer}). Same-node PP>1 requires the ssd "
+            f"pool to cover all co-located PP stages."
+        )
+        if start_layer_id > 0 and self.has_multi_group:
+            raise ValueError(
+                "tpGDSTransferWorker: start_layer_id>0 (same-node PP>1) "
+                "is not supported with multi-group layer_groups"
+            )
 
         if self.has_multi_group:
             self._init_tp_multi_group_gds(
@@ -2403,7 +2487,7 @@ class tpGDSTransferWorker(TransferWorkerBase):
                 self.ssd_tp_stride_in_bytes,
                 self.num_blocks_per_file,
                 is_read,
-                0,
+                self.start_layer_id,  # SSD-side layer seek offset (PP slice)
                 self.num_layers,
                 self.is_mla,
                 packed_kv=self.packed_kv,

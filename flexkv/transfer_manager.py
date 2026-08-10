@@ -192,7 +192,36 @@ class TransferManager:
             f"Expected {self.expected_gpus} GPU layouts, got {len(self.all_gpu_layouts)}"
         assert len(self.all_gpu_blocks) == self.expected_gpus, \
             f"Expected {self.expected_gpus} GPU blocks, got {len(self.all_gpu_blocks)}"
-        num_layers_per_pp_stage = next(iter(self.all_gpu_layouts.values())).num_layer
+
+        distinct_local_pp_ranks = {
+            wk.pp_rank for wk in self.gpu_worker_key_mapping.values()}
+        num_layers_on_node = 0
+        for pp_rank in distinct_local_pp_ranks:
+            start, end = self.model_config.get_pp_indices(pp_rank)
+            registered = next(
+                layout.num_layer
+                for dev_id, layout in self.all_gpu_layouts.items()
+                if self.gpu_worker_key_mapping[dev_id].pp_rank == pp_rank)
+            if registered != end - start:
+                raise ValueError(
+                    f"[TransferManager] registered layout.num_layer={registered} "
+                    f"for pp_rank={pp_rank} does not match "
+                    f"get_pp_indices({pp_rank})=[{start}, {end}) "
+                    f"(pp_layer_ranges={self.model_config.pp_layer_ranges}).")
+            num_layers_on_node += registered
+
+        if (len(distinct_local_pp_ranks) > 1
+                and self.model_config.layer_groups is not None):
+            raise ValueError(
+                "[TransferManager] multiple PP stages on one node with "
+                "heterogeneous layer_groups is not supported: the multi-group "
+                "CPU/SSD pool block format is per-stage and cannot be shared. "
+                "Colocating stages would corrupt the pool; run with one PP "
+                "stage per node (or disable layer_groups)."
+            )
+        flexkv_logger.info(
+            f"[TransferManager] per-node pool: num_layers_on_node={num_layers_on_node} "
+            f"(local pp_ranks={sorted(distinct_local_pp_ranks)})")
 
         # Recompute block counts once layer_groups are known (heterogeneous /
         # multi-pool models).  Must match CacheEngine mempool sizing in the
@@ -203,7 +232,7 @@ class TransferManager:
         self.storage_engine = StorageEngine(
             self.model_config,
             self.cache_config,
-            num_layers_per_pp_stage,
+            num_layers_on_node,
             swa_layer_groups=self.swa_layer_groups,
         )
 

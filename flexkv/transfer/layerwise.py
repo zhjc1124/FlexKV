@@ -87,6 +87,7 @@ class LayerwiseTransferWorker(TransferWorkerBase):
                  h2d_cta_num: int = 4,
                  d2h_cta_num: int = 4,
                  enable_eventfd: bool = True,
+                 start_layer_id: int = 0,
                  layer_groups: Optional[List[LayerGroupSpec]] = None,
                  gpu_blocks_per_group: Optional[List[List[List[TensorSharedHandle]]]] = None,
                  gpu_layouts_per_group: Optional[List[List[KVCacheLayout]]] = None,
@@ -154,6 +155,23 @@ class LayerwiseTransferWorker(TransferWorkerBase):
             layer_groups is not None
             and gpu_blocks_per_group is not None
             and gpu_layouts_per_group is not None
+        )
+
+        # PP stage offset into the shared per-node CPU pool: the tensor handed
+        # to the C++ group is sliced by start_layer_id * (post-div_head h2d
+        # layer stride) in _init_single_group, so the kernel keeps layer_id=0
+        # (GPU tensor is PP-stage-local, 0-indexed).
+        self.start_layer_id = start_layer_id
+        if start_layer_id > 0 and self.has_multi_group:
+            raise ValueError(
+                "LayerwiseTransferWorker: start_layer_id>0 (same-node PP>1) "
+                "is not supported with multi-group layer_groups"
+            )
+        assert start_layer_id + self.num_layers <= cpu_kv_layout.num_layer, (
+            f"LayerwiseTransferWorker: start_layer_id({start_layer_id}) + "
+            f"num_layers({self.num_layers}) exceeds cpu pool layers"
+            f"({cpu_kv_layout.num_layer}). Same-node PP>1 requires the cpu "
+            f"pool to cover all co-located PP stages."
         )
 
         num_blocks_first_gpu = len(imported_gpu_blocks[0]) if imported_gpu_blocks else 0
@@ -628,6 +646,11 @@ class LayerwiseTransferWorker(TransferWorkerBase):
         self.cpu_tp_stride_in_bytes = self.cpu_block_stride_in_bytes // self.tp_group_size
         self.h2d_cpu_kv_stride_in_bytes = cpu_kv_layout_tp.get_kv_stride() * self.dtype.itemsize
         self.h2d_cpu_layer_stride_in_bytes = cpu_kv_layout_tp.get_layer_stride() * self.dtype.itemsize
+
+        if self.start_layer_id > 0:
+            layer_offset_elems = self.start_layer_id * (
+                self.h2d_cpu_layer_stride_in_bytes // self.dtype.itemsize)
+            cpu_blocks = cpu_blocks.flatten()[layer_offset_elems:]
 
         if self.enable_ssd:
             ssd_kv_layout_per_file = ssd_kv_layout.div_block(self.num_files, padding=True)
