@@ -319,6 +319,8 @@ class KVTPClient:
         layer_groups: Optional[List[LayerGroupSpec]] = None,
         gpu_layouts: Optional[List[KVCacheLayout]] = None,
         handles_per_group: Optional[List[List[torch.Tensor]]] = None,
+        indexer_buffers: Optional[List[torch.Tensor]] = None,
+        indexer_layout: Optional[KVCacheLayout] = None,
         swa_caches: Optional[List[torch.Tensor]] = None,
         swa_layout: Optional[KVCacheLayout] = None,
         swa_layer_groups: Optional[List[LayerGroupSpec]] = None,
@@ -327,6 +329,47 @@ class KVTPClient:
     ) -> None:
         if not kv_caches or not kv_caches[0].is_cuda:
             raise ValueError("GPU blocks must be CUDA tensors")
+
+        # ── indexer compatibility shim ──────────────────────────────
+        # sglang's FlexKVConnector passes indexer buffers via the
+        # (indexer_buffers, indexer_layout) pair instead of the
+        # (layer_groups, gpu_layouts, handles_per_group) triple that
+        # vLLM uses.  Translate the former into the latter so the rest
+        # of the registration pipeline is identical.
+        if indexer_buffers is not None and len(indexer_buffers) > 0:
+            if indexer_layout is None:
+                raise ValueError(
+                    "indexer_layout must be provided when indexer_buffers is given"
+                )
+            if layer_groups is not None or gpu_layouts is not None or handles_per_group is not None:
+                raise ValueError(
+                    "indexer_buffers conflicts with explicit layer_groups/"
+                    "gpu_layouts/handles_per_group — use one or the other"
+                )
+            main_group = LayerGroupSpec(
+                num_layers=kv_layout.num_layer,
+                num_kv_heads=kv_layout.num_head,
+                head_size=kv_layout.head_size,
+                layer_indices=list(range(kv_layout.num_layer)),
+                dtype=kv_caches[0].dtype,
+            )
+            indexer_group = LayerGroupSpec(
+                num_layers=indexer_layout.num_layer,
+                num_kv_heads=indexer_layout.num_head,
+                head_size=indexer_layout.head_size,
+                layer_indices=list(range(indexer_layout.num_layer)),
+                dtype=indexer_buffers[0].dtype,
+                compress_ratio=(
+                    kv_layout.tokens_per_block
+                    // indexer_layout.tokens_per_block
+                    if indexer_layout.tokens_per_block > 0
+                    else None
+                ),
+            )
+            layer_groups = [main_group, indexer_group]
+            gpu_layouts = [kv_layout, indexer_layout]
+            handles_per_group = [kv_caches, indexer_buffers]
+        # ── end indexer compatibility shim ──────────────────────────
         swa_group_fields = (
             swa_layer_groups,
             swa_gpu_layouts,
