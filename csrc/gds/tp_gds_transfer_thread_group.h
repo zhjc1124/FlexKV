@@ -47,7 +47,8 @@ public:
       const int layer_id,
       const int layer_granularity,
       const int kv_dim,
-      const int num_kv_heads = 1);
+      const int num_kv_heads = 1,
+      const int64_t pp_seek_offset_bytes = 0);
 
 private:
   using Task = std::function<void()>;

@@ -211,6 +211,18 @@ void TPTransferThreadGroup::tp_group_transfer(
 
   std::atomic<bool> failed{false};
   std::string error_msg;
+
+  // Python multi-group callers pass the PP stage offset as layer_id against a
+  // per-node CPU pool (global layer indexing) while the GPU pointer array is
+  // per-stage (0-based).  Kernels index GPU pointers with start_layer + i, so
+  // bake the offset into the CPU base pointer and transfer layers 0-based.
+  void *cpu_base = cpu_blocks_;
+  int layer_base = 0;
+  if (layer_id != 0) {
+    cpu_base = static_cast<char *>(cpu_blocks_) +
+               static_cast<int64_t>(layer_id) * cpu_layer_stride_in_bytes;
+  }
+
   // threads_.clear();
   // threads_.reserve(num_gpus_);
 
@@ -285,7 +297,7 @@ void TPTransferThreadGroup::tp_group_transfer(
             static_cast<int64_t *>(gpu_block_id_tensor.data_ptr());
         int64_t *cpu_block_ids =
             static_cast<int64_t *>(cpu_block_id_tensor.data_ptr());
-        void *cpu_ptr = cpu_blocks_;
+        void *cpu_ptr = cpu_base;
         int64_t cpu_startoff_inside_chunks = 0;
         int64_t gpu_startoff_inside_chunks = 0;
         int64_t chunk_size = gpu_chunk_sizes_in_bytes_[i];
@@ -304,7 +316,7 @@ void TPTransferThreadGroup::tp_group_transfer(
         }
         
         // Effective layer range: round_robin assigns subset; else full (layer_id, layer_granularity).
-        int eff_start_layer = layer_id;
+        int eff_start_layer = layer_base;
         int eff_num_layers = layer_granularity;
         if (num_kv_heads == 1 && !is_host_to_device && mode == "layer_parallel") {
           int L_rotate = layer_granularity, N_rotate = num_gpus_;
@@ -317,7 +329,7 @@ void TPTransferThreadGroup::tp_group_transfer(
             my_start_rotate = remainder_rotate * (layers_per_rank_rotate + 1) +
                           (i - remainder_rotate) * layers_per_rank_rotate;
           }
-          eff_start_layer = layer_id + my_start_rotate;
+          eff_start_layer = layer_base + my_start_rotate;
           eff_num_layers = (i < remainder_rotate) ? (layers_per_rank_rotate + 1)
                                               : layers_per_rank_rotate;
         }

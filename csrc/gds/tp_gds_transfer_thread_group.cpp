@@ -172,7 +172,8 @@ void TPGDSTransferThreadGroup::tp_group_transfer(
     const int layer_id,
     const int layer_granularity,
     const int kv_dim,
-    const int num_kv_heads) {
+    const int num_kv_heads,
+    const int64_t pp_seek_offset_bytes) {
 
   std::atomic<bool> failed{false};
   std::string error_msg;
@@ -195,6 +196,7 @@ void TPGDSTransferThreadGroup::tp_group_transfer(
           ssd_copy_off_inside_chunks = i * ssd_tp_stride_in_bytes;
         }
 
+        ssd_copy_off_inside_chunks += pp_seek_offset_bytes;
         int64_t chunk_size = gpu_chunk_size_in_bytes;
         switch (backend_type_) {
           case BackendType::VLLM:

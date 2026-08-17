@@ -705,7 +705,8 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
                  compressor: Optional[CompressionStrategy] = None,
                  layer_groups: Optional[List[LayerGroupSpec]] = None,
                  gpu_blocks_per_group: Optional[List[List[TensorSharedHandle]]] = None,
-                 gpu_layouts_per_group: Optional[List[KVCacheLayout]] = None) -> None:
+                 gpu_layouts_per_group: Optional[List[KVCacheLayout]] = None,
+                 start_layer_id: int = 0) -> None:
         # initialize worker in a new process
         super().__init__(worker_id, transfer_conn, finished_ops_queue, op_buffer_tensor)
 
@@ -735,6 +736,8 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
         )
 
         self.num_layers = gpu_kv_layout.num_layer
+        self._pool_num_layers = cpu_kv_layout.num_layer
+        self.start_layer_id = start_layer_id
         self.layer_groups = layer_groups
 
         if layer_groups is not None and gpu_blocks_per_group is not None and gpu_layouts_per_group is not None:
@@ -779,7 +782,10 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
             ref_num_layers = self.num_layers
         else:
             ref_blocks_len = len(gpu_blocks_per_group[0])
-            ref_num_layers = layer_groups[0].num_layers
+            # self.num_layers is already per-stage (from gpu_kv_layout.num_layer);
+            # layer_groups[0].num_layers is the total model layer count.
+            # Use self.num_layers to correctly match per-stage GPU block count.
+            ref_num_layers = self.num_layers
 
         if ref_blocks_len == 1:
             self.gpu_block_type_ = 1
@@ -798,6 +804,13 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
         self.transfer_num_cta_d2h = transfer_num_cta_d2h
         self.use_ce_transfer_h2d = use_ce_transfer_h2d
         self.use_ce_transfer_d2h = use_ce_transfer_d2h
+
+        # PP stage offset
+        self.start_layer_id = start_layer_id
+        if start_layer_id > 0 and self.group_transfer_params is None:
+            layer_offset_elems = start_layer_id * (
+                self.cpu_layer_stride_in_bytes // self.dtype.itemsize)
+            self.cpu_tensor = cpu_blocks.flatten()[layer_offset_elems:]
 
         self.ce_path_opt = GLOBAL_CONFIG_FROM_ENV.ce_path_opt
         self.ce_segment_threshold = GLOBAL_CONFIG_FROM_ENV.ce_segment_threshold
@@ -829,6 +842,7 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
         )
 
         self.group_transfer_params: list = []
+        self._total_block_bytes = total_block_bytes
         # Keep the imported CUDA-IPC tensors alive for the worker's lifetime.
         # _get_layer_ptrs() below records only their raw data_ptr()s; if the
         # tensors themselves were allowed to go out of scope, PyTorch would
@@ -888,7 +902,7 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
                 'cpu_block_stride': cpu_block_stride,
                 'cpu_kv_stride': cpu_kv_stride,
                 'cpu_offset_bytes': cpu_offset_bytes,
-                'num_layers': g.num_layers,
+                'num_layers': self.num_layers,  # per-stage, not g.num_layers (total)
                 'kv_dim': gpu_layout.kv_dim,
             })
 
@@ -973,8 +987,10 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
             # Multi-group transfer: one call per group
             for gp in self.group_transfer_params:
                 gpu_ptrs = gp['gpu_ptrs'].contiguous().pin_memory()
-                # Offset the CPU tensor to this group's region.  cpu_tensor is
-                # uint8 in multi-group mode, so this slice is byte-addressed.
+                # CPU tensor: slice to this group's region only.
+                # start_layer_id is passed directly to transfer_kv_blocks
+                # so the C++ kernel handles per-layer offset correctly
+                # for both LAYERFIRST and BLOCKFIRST layouts.
                 cpu_tensor_for_group = self.cpu_tensor.view(-1)[
                     gp['cpu_offset_bytes']:
                 ]
@@ -991,7 +1007,7 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
                     gp['cpu_layer_stride'],
                     gp['cpu_block_stride'],
                     gp['chunk_size'],
-                    0,                   # start_layer_id (always 0 within group)
+                    self.start_layer_id,  # PP offset passed to C++ kernel
                     gp['num_layers'],    # all layers in this group
                     transfer_num_cta,
                     transfer_type == TransferType.H2D,
@@ -1095,7 +1111,8 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
                  compressor: Optional[CompressionStrategy] = None,
                  layer_groups: Optional[List[LayerGroupSpec]] = None,
                  gpu_blocks_per_group: Optional[List[List[List[TensorSharedHandle]]]] = None,
-                 gpu_layouts_per_group: Optional[List[List[KVCacheLayout]]] = None):
+                 gpu_layouts_per_group: Optional[List[List[KVCacheLayout]]] = None,
+                 start_layer_id: int = 0):
 
         super().__init__(worker_id, transfer_conn, finished_ops_queue, op_buffer_tensor)
         assert len(gpu_blocks) == tp_group_size
@@ -1123,6 +1140,8 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
         self._register_host_tensor(cpu_blocks, "tp_cpu_kv_pool")
 
         self.num_layers = gpu_kv_layouts[0].num_layer
+        self._pool_num_layers = cpu_kv_layout.num_layer
+        self.start_layer_id = start_layer_id
 
         self.transfer_num_cta_h2d = transfer_num_cta_h2d
         self.transfer_num_cta_d2h = transfer_num_cta_d2h
@@ -1131,6 +1150,7 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
 
         # Read KV shared across ranks D2H mode from global config
         self.kv_shared_across_ranks_mode = GLOBAL_CONFIG_FROM_ENV.kv_shared_across_ranks_mode
+        self.start_layer_id = start_layer_id
         flexkv_logger.debug(f"[tpGPUCPUTransferWorker] kv_shared_across_ranks_mode={self.kv_shared_across_ranks_mode}")
 
         if layer_groups is not None and gpu_blocks_per_group is not None and gpu_layouts_per_group is not None:
@@ -1192,6 +1212,8 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
                 for j in range(len(self.gpu_blocks[i]))
             ]
             cpu_blocks_ptr = cpu_blocks.data_ptr()
+            if start_layer_id > 0:
+                cpu_blocks_ptr += start_layer_id * self.cpu_layer_stride_in_bytes
             gpu_device_ids = [self.gpu_blocks[i][0].device.index for i in range(self.num_gpus)]
             num_tensors_per_gpu = len(self.gpu_blocks[0])
 
@@ -1246,6 +1268,7 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
         )
 
         self.tp_group_transfer_groups: list = []
+        self._tp_total_block_bytes = total_block_bytes
         # Keep imported CUDA-IPC tensors alive for the worker's lifetime:
         # TPTransferThreadGroup below stores only their raw data_ptr()s, so if
         # the tensors were dropped PyTorch would release the IPC mapping and the
@@ -1317,6 +1340,8 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
                 cpu_tp_stride = cpu_block_stride // self.tp_group_size
 
             # CPU tensor offset for this group (cpu_tensor is uint8 in multi-group)
+            # Only slice to group region; start_layer_id is passed to C++ kernel
+            # so it handles per-layer offset correctly for both layouts.
             cpu_blocks_ptr = self.cpu_tensor.view(-1)[cpu_offset_bytes:].data_ptr()
 
             tp_thread_group = TPTransferThreadGroup(
@@ -1324,7 +1349,7 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
                 gpu_block_ptrs_flat,
                 num_tensors_per_gpu,
                 cpu_blocks_ptr,
-                g.num_layers,
+                num_tensors_per_gpu,  # num_layers: per-stage count (was g.num_layers total)
                 gpu_kv_strides,
                 gpu_block_strides,
                 gpu_layer_strides,
@@ -1344,7 +1369,7 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
                 'cpu_block_stride': cpu_block_stride,
                 'cpu_tp_stride': cpu_tp_stride,
                 'cpu_offset_bytes': cpu_offset_bytes,
-                'num_layers': g.num_layers,
+                'num_layers': self.num_layers,  # per-stage, not g.num_layers (total)
                 'chunk_size': chunk_elements * dtype_size_g,
             })
 
@@ -1454,8 +1479,8 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
                     transfer_num_cta,
                     transfer_type == TransferType.H2D,
                     use_ce_transfer,
-                    0,                 # start_layer_id (always 0 within group)
-                    gp['num_layers'],  # all layers in this group
+                    self.start_layer_id,  # PP offset passed to C++ kernel
+                    gp['num_layers'],  # per-stage layers in this group
                     self.kv_dim,
                     self.num_kv_heads,
                     self.kv_shared_across_ranks_mode,
@@ -1942,7 +1967,7 @@ class GDSTransferWorker(TransferWorkerBase):
         layer_groups: Optional[List[LayerGroupSpec]] = None,
         gpu_blocks_per_group: Optional[List[List[TensorSharedHandle]]] = None,
         gpu_layouts_per_group: Optional[List[KVCacheLayout]] = None,
-    ) -> None:
+                 start_layer_id: int = 0) -> None:
         """
         Initialize GDS Transfer Worker
         """
@@ -2089,7 +2114,7 @@ class GDSTransferWorker(TransferWorkerBase):
                 group_gpu_ptrs = self.gpu_layer_ptrs
 
             self.group_gds_params.append({
-                'num_layers': g.num_layers,
+                'num_layers': self.num_layers,  # per-stage, not g.num_layers (total)
                 'gpu_ptrs': group_gpu_ptrs,
                 'gpu_kv_stride': gpu_kv_stride,
                 'gpu_block_stride': gpu_block_stride,
@@ -2137,6 +2162,7 @@ class GDSTransferWorker(TransferWorkerBase):
 
         try:
             if self.has_multi_group:
+                pp_ssd_offset = self.start_layer_id * (self.ssd_block_stride_in_bytes // self._pool_num_layers)
                 for gp in self.group_gds_params:
                     g_gpu = gpu_block_id_list
                     g_ssd = ssd_block_id_list
@@ -2155,7 +2181,7 @@ class GDSTransferWorker(TransferWorkerBase):
                         self.ssd_block_stride_in_bytes,
                         gp['ssd_kv_stride'],
                         gp['chunk_size'],
-                        gp['ssd_copy_offset'],
+                        gp['ssd_copy_offset'] + pp_ssd_offset,
                         self.num_blocks_per_file,
                         gp['num_layers'],
                         is_read,
@@ -2180,7 +2206,7 @@ class GDSTransferWorker(TransferWorkerBase):
                     self.ssd_block_stride_in_bytes,
                     self.ssd_kv_stride_in_bytes,
                     self.chunk_size_in_bytes,
-                    0,
+                    self.start_layer_id * self.ssd_layer_stride_in_bytes,
                     self.num_blocks_per_file,
                     self.num_layers,
                     is_read,
@@ -2240,7 +2266,7 @@ class tpGDSTransferWorker(TransferWorkerBase):
         layer_groups: Optional[List[LayerGroupSpec]] = None,
         gpu_blocks_per_group: Optional[List[List[List[TensorSharedHandle]]]] = None,
         gpu_layouts_per_group: Optional[List[List[KVCacheLayout]]] = None,
-    ) -> None:
+                 start_layer_id: int = 0) -> None:
         """
         Initialize TP GDS Transfer Worker
 
@@ -2458,7 +2484,7 @@ class tpGDSTransferWorker(TransferWorkerBase):
                 gpu_ptrs_flat,
                 num_tensors,
                 ssd_files,
-                g.num_layers,
+                num_tensors_per_gpu,  # num_layers: per-stage count (was g.num_layers total)
                 gpu_kv_strides,
                 gpu_block_strides,
                 gpu_layer_strides,
@@ -2467,7 +2493,7 @@ class tpGDSTransferWorker(TransferWorkerBase):
             )
 
             self.group_tp_gds_params.append({
-                'num_layers': g.num_layers,
+                'num_layers': self.num_layers,  # per-stage, not g.num_layers (total)
                 'tp_gds_group': tp_gds_group,
                 'ssd_layer_stride': ssd_layer_stride,
                 'ssd_kv_stride': ssd_kv_stride,
@@ -2524,10 +2550,11 @@ class tpGDSTransferWorker(TransferWorkerBase):
                     gp['ssd_tp_stride'],
                     self.num_blocks_per_file,
                     is_read,
-                    0,  # layer_id always 0 for per-group
+                    0,  # layer_id=0: PP offset in pp_seek_offset_bytes
                     gp['num_layers'],
                     self.kv_dim,
                     self.num_kv_heads,
+                    pp_seek_offset_bytes=self.start_layer_id * (self.ssd_block_stride_in_bytes // self._pool_num_layers),
                 )
         else:
             self.tp_gds_transfer_thread_group.tp_group_transfer(
@@ -2539,10 +2566,11 @@ class tpGDSTransferWorker(TransferWorkerBase):
                 self.ssd_tp_stride_in_bytes,
                 self.num_blocks_per_file,
                 is_read,
-                0,
+                0,  # layer_id=0: PP offset in pp_seek_offset_bytes
                 self.num_layers,
                 self.kv_dim,
                 self.num_kv_heads,
+                pp_seek_offset_bytes=self.start_layer_id * self.ssd_layer_stride_in_bytes,
             )
 
     def launch_transfer(self, transfer_op: WorkerTransferOp) -> bool:

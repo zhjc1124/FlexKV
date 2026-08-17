@@ -104,6 +104,18 @@ void transfer_kv_blocks_binding(
   ce_config.gather_threads = ce_gather_threads;
   ce_config.gather_nt = ce_gather_nt;
 
+  // The Python worker passes the PP stage offset as start_layer_id against
+  // a per-node CPU pool (global layer indexing) and a per-stage GPU pointer
+  // array (0-based layer indexing).  Kernels index GPU pointers with
+  // start_layer_id + i, so bake the offset into the CPU base pointer here and
+  // zero it, keeping both the CPU and GPU addressing correct.
+  void *cpu_base = cpu_ptr;
+  int gpu_start_layer = 0;
+  if (start_layer_id != 0) {
+    cpu_base = static_cast<char *>(cpu_ptr) +
+               static_cast<int64_t>(start_layer_id) * cpu_layer_stride_in_bytes;
+  }
+
   // Create GTensorHandler
   flexkv::GTensorHandler handler(
       backend_type, reinterpret_cast<int64_t **>(gpu_tensor_ptrs), num_layers,
@@ -114,8 +126,8 @@ void transfer_kv_blocks_binding(
   switch (backend_type) {
   case flexkv::BackendType::VLLM:
     flexkv::transfer_kv_blocks<flexkv::BackendType::VLLM>(
-        num_blocks, start_layer_id, num_layers, gpu_block_ids, handler,
-        /*gpu_startoff_inside_chunks=*/0, cpu_block_ids, cpu_ptr,
+        num_blocks, gpu_start_layer, num_layers, gpu_block_ids, handler,
+        /*gpu_startoff_inside_chunks=*/0, cpu_block_ids, cpu_base,
         cpu_kv_stride_in_bytes, cpu_layer_stride_in_bytes,
         cpu_block_stride_in_bytes, /*cpu_startoff_inside_chunks=*/0,
         chunk_size_in_bytes, stream, transfer_num_cta, is_host_to_device,
@@ -124,8 +136,8 @@ void transfer_kv_blocks_binding(
     break;
   case flexkv::BackendType::TRTLLM:
     flexkv::transfer_kv_blocks<flexkv::BackendType::TRTLLM>(
-        num_blocks, start_layer_id, num_layers, gpu_block_ids, handler,
-        /*gpu_startoff_inside_chunks=*/0, cpu_block_ids, cpu_ptr,
+        num_blocks, gpu_start_layer, num_layers, gpu_block_ids, handler,
+        /*gpu_startoff_inside_chunks=*/0, cpu_block_ids, cpu_base,
         cpu_kv_stride_in_bytes, cpu_layer_stride_in_bytes,
         cpu_block_stride_in_bytes, /*cpu_startoff_inside_chunks=*/0,
         chunk_size_in_bytes, stream, transfer_num_cta, is_host_to_device,
@@ -134,8 +146,8 @@ void transfer_kv_blocks_binding(
     break;
   case flexkv::BackendType::SGLANG:
     flexkv::transfer_kv_blocks<flexkv::BackendType::SGLANG>(
-        num_blocks, start_layer_id, num_layers, gpu_block_ids, handler,
-        /*gpu_startoff_inside_chunks=*/0, cpu_block_ids, cpu_ptr,
+        num_blocks, gpu_start_layer, num_layers, gpu_block_ids, handler,
+        /*gpu_startoff_inside_chunks=*/0, cpu_block_ids, cpu_base,
         cpu_kv_stride_in_bytes, cpu_layer_stride_in_bytes,
         cpu_block_stride_in_bytes, /*cpu_startoff_inside_chunks=*/0,
         chunk_size_in_bytes, stream, transfer_num_cta, is_host_to_device,
@@ -873,7 +885,8 @@ PYBIND11_MODULE(c_ext, m) {
            py::arg("ssd_tp_stride_in_bytes"), py::arg("num_blocks_per_file"),
            py::arg("is_read"), py::arg("layer_id"),
            py::arg("layer_granularity"), py::arg("kv_dim"),
-           py::arg("num_kv_heads") = 1);
+           py::arg("num_kv_heads") = 1,
+           py::arg("pp_seek_offset_bytes") = (int64_t)0);
 #endif
 
   // Add Hasher class binding

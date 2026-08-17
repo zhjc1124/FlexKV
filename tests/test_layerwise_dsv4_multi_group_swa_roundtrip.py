@@ -19,6 +19,7 @@ Run:
 
 from __future__ import annotations
 
+import os
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import pytest
@@ -396,6 +397,8 @@ def _zero_all_gpu(fx: MultiGroupFixture) -> None:
 class TestLayerwiseDsv4MultiGroupSwaRoundtrip:
     def test_dsv4_write_read_roundtrip_main_indexer_swa(self) -> None:
         """GPU seed -> D2H (3 groups + SWA) -> layerwise H2D -> byte-exact restore."""
+        # io_uring is optional: when unavailable, the C++ SSD layer falls
+        # back to threaded synchronous pread/pwrite automatically.
         torch.cuda.set_device(DEVICE_ID)
         layer_groups = _dsv4_layer_groups()
         fx = _build_dsv4_fixture(layer_groups)

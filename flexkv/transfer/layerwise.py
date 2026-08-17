@@ -87,6 +87,7 @@ class LayerwiseTransferWorker(TransferWorkerBase):
                  h2d_cta_num: int = 4,
                  d2h_cta_num: int = 4,
                  enable_eventfd: bool = True,
+                 start_layer_id: int = 0,
                  layer_groups: Optional[List[LayerGroupSpec]] = None,
                  gpu_blocks_per_group: Optional[List[List[List[TensorSharedHandle]]]] = None,
                  gpu_layouts_per_group: Optional[List[List[KVCacheLayout]]] = None,
@@ -153,6 +154,7 @@ class LayerwiseTransferWorker(TransferWorkerBase):
             and gpu_blocks_per_group is not None
             and gpu_layouts_per_group is not None
         )
+        self.start_layer_id = start_layer_id
 
         num_blocks_first_gpu = len(imported_gpu_blocks[0]) if imported_gpu_blocks else 0
         if num_blocks_first_gpu == 1:
@@ -626,6 +628,10 @@ class LayerwiseTransferWorker(TransferWorkerBase):
         self.cpu_tp_stride_in_bytes = self.cpu_block_stride_in_bytes // self.tp_group_size
         self.h2d_cpu_kv_stride_in_bytes = cpu_kv_layout_tp.get_kv_stride() * self.dtype.itemsize
         self.h2d_cpu_layer_stride_in_bytes = cpu_kv_layout_tp.get_layer_stride() * self.dtype.itemsize
+        if self.start_layer_id > 0:
+            layer_offset_elems = self.start_layer_id * (
+                self.h2d_cpu_layer_stride_in_bytes // self.dtype.itemsize)
+            cpu_blocks = cpu_blocks.flatten()[layer_offset_elems:]
 
         if self.enable_ssd:
             ssd_kv_layout_per_file = ssd_kv_layout.div_block(self.num_files, padding=True)
@@ -714,6 +720,19 @@ class LayerwiseTransferWorker(TransferWorkerBase):
             f"tp_stride={tables['cpu_tp_stride']}"
         )
 
+        if self.start_layer_id > 0:
+            # In BLOCKFIRST multi-group, each group's layers are contiguous
+            # within a block.  PP offset = start_layer_id * per-group layer
+            # stride, applied per-group via group_cpu_offset_bytes (not baked
+            # into cpu_blocks pointer, which would skip entire blocks).
+            adjusted_offsets = [
+                off + self.start_layer_id * ls
+                for off, ls in zip(
+                    tables["group_cpu_offset_bytes"],
+                    tables["group_cpu_layer_strides"],
+                )
+            ]
+            tables["group_cpu_offset_bytes"] = adjusted_offsets
         flexkv_logger.debug("[LayerwiseWorker] Creating LayerwiseTransferGroup (multi-group)...")
         self.layerwise_transfer_group = LayerwiseTransferGroup(
             num_gpus=self.num_gpus,
