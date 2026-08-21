@@ -1479,7 +1479,7 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
                     transfer_type == TransferType.H2D,
                     use_ce_transfer,
                     self.start_layer_id * gp['cpu_layer_stride'],  # PP anchor
-                    0,              # layer_id: whole stage
+                    0,              # start_layer_id: whole stage
                     gp['num_layers'],  # per-stage layers in this group
                     self.kv_dim,
                     self.num_kv_heads,
@@ -1497,7 +1497,7 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
                 transfer_type == TransferType.H2D,
                 use_ce_transfer,
                 self.start_layer_id * self.cpu_layer_stride_in_bytes,  # PP anchor
-                0,                  # layer_id: whole stage
+                0,                  # start_layer_id: whole stage
                 self.num_layers,    # layer_granularity = all layers
                 self.kv_dim,
                 self.num_kv_heads,
@@ -2551,11 +2551,11 @@ class tpGDSTransferWorker(TransferWorkerBase):
                     gp['ssd_tp_stride'],
                     self.num_blocks_per_file,
                     is_read,
-                    0,  # layer_id=0: PP offset in pp_seek_offset_bytes
+                    0,  # start_layer_id=0: PP offset in ssd_pp_seek_offset_bytes
                     gp['num_layers'],
                     self.kv_dim,
                     self.num_kv_heads,
-                    pp_seek_offset_bytes=self.start_layer_id * (self.ssd_block_stride_in_bytes // self._pool_num_layers),
+                    ssd_pp_seek_offset_bytes=self.start_layer_id * (self.ssd_block_stride_in_bytes // self._pool_num_layers),
                 )
         else:
             self.tp_gds_transfer_thread_group.tp_group_transfer(
@@ -2567,11 +2567,11 @@ class tpGDSTransferWorker(TransferWorkerBase):
                 self.ssd_tp_stride_in_bytes,
                 self.num_blocks_per_file,
                 is_read,
-                0,  # layer_id=0: PP offset in pp_seek_offset_bytes
+                0,  # start_layer_id=0: PP offset in ssd_pp_seek_offset_bytes
                 self.num_layers,
                 self.kv_dim,
                 self.num_kv_heads,
-                pp_seek_offset_bytes=self.start_layer_id * self.ssd_layer_stride_in_bytes,
+                ssd_pp_seek_offset_bytes=self.start_layer_id * self.ssd_layer_stride_in_bytes,
             )
 
     def launch_transfer(self, transfer_op: WorkerTransferOp) -> bool:

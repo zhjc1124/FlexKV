@@ -84,7 +84,7 @@ def _probe_engine(use_ce):
             cpu_block_stride_in_bytes=layout.get_block_stride() * 2,
             cpu_tp_stride_in_bytes=layout.get_block_stride() * 2,
             transfer_num_cta=4, is_host_to_device=False, use_ce_transfer=use_ce,
-            pp_offset_bytes=0, layer_id=0, layer_granularity=1, kv_dim=1, num_kv_heads=1,
+            pp_offset_bytes=0, start_layer_id=0, layer_granularity=1, kv_dim=1, num_kv_heads=1,
             kv_shared_across_ranks_mode="sharded")
         torch.cuda.synchronize()
         del tp
@@ -563,7 +563,7 @@ def test_non_mla_roundtrip(data_config, kv_dim, cpu_layout_name, engine_name, us
         cpu_block_stride_in_bytes=cpu_layout.get_block_stride() * ES,
         cpu_tp_stride_in_bytes=cpu_layout.get_block_stride() * ES // num_gpus,
         transfer_num_cta=4, is_host_to_device=False, use_ce_transfer=use_ce,
-        pp_offset_bytes=0, layer_id=0, layer_granularity=num_layers, kv_dim=kv_dim, num_kv_heads=num_kv_heads,
+        pp_offset_bytes=0, start_layer_id=0, layer_granularity=num_layers, kv_dim=kv_dim, num_kv_heads=num_kv_heads,
         kv_shared_across_ranks_mode="sharded",  # ignored for multi-head
     )
     sync_all(num_gpus)
@@ -582,7 +582,7 @@ def test_non_mla_roundtrip(data_config, kv_dim, cpu_layout_name, engine_name, us
         cpu_block_stride_in_bytes=cpu_layout.get_block_stride() * ES,
         cpu_tp_stride_in_bytes=cpu_layout.get_block_stride() * ES // num_gpus,
         transfer_num_cta=4, is_host_to_device=True, use_ce_transfer=use_ce,
-        pp_offset_bytes=0, layer_id=0, layer_granularity=num_layers, kv_dim=kv_dim, num_kv_heads=num_kv_heads,
+        pp_offset_bytes=0, start_layer_id=0, layer_granularity=num_layers, kv_dim=kv_dim, num_kv_heads=num_kv_heads,
         kv_shared_across_ranks_mode="sharded",  # ignored for multi-head
     )
     sync_all(num_gpus)
@@ -676,7 +676,7 @@ def test_mla_roundtrip_modes(data_config, kv_dim, cpu_layout_name, engine_name, 
         cpu_block_stride_in_bytes=cpu_stride_block,
         cpu_tp_stride_in_bytes=cpu_stride_tp,
         transfer_num_cta=4, is_host_to_device=False, use_ce_transfer=use_ce,
-        pp_offset_bytes=0, layer_id=0, layer_granularity=num_layers, kv_dim=kv_dim, num_kv_heads=num_kv_heads,
+        pp_offset_bytes=0, start_layer_id=0, layer_granularity=num_layers, kv_dim=kv_dim, num_kv_heads=num_kv_heads,
         kv_shared_across_ranks_mode=mode,
     )
     sync_all(num_gpus)
@@ -695,7 +695,7 @@ def test_mla_roundtrip_modes(data_config, kv_dim, cpu_layout_name, engine_name, 
         cpu_block_stride_in_bytes=cpu_stride_block,
         cpu_tp_stride_in_bytes=cpu_stride_tp,
         transfer_num_cta=4, is_host_to_device=True, use_ce_transfer=use_ce,
-        pp_offset_bytes=0, layer_id=0, layer_granularity=num_layers, kv_dim=kv_dim, num_kv_heads=num_kv_heads,
+        pp_offset_bytes=0, start_layer_id=0, layer_granularity=num_layers, kv_dim=kv_dim, num_kv_heads=num_kv_heads,
         kv_shared_across_ranks_mode=mode,
     )
     sync_all(num_gpus)
@@ -775,7 +775,7 @@ def test_tp1_roundtrip(data_config, cpu_layout_name, engine_name, use_ce):
         cpu_block_stride_in_bytes=cpu_stride_block,
         cpu_tp_stride_in_bytes=cpu_stride_tp,
         transfer_num_cta=4, is_host_to_device=False, use_ce_transfer=use_ce,
-        pp_offset_bytes=0, layer_id=0, layer_granularity=num_layers, kv_dim=kv_dim, num_kv_heads=num_kv_heads,
+        pp_offset_bytes=0, start_layer_id=0, layer_granularity=num_layers, kv_dim=kv_dim, num_kv_heads=num_kv_heads,
         kv_shared_across_ranks_mode=mode,
     )
     sync_all(num_gpus)
@@ -793,7 +793,7 @@ def test_tp1_roundtrip(data_config, cpu_layout_name, engine_name, use_ce):
         cpu_block_stride_in_bytes=cpu_stride_block,
         cpu_tp_stride_in_bytes=cpu_stride_tp,
         transfer_num_cta=4, is_host_to_device=True, use_ce_transfer=use_ce,
-        pp_offset_bytes=0, layer_id=0, layer_granularity=num_layers, kv_dim=kv_dim, num_kv_heads=num_kv_heads,
+        pp_offset_bytes=0, start_layer_id=0, layer_granularity=num_layers, kv_dim=kv_dim, num_kv_heads=num_kv_heads,
         kv_shared_across_ranks_mode=mode,
     )
     sync_all(num_gpus)
@@ -858,7 +858,7 @@ def test_layerwise_h2d_notify_modes(data_config, kv_dim, engine_name, use_ce, no
         cpu_block_stride_in_bytes=cpu_stride_block,
         cpu_tp_stride_in_bytes=cpu_stride_tp,
         transfer_num_cta=4, is_host_to_device=False, use_ce_transfer=use_ce,
-        pp_offset_bytes=0, layer_id=0, layer_granularity=num_layers, kv_dim=kv_dim, num_kv_heads=num_kv_heads,
+        pp_offset_bytes=0, start_layer_id=0, layer_granularity=num_layers, kv_dim=kv_dim, num_kv_heads=num_kv_heads,
         kv_shared_across_ranks_mode="sharded",
     )
     sync_all(num_gpus)
@@ -956,7 +956,7 @@ def test_non_mla_roundtrip_layerwise(data_config, kv_dim, cpu_layout_name, engin
         cpu_block_stride_in_bytes=cpu_stride_block,
         cpu_tp_stride_in_bytes=cpu_stride_tp,
         transfer_num_cta=4, is_host_to_device=False, use_ce_transfer=use_ce,
-        pp_offset_bytes=0, layer_id=0, layer_granularity=num_layers, kv_dim=kv_dim, num_kv_heads=num_kv_heads,
+        pp_offset_bytes=0, start_layer_id=0, layer_granularity=num_layers, kv_dim=kv_dim, num_kv_heads=num_kv_heads,
         kv_shared_across_ranks_mode=mode,
     )
     sync_all(num_gpus)
@@ -1041,7 +1041,7 @@ def test_mla_roundtrip_modes_layerwise(data_config, kv_dim, cpu_layout_name, mod
         cpu_block_stride_in_bytes=cpu_stride_block,
         cpu_tp_stride_in_bytes=cpu_stride_tp,
         transfer_num_cta=4, is_host_to_device=False, use_ce_transfer=use_ce,
-        pp_offset_bytes=0, layer_id=0, layer_granularity=num_layers, kv_dim=kv_dim, num_kv_heads=num_kv_heads,
+        pp_offset_bytes=0, start_layer_id=0, layer_granularity=num_layers, kv_dim=kv_dim, num_kv_heads=num_kv_heads,
         kv_shared_across_ranks_mode=mode,
     )
     sync_all(num_gpus)
@@ -1098,7 +1098,7 @@ def test_invalid_mode_fallback():
         cpu_block_stride_in_bytes=cpu_layout.get_block_stride() * ES,
         cpu_tp_stride_in_bytes=cpu_layout.get_block_stride() * ES // num_gpus,
         transfer_num_cta=4, is_host_to_device=False, use_ce_transfer=False,
-        pp_offset_bytes=0, layer_id=0, layer_granularity=num_layers, kv_dim=1, num_kv_heads=1,
+        pp_offset_bytes=0, start_layer_id=0, layer_granularity=num_layers, kv_dim=1, num_kv_heads=1,
         kv_shared_across_ranks_mode="invalid_xyz",
     )
     sync_all(num_gpus)
@@ -1397,7 +1397,7 @@ def test_ce_paths_roundtrip(data_config, kv_dim, num_kv_heads, cpu_layout_name, 
         cpu_block_stride_in_bytes=cpu_stride_block,
         cpu_tp_stride_in_bytes=cpu_stride_tp,
         transfer_num_cta=4, is_host_to_device=False, use_ce_transfer=True,
-        pp_offset_bytes=0, layer_id=0, layer_granularity=num_layers, kv_dim=kv_dim, num_kv_heads=num_kv_heads,
+        pp_offset_bytes=0, start_layer_id=0, layer_granularity=num_layers, kv_dim=kv_dim, num_kv_heads=num_kv_heads,
         kv_shared_across_ranks_mode=mode,
     )
     sync_all(num_gpus)
@@ -1416,7 +1416,7 @@ def test_ce_paths_roundtrip(data_config, kv_dim, num_kv_heads, cpu_layout_name, 
         cpu_block_stride_in_bytes=cpu_stride_block,
         cpu_tp_stride_in_bytes=cpu_stride_tp,
         transfer_num_cta=4, is_host_to_device=True, use_ce_transfer=True,
-        pp_offset_bytes=0, layer_id=0, layer_granularity=num_layers, kv_dim=kv_dim, num_kv_heads=num_kv_heads,
+        pp_offset_bytes=0, start_layer_id=0, layer_granularity=num_layers, kv_dim=kv_dim, num_kv_heads=num_kv_heads,
         kv_shared_across_ranks_mode=mode,
     )
     sync_all(num_gpus)
@@ -1525,7 +1525,7 @@ def test_ce_paths_layerwise_h2d(data_config, kv_dim, num_kv_heads, cpu_layout_na
         cpu_block_stride_in_bytes=cpu_stride_block,
         cpu_tp_stride_in_bytes=cpu_stride_tp,
         transfer_num_cta=4, is_host_to_device=False, use_ce_transfer=True,
-        pp_offset_bytes=0, layer_id=0, layer_granularity=num_layers, kv_dim=kv_dim, num_kv_heads=num_kv_heads,
+        pp_offset_bytes=0, start_layer_id=0, layer_granularity=num_layers, kv_dim=kv_dim, num_kv_heads=num_kv_heads,
         kv_shared_across_ranks_mode=mode,
     )
     sync_all(num_gpus)
@@ -1653,7 +1653,7 @@ def test_mla_designated_rank_d2h(data_config, designated_rank):
         cpu_block_stride_in_bytes=cpu_stride_block,
         cpu_tp_stride_in_bytes=cpu_stride_tp,
         transfer_num_cta=4, is_host_to_device=False, use_ce_transfer=True,
-        pp_offset_bytes=0, layer_id=0, layer_granularity=num_layers, kv_dim=kv_dim, num_kv_heads=num_kv_heads,
+        pp_offset_bytes=0, start_layer_id=0, layer_granularity=num_layers, kv_dim=kv_dim, num_kv_heads=num_kv_heads,
         kv_shared_across_ranks_mode="rank0_only", designated_rank=designated_rank)
     sync_all(num_gpus)
     del tp
@@ -1817,7 +1817,7 @@ def test_gather_nt_roundtrip(data_config, kv_dim, num_kv_heads, cpu_layout_name,
         cpu_block_stride_in_bytes=cpu_stride_block,
         cpu_tp_stride_in_bytes=cpu_stride_tp,
         transfer_num_cta=4, is_host_to_device=False, use_ce_transfer=True,
-        pp_offset_bytes=0, layer_id=0, layer_granularity=num_layers, kv_dim=kv_dim, num_kv_heads=num_kv_heads,
+        pp_offset_bytes=0, start_layer_id=0, layer_granularity=num_layers, kv_dim=kv_dim, num_kv_heads=num_kv_heads,
         kv_shared_across_ranks_mode=mode,
     )
     sync_all(num_gpus)
@@ -1836,7 +1836,7 @@ def test_gather_nt_roundtrip(data_config, kv_dim, num_kv_heads, cpu_layout_name,
         cpu_block_stride_in_bytes=cpu_stride_block,
         cpu_tp_stride_in_bytes=cpu_stride_tp,
         transfer_num_cta=4, is_host_to_device=True, use_ce_transfer=True,
-        pp_offset_bytes=0, layer_id=0, layer_granularity=num_layers, kv_dim=kv_dim, num_kv_heads=num_kv_heads,
+        pp_offset_bytes=0, start_layer_id=0, layer_granularity=num_layers, kv_dim=kv_dim, num_kv_heads=num_kv_heads,
         kv_shared_across_ranks_mode=mode,
     )
     sync_all(num_gpus)
@@ -1916,7 +1916,7 @@ def test_gather_nt_layerwise_h2d(data_config, kv_dim, num_kv_heads, cpu_layout_n
         cpu_block_stride_in_bytes=cpu_stride_block,
         cpu_tp_stride_in_bytes=cpu_stride_tp,
         transfer_num_cta=4, is_host_to_device=False, use_ce_transfer=True,
-        pp_offset_bytes=0, layer_id=0, layer_granularity=num_layers, kv_dim=kv_dim, num_kv_heads=num_kv_heads,
+        pp_offset_bytes=0, start_layer_id=0, layer_granularity=num_layers, kv_dim=kv_dim, num_kv_heads=num_kv_heads,
         kv_shared_across_ranks_mode=mode,
     )
     sync_all(num_gpus)
@@ -2644,7 +2644,7 @@ if __name__ == "__main__":
 @pytest.mark.parametrize("engine_name,use_ce", ENGINES)
 def test_same_node_pp_offset_roundtrip(data_config, cpu_layout_name, engine_name, use_ce):
     """Two PP stages share one CPU pool. PP offset baked into CPU pointer;
-    layer_id=0 (GPU is PP-stage-local). Uses sharded mode (each GPU writes
+    start_layer_id=0 (GPU is PP-stage-local). Uses sharded mode (each GPU writes
     1/num_gpus, H2D reads back full)."""
     skip_if_engine_unsupported(use_ce)
     num_layers, num_blocks, tpb, num_heads, head_dim = data_config
@@ -2693,7 +2693,7 @@ def test_same_node_pp_offset_roundtrip(data_config, cpu_layout_name, engine_name
             cpu_block_stride_in_bytes=cpu_layout.get_block_stride() * ES,
             cpu_tp_stride_in_bytes=cpu_layout.get_block_stride() * ES // num_gpus,
             transfer_num_cta=4, is_host_to_device=False, use_ce_transfer=use_ce,
-            pp_offset_bytes=0, layer_id=0, layer_granularity=stage_layers,
+            pp_offset_bytes=0, start_layer_id=0, layer_granularity=stage_layers,
             kv_dim=kv_dim, num_kv_heads=num_kv_heads,
             kv_shared_across_ranks_mode="sharded")
         sync_all(num_gpus)
@@ -2710,7 +2710,7 @@ def test_same_node_pp_offset_roundtrip(data_config, cpu_layout_name, engine_name
             cpu_block_stride_in_bytes=cpu_layout.get_block_stride() * ES,
             cpu_tp_stride_in_bytes=cpu_layout.get_block_stride() * ES // num_gpus,
             transfer_num_cta=4, is_host_to_device=True, use_ce_transfer=use_ce,
-            pp_offset_bytes=0, layer_id=0, layer_granularity=stage_layers,
+            pp_offset_bytes=0, start_layer_id=0, layer_granularity=stage_layers,
             kv_dim=kv_dim, num_kv_heads=num_kv_heads,
             kv_shared_across_ranks_mode="sharded")
         sync_all(num_gpus)
@@ -2776,7 +2776,7 @@ def test_pp_offset_gpucpu_tp1(data_config, cpu_layout_name, engine_name, use_ce)
             cpu_block_stride_in_bytes=cpu_layout.get_block_stride() * ES,
             chunk_size_in_bytes=stage_gpu_layout.get_chunk_size() * ES,
             pp_offset_bytes=start_layer_id * cpu_layout.get_layer_stride() * ES,
-            start_pp_offset_bytes=0, layer_id=0, num_layers=stage_layers,
+            start_pp_offset_bytes=0, start_layer_id=0, num_layers=stage_layers,
             is_host_to_device=False, use_ce_transfer=use_ce,
             kv_dim=kv_dim,
             is_blockfirst=(cpu_layout_name == "BLOCKFIRST"))
@@ -2798,7 +2798,7 @@ def test_pp_offset_gpucpu_tp1(data_config, cpu_layout_name, engine_name, use_ce)
             cpu_block_stride_in_bytes=cpu_layout.get_block_stride() * ES,
             chunk_size_in_bytes=stage_gpu_layout.get_chunk_size() * ES,
             pp_offset_bytes=start_layer_id * cpu_layout.get_layer_stride() * ES,
-            start_pp_offset_bytes=0, layer_id=0, num_layers=stage_layers,
+            start_pp_offset_bytes=0, start_layer_id=0, num_layers=stage_layers,
             is_host_to_device=True, use_ce_transfer=use_ce,
             kv_dim=kv_dim,
             is_blockfirst=(cpu_layout_name == "BLOCKFIRST"))
@@ -2865,7 +2865,7 @@ def test_pp_offset_swa(data_config, cpu_layout_name, engine_name, use_ce):
             cpu_block_stride_in_bytes=cpu_layout.get_block_stride() * ES,
             chunk_size_in_bytes=stage_gpu_layout.get_chunk_size() * ES,
             pp_offset_bytes=start_layer_id * cpu_layout.get_layer_stride() * ES,
-            start_pp_offset_bytes=0, layer_id=0, num_layers=stage_layers,
+            start_pp_offset_bytes=0, start_layer_id=0, num_layers=stage_layers,
             is_host_to_device=False, use_ce_transfer=use_ce,
             kv_dim=kv_dim,
             is_blockfirst=(cpu_layout_name == "BLOCKFIRST"))
@@ -2887,7 +2887,7 @@ def test_pp_offset_swa(data_config, cpu_layout_name, engine_name, use_ce):
             cpu_block_stride_in_bytes=cpu_layout.get_block_stride() * ES,
             chunk_size_in_bytes=stage_gpu_layout.get_chunk_size() * ES,
             pp_offset_bytes=start_layer_id * cpu_layout.get_layer_stride() * ES,
-            start_pp_offset_bytes=0, layer_id=0, num_layers=stage_layers,
+            start_pp_offset_bytes=0, start_layer_id=0, num_layers=stage_layers,
             is_host_to_device=True, use_ce_transfer=use_ce,
             kv_dim=kv_dim,
             is_blockfirst=(cpu_layout_name == "BLOCKFIRST"))
@@ -3013,7 +3013,7 @@ def test_pp_offset_multigroup(data_config, cpu_layout_name, engine_name, use_ce)
                 cpu_block_stride_in_bytes=g_cbs,
                 chunk_size_in_bytes=g_chunk,
                 pp_offset_bytes=start_layer_id * g_cls,
-                start_pp_offset_bytes=0, layer_id=0, num_layers=stage_layers,
+                start_pp_offset_bytes=0, start_layer_id=0, num_layers=stage_layers,
                 is_host_to_device=False, use_ce_transfer=use_ce,
                 kv_dim=kv_dim, is_blockfirst=is_bfirst)
             sync_all(1)
@@ -3037,7 +3037,7 @@ def test_pp_offset_multigroup(data_config, cpu_layout_name, engine_name, use_ce)
                 cpu_block_stride_in_bytes=g_cbs,
                 chunk_size_in_bytes=g_chunk,
                 pp_offset_bytes=start_layer_id * g_cls,
-                start_pp_offset_bytes=0, layer_id=0, num_layers=stage_layers,
+                start_pp_offset_bytes=0, start_layer_id=0, num_layers=stage_layers,
                 is_host_to_device=True, use_ce_transfer=use_ce,
                 kv_dim=kv_dim, is_blockfirst=is_bfirst)
             sync_all(1)

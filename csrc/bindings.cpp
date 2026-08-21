@@ -835,7 +835,7 @@ PYBIND11_MODULE(c_ext, m) {
            py::arg("cpu_block_stride_in_bytes"),
            py::arg("cpu_tp_stride_in_bytes"), py::arg("transfer_num_cta"),
            py::arg("is_host_to_device"), py::arg("use_ce_transfer"),
-           py::arg("pp_offset_bytes"), py::arg("layer_id"),
+           py::arg("pp_offset_bytes"), py::arg("start_layer_id"),
            py::arg("layer_granularity"),
            py::arg("kv_dim"), py::arg("num_kv_heads"),
            py::arg("kv_shared_across_ranks_mode") = "sharded",
@@ -854,7 +854,7 @@ PYBIND11_MODULE(c_ext, m) {
            py::arg("cpu_block_stride_in_bytes"),
            py::arg("cpu_tp_stride_in_bytes"), py::arg("transfer_num_cta"),
            py::arg("is_host_to_device"), py::arg("use_ce_transfer"),
-           py::arg("pp_offset_bytes"), py::arg("layer_id"),
+           py::arg("pp_offset_bytes"), py::arg("start_layer_id"),
            py::arg("layer_granularity"), py::arg("kv_dim"),
            py::arg("num_kv_heads"),
            py::arg("cpu_size_table_tp_ptr"),
@@ -884,10 +884,10 @@ PYBIND11_MODULE(c_ext, m) {
            py::arg("ssd_kv_stride_in_bytes"),
            py::arg("ssd_block_stride_in_bytes"),
            py::arg("ssd_tp_stride_in_bytes"), py::arg("num_blocks_per_file"),
-           py::arg("is_read"), py::arg("layer_id"),
+           py::arg("is_read"), py::arg("start_layer_id"),
            py::arg("layer_granularity"), py::arg("kv_dim"),
            py::arg("num_kv_heads") = 1,
-           py::arg("pp_seek_offset_bytes") = (int64_t)0);
+           py::arg("ssd_pp_seek_offset_bytes") = (int64_t)0);
 #endif
 
   // Add Hasher class binding
