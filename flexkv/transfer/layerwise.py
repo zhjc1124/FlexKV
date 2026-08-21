@@ -22,6 +22,7 @@ from flexkv.storage.allocator import HugePageTensorHandle, materialize_worker_te
 from flexkv.transfer.worker_op import WorkerLayerwiseTransferOp
 from flexkv.transfer.worker import (
     TransferWorkerBase,
+    _group_pp_anchor_layers,
     ensure_cuda_device,
     import_tensor_handles,
 )
@@ -721,14 +722,18 @@ class LayerwiseTransferWorker(TransferWorkerBase):
 
         if self.start_layer_id > 0:
             # In BLOCKFIRST multi-group, each group's layers are contiguous
-            # within a block.  PP offset = start_layer_id * per-group layer
-            # stride, applied per-group via group_cpu_offset_bytes (not baked
-            # into cpu_blocks pointer, which would skip entire blocks).
+            # within a block.  PP anchor = group-local stage start * per-group
+            # layer stride, applied per-group via group_cpu_offset_bytes (not
+            # baked into cpu_blocks pointer, which would skip entire blocks).
+            # Group-local stage start = layers of this group preceding the
+            # stage start in the full layer-id namespace (0 for groups whose
+            # layer_indices are already stage-local).
             adjusted_offsets = [
-                off + self.start_layer_id * ls
-                for off, ls in zip(
+                off + _group_pp_anchor_layers(g.layer_indices, self.start_layer_id) * ls
+                for off, ls, g in zip(
                     tables["group_cpu_offset_bytes"],
                     tables["group_cpu_layer_strides"],
+                    layer_groups,
                 )
             ]
             tables["group_cpu_offset_bytes"] = adjusted_offsets

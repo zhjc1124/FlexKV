@@ -47,6 +47,28 @@ from flexkv.transfer.host_buffer import (
 )
 
 
+def _group_pp_anchor_layers(
+    layer_indices: Optional[List[int]], stage_start: int
+) -> int:
+    """Group-local PP anchor: how many of this group's layers precede the
+    stage start, in the group's CPU layer-id namespace.
+
+    Groups whose ``layer_indices`` are full model layer ids (dense KV, sidecar
+    subsets) live in a per-node CPU pool laid out over all layers, so the
+    stage start must be translated into the group namespace (count of group
+    layers below ``stage_start``).  Groups whose ``layer_indices`` are already
+    stage-local (indexer / SWA sidecars) have their CPU region sized for this
+    stage only, so they anchor at 0 -- detected via ``max(layer_indices)``
+    never reaching ``stage_start``.
+    """
+    li = list(layer_indices or [])
+    if not li:
+        return 0
+    if max(li) < stage_start:
+        return 0
+    return sum(1 for x in li if x < stage_start)
+
+
 def ensure_cuda_device(device: Union[int, torch.device, None]) -> None:
     """Bind this process's CUDA context before IPC import / host register / Stream.
 
@@ -899,7 +921,18 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
                 'cpu_block_stride': cpu_block_stride,
                 'cpu_kv_stride': cpu_kv_stride,
                 'cpu_offset_bytes': cpu_offset_bytes,
-                'num_layers': self.num_layers,  # per-stage, not g.num_layers (total)
+                # Per-GPU buffer count == this group's per-stage layer count.
+                # self.num_layers (main KV per-stage layers) is wrong for
+                # sidecar groups covering a subset of layers: the kernel
+                # indexes the GPU pointer array with layer_idx and would run
+                # past the group's buffers (illegal access).
+                'num_layers': len(group_gpu_blocks),
+                # Group-local PP anchor: layers of this group that precede the
+                # stage start in the full model layer-id namespace. Groups
+                # whose layer_indices are already stage-local yield 0.
+                'pp_anchor_layers': _group_pp_anchor_layers(
+                    g.layer_indices, self.start_layer_id
+                ),
                 'kv_dim': gpu_layout.kv_dim,
             })
 
@@ -1004,9 +1037,9 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
                     gp['cpu_layer_stride'],
                     gp['cpu_block_stride'],
                     gp['chunk_size'],
-                    self.start_layer_id * gp['cpu_layer_stride'],  # PP anchor
+                    gp['pp_anchor_layers'] * gp['cpu_layer_stride'],  # PP anchor (group-local)
                     0,                  # start_layer_id: whole stage
-                    gp['num_layers'],    # all layers in this group
+                    gp['num_layers'],    # per-GPU layers in this group
                     transfer_num_cta,
                     transfer_type == TransferType.H2D,
                     use_ce_transfer,
@@ -1368,7 +1401,18 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
                 'cpu_block_stride': cpu_block_stride,
                 'cpu_tp_stride': cpu_tp_stride,
                 'cpu_offset_bytes': cpu_offset_bytes,
-                'num_layers': self.num_layers,  # per-stage, not g.num_layers (total)
+                # Per-GPU buffer count == this group's per-stage layer count.
+                # self.num_layers (main KV per-stage layers) is wrong for
+                # sidecar groups covering a subset of layers: the kernel
+                # indexes the GPU pointer array with layer_idx and would run
+                # past the group's buffers (illegal access).
+                'num_layers': num_tensors_per_gpu,
+                # Group-local PP anchor: layers of this group that precede the
+                # stage start in the full model layer-id namespace. Groups
+                # whose layer_indices are already stage-local yield 0.
+                'pp_anchor_layers': _group_pp_anchor_layers(
+                    g.layer_indices, self.start_layer_id
+                ),
                 'chunk_size': chunk_elements * dtype_size_g,
             })
 
@@ -1478,9 +1522,9 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
                     transfer_num_cta,
                     transfer_type == TransferType.H2D,
                     use_ce_transfer,
-                    self.start_layer_id * gp['cpu_layer_stride'],  # PP anchor
+                    gp['pp_anchor_layers'] * gp['cpu_layer_stride'],  # PP anchor (group-local)
                     0,              # start_layer_id: whole stage
-                    gp['num_layers'],  # per-stage layers in this group
+                    gp['num_layers'],  # per-GPU layers in this group
                     self.kv_dim,
                     self.num_kv_heads,
                     self.kv_shared_across_ranks_mode,
@@ -2115,7 +2159,13 @@ class GDSTransferWorker(TransferWorkerBase):
                 group_gpu_ptrs = self.gpu_layer_ptrs
 
             self.group_gds_params.append({
-                'num_layers': self.num_layers,  # per-stage, not g.num_layers (total)
+                # Per-GPU buffer count == this group's per-stage layer count
+                # (see group_transfer_params above; self.num_layers overruns
+                # sidecar groups that cover a subset of layers).
+                'num_layers': (
+                    len(group_gpu_blocks)
+                    if gpu_blocks_per_group is not None else self.num_layers
+                ),
                 'gpu_ptrs': group_gpu_ptrs,
                 'gpu_kv_stride': gpu_kv_stride,
                 'gpu_block_stride': gpu_block_stride,
@@ -2494,7 +2544,9 @@ class tpGDSTransferWorker(TransferWorkerBase):
             )
 
             self.group_tp_gds_params.append({
-                'num_layers': self.num_layers,  # per-stage, not g.num_layers (total)
+                # Per-GPU buffer count == this group's per-stage layer count
+                # (matches num_tensors passed to TPGDSTransferThreadGroup).
+                'num_layers': num_tensors,
                 'tp_gds_group': tp_gds_group,
                 'ssd_layer_stride': ssd_layer_stride,
                 'ssd_kv_stride': ssd_kv_stride,
