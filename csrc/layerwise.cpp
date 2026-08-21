@@ -517,7 +517,7 @@ void LayerwiseTransferGroup::launch_swa_mg_h2d_layer_(
 
 LayerwiseTransferGroup::LayerwiseTransferGroup(
     int num_gpus, const std::vector<std::vector<torch::Tensor>> &gpu_blocks,
-    torch::Tensor &cpu_blocks,
+    torch::Tensor &cpu_blocks, int64_t pp_offset_bytes,
     std::map<int, std::vector<std::string>> &ssd_files, int num_layers,
     torch::Tensor &gpu_kv_strides_tensor,
     torch::Tensor &gpu_block_strides_tensor,
@@ -616,7 +616,9 @@ LayerwiseTransferGroup::LayerwiseTransferGroup(
         gpu_block_strides_in_bytes_[i], gpu_layer_strides_in_bytes_[i]);
   }
 
-  cpu_blocks_ = cpu_blocks.data_ptr();
+  // Anchor the per-node pool at this PP stage's first layer; layerwise
+  // batches then address layers 0-based against the anchored view.
+  cpu_blocks_ = static_cast<char *>(cpu_blocks.data_ptr()) + pp_offset_bytes;
 
   // Get GPU device IDs from tensors (like tp_transfer_thread_group.cpp)
   gpu_device_ids_.resize(num_gpus_);

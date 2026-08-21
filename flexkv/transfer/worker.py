@@ -805,12 +805,9 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
         self.use_ce_transfer_h2d = use_ce_transfer_h2d
         self.use_ce_transfer_d2h = use_ce_transfer_d2h
 
-        # PP stage offset
+        # PP stage offset: passed as pp_offset_bytes to the C++ transfer
+        # entry points, which anchor the CPU pool at this stage's first layer.
         self.start_layer_id = start_layer_id
-        if start_layer_id > 0 and self.group_transfer_params is None:
-            layer_offset_elems = start_layer_id * (
-                self.cpu_layer_stride_in_bytes // self.dtype.itemsize)
-            self.cpu_tensor = cpu_blocks.flatten()[layer_offset_elems:]
 
         self.ce_path_opt = GLOBAL_CONFIG_FROM_ENV.ce_path_opt
         self.ce_segment_threshold = GLOBAL_CONFIG_FROM_ENV.ce_segment_threshold
@@ -1007,7 +1004,8 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
                     gp['cpu_layer_stride'],
                     gp['cpu_block_stride'],
                     gp['chunk_size'],
-                    self.start_layer_id,  # PP offset passed to C++ kernel
+                    self.start_layer_id * gp['cpu_layer_stride'],  # PP anchor
+                    0,                  # start_layer_id: whole stage
                     gp['num_layers'],    # all layers in this group
                     transfer_num_cta,
                     transfer_type == TransferType.H2D,
@@ -1037,7 +1035,8 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
                 self.cpu_layer_stride_in_bytes,
                 self.cpu_block_stride_in_bytes,
                 self.chunk_size_in_bytes,
-                0,                  # start_layer_id (whole-model)
+                self.start_layer_id * self.cpu_layer_stride_in_bytes,  # PP anchor
+                0,                  # start_layer_id (whole stage)
                 self.num_layers,    # layer_granularity = all layers
                 transfer_num_cta,
                 transfer_type == TransferType.H2D,
@@ -1211,9 +1210,9 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
                 for i in range(self.num_gpus)
                 for j in range(len(self.gpu_blocks[i]))
             ]
+            # Full per-node pool pointer; the PP anchor is passed per call
+            # as pp_offset_bytes (no bake here).
             cpu_blocks_ptr = cpu_blocks.data_ptr()
-            if start_layer_id > 0:
-                cpu_blocks_ptr += start_layer_id * self.cpu_layer_stride_in_bytes
             gpu_device_ids = [self.gpu_blocks[i][0].device.index for i in range(self.num_gpus)]
             num_tensors_per_gpu = len(self.gpu_blocks[0])
 
@@ -1479,7 +1478,8 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
                     transfer_num_cta,
                     transfer_type == TransferType.H2D,
                     use_ce_transfer,
-                    self.start_layer_id,  # PP offset passed to C++ kernel
+                    self.start_layer_id * gp['cpu_layer_stride'],  # PP anchor
+                    0,              # layer_id: whole stage
                     gp['num_layers'],  # per-stage layers in this group
                     self.kv_dim,
                     self.num_kv_heads,
@@ -1496,7 +1496,8 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
                 transfer_num_cta,
                 transfer_type == TransferType.H2D,
                 use_ce_transfer,
-                0,                  # start_layer_id (whole-model)
+                self.start_layer_id * self.cpu_layer_stride_in_bytes,  # PP anchor
+                0,                  # layer_id: whole stage
                 self.num_layers,    # layer_granularity = all layers
                 self.kv_dim,
                 self.num_kv_heads,

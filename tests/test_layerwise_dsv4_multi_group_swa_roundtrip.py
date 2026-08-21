@@ -306,7 +306,8 @@ def _d2h_main_group(
         fx.strides["group_cpu_layer_strides"][group_idx],  # type: ignore[index]
         fx.strides["group_cpu_block_strides"][group_idx],  # type: ignore[index]
         fx.strides["group_chunk_sizes"][group_idx],  # type: ignore[index]
-        0,
+        0,  # pp_offset_bytes
+        0,  # start_layer_id
         g.num_layers,
         4,
         False,  # D2H
@@ -338,7 +339,8 @@ def _d2h_swa(
         fx.swa_strides["swa_cpu_layer_stride_in_bytes"],  # type: ignore[index]
         fx.swa_strides["swa_cpu_block_stride_in_bytes"],  # type: ignore[index]
         fx.swa_strides["swa_cpu_chunk_size_in_bytes"],  # type: ignore[index]
-        0,
+        0,  # pp_offset_bytes
+        0,  # start_layer_id
         NUM_ORIGINAL_LAYERS,
         4,
         False,

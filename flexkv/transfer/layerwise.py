@@ -628,10 +628,9 @@ class LayerwiseTransferWorker(TransferWorkerBase):
         self.cpu_tp_stride_in_bytes = self.cpu_block_stride_in_bytes // self.tp_group_size
         self.h2d_cpu_kv_stride_in_bytes = cpu_kv_layout_tp.get_kv_stride() * self.dtype.itemsize
         self.h2d_cpu_layer_stride_in_bytes = cpu_kv_layout_tp.get_layer_stride() * self.dtype.itemsize
-        if self.start_layer_id > 0:
-            layer_offset_elems = self.start_layer_id * (
-                self.h2d_cpu_layer_stride_in_bytes // self.dtype.itemsize)
-            cpu_blocks = cpu_blocks.flatten()[layer_offset_elems:]
+        # PP anchor is passed to the C++ group (pp_offset_bytes), which bakes
+        # it into the pool base pointer once.
+        pp_offset_bytes = self.start_layer_id * self.h2d_cpu_layer_stride_in_bytes
 
         if self.enable_ssd:
             ssd_kv_layout_per_file = ssd_kv_layout.div_block(self.num_files, padding=True)
@@ -651,8 +650,8 @@ class LayerwiseTransferWorker(TransferWorkerBase):
         flexkv_logger.debug("[LayerwiseWorker] Creating LayerwiseTransferGroup (single-group)...")
 
         self.layerwise_transfer_group = LayerwiseTransferGroup(
-            self.num_gpus, self.gpu_blocks, cpu_blocks, ssd_files,
-            self.num_layers,
+            self.num_gpus, self.gpu_blocks, cpu_blocks, pp_offset_bytes,
+            ssd_files, self.num_layers,
             gpu_kv_strides_tensor, gpu_block_strides_tensor,
             gpu_layer_strides_tensor, gpu_chunk_sizes_tensor,
             GLOBAL_CONFIG_FROM_ENV.iouring_entries,

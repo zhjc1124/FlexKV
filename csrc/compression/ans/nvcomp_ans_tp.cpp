@@ -115,7 +115,8 @@ size_t TPTransferThreadGroup::tp_group_transfer_ans(
     const int64_t cpu_block_stride_in_bytes,
     const int64_t cpu_tp_stride_in_bytes, const int transfer_num_cta,
     const bool is_host_to_device,     const bool use_ce_transfer,
-    const int layer_id, const int layer_granularity, const int kv_dim,
+    const int64_t pp_offset_bytes, const int layer_id,
+    const int layer_granularity, const int kv_dim,
     const int num_kv_heads,
     const int64_t cpu_size_table_tp_ptr,
     const int64_t cpu_size_table_tp_rank_stride,
@@ -159,7 +160,9 @@ size_t TPTransferThreadGroup::tp_group_transfer_ans(
             static_cast<int64_t *>(gpu_block_id_tensor.data_ptr());
         int64_t *cpu_block_ids =
             static_cast<int64_t *>(cpu_block_id_tensor.data_ptr());
-        void *cpu_ptr = cpu_blocks_;
+        // pp_offset_bytes anchors the pool at this PP stage's first layer.
+        void *cpu_ptr =
+            static_cast<char *>(cpu_blocks_) + pp_offset_bytes;
 
         auto dispatch_nvcomp = [&](auto backend_tag, int cur_num_blocks,
                                    int64_t *cur_gpu_block_ids,
