@@ -10,6 +10,17 @@
 
 namespace flexkv {
 
+// Restores the caller's current CUDA device on scope exit. Transfers
+// cudaSetDevice() to each group GPU; without restore the last GPU leaks as
+// the thread's current device, breaking later ambient-device launches.
+namespace {
+struct CurrentDeviceGuard {
+  int dev = 0;
+  CurrentDeviceGuard() { cudaGetDevice(&dev); }
+  ~CurrentDeviceGuard() { cudaSetDevice(dev); }
+};
+} // namespace
+
 // ===== Event polling notification (#199) =====
 
 void LayerwiseTransferGroup::notify_layer_batch(int start_layer,
@@ -972,6 +983,8 @@ void LayerwiseTransferGroup::layerwise_transfer(
     const int swa_num_blocks_per_file, const std::string &kv_shared_across_ranks_mode,
     const std::string &notify_mode, const bool enable_trace) {
 
+  CurrentDeviceGuard device_guard;
+
   if (has_multi_group_) {
     throw std::runtime_error(
         "[LayerwiseTransferGroup] layerwise_transfer() invoked on a "
@@ -1331,6 +1344,8 @@ void LayerwiseTransferGroup::layerwise_transfer_multi_group(
     const int swa_num_blocks_per_file, const std::string &kv_shared_across_ranks_mode,
     const std::string &notify_mode, const bool enable_trace) {
   (void)swa_cpu_tp_stride_in_bytes;
+
+  CurrentDeviceGuard device_guard;
 
   if (!has_multi_group_) {
     throw std::runtime_error(
