@@ -177,8 +177,14 @@ class ModelConfig:
     # ------------------------------------------------------------------
     _frozen: bool = field(default=False, init=False, repr=False)
 
-    def freeze(self) -> None:
-        """Lock the config so that any subsequent __setattr__ raises an error."""
+    def _normalize_cp_sizes(self) -> None:
+        """Mirror cp_size <-> attn_cp_size so derived topology stays consistent.
+
+        RankInfo mirrors cp_rank <-> attn_cp_rank at construction; without the
+        same normalization here, effective_tp_size (folds cp_size) and
+        effective_tp_rank (folds cp_rank) disagree and intra_client_id can
+        collide across (pp_rank, cp_rank, tp_rank) tuples.
+        """
         if self.cp_size == 1 and self.attn_cp_size != 1:
             self.cp_size = self.attn_cp_size
         elif self.attn_cp_size == 1 and self.cp_size != 1:
@@ -188,6 +194,13 @@ class ModelConfig:
                 f"[ModelConfig] cp_size={self.cp_size} and "
                 f"attn_cp_size={self.attn_cp_size} disagree"
             )
+
+    def __post_init__(self) -> None:
+        self._normalize_cp_sizes()
+
+    def freeze(self) -> None:
+        """Lock the config so that any subsequent __setattr__ raises an error."""
+        self._normalize_cp_sizes()
         # ---- Topology validation ----
         if self.total_gpus % self.nnodes != 0:
             raise ValueError(
