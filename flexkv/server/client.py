@@ -1,4 +1,5 @@
 import time
+import threading
 from multiprocessing import Lock, Queue
 from multiprocessing.connection import Connection
 from queue import Queue as ThreadQueue
@@ -310,6 +311,7 @@ class KVTPClient:
         self.gpu_control_socket.setsockopt(zmq.SNDTIMEO, 120000)
         self._exported_handles: List[TensorSharedHandle] = []
 
+        self.gpu_register_port = gpu_register_port
         self.dp_client_id = dp_client_id
         self.pp_rank = pp_rank
         self.intra_client_id = intra_client_id
@@ -490,21 +492,76 @@ class KVTPClient:
             )
             return
 
+        # Fire-and-forget on the data channel keeps engine init non-blocking:
+        # the TransferManager that owns gpu_register_port is created later in
+        # the same init flow (scheduler connector -> KVManager -> TM spawn),
+        # so blocking here for an ack would deadlock engine init.
+        self.send_to_server.send_pyobj(register_req, flags=zmq.NOBLOCK)
+        self._exported_handles = exported_handles
+        flexkv_logger.info(
+            f"KVTPClient {device_id}: registration message sent "
+            f"(dp_client_id={self.dp_client_id}, pp_rank={self.pp_rank}, "
+            f"intra_client_id={self.intra_client_id}, "
+            f"num_kv_caches={len(kv_caches)})")
+        # The PUSH message can be lost across the TM spawn window (observed
+        # with AFD, which widens it from ~1s to ~12s). A daemon thread keeps
+        # re-registering over a dedicated REQ control socket until the
+        # TransferManager acks, so delivery is guaranteed once the TM is up.
+        # The shared gpu_control_socket stays untouched for suspend/resume.
+        self._registration_confirmed = threading.Event()
+        threading.Thread(
+            target=self._registration_ack_loop,
+            args=(register_req, device_id),
+            daemon=True,
+            name=f"flexkv-registration-ack-{device_id}",
+        ).start()
+
+    def _registration_ack_loop(
+        self, register_req: RegisterTPClientRequest, device_id: int,
+    ) -> None:
+        """Re-register over the control channel until the TM acks.
+
+        Each round uses a fresh REQ socket so a lost reply cannot wedge the
+        REQ/REP state machine. Exits on the first successful ack; the TM side
+        treats a repeat registration as an idempotent duplicate when the
+        original PUSH already landed.
+        """
+        context = zmq.Context(1)
         try:
-            self.send_to_server.send_pyobj(register_req, flags=zmq.NOBLOCK)
-            self._exported_handles = exported_handles
-            flexkv_logger.info(
-                f"KVTPClient {device_id}: registration message sent "
-                f"(dp_client_id={self.dp_client_id}, pp_rank={self.pp_rank}, "
-                f"intra_client_id={self.intra_client_id}, "
-                f"num_kv_caches={len(kv_caches)})")
-        except zmq.Again:
-            flexkv_logger.error(
-                f"KVTPClient {device_id}: zmq.Again when sending registration "
-                f"(send buffer full or no connection). Retrying with blocking send...")
-            self.send_to_server.send_pyobj(register_req)
-            self._exported_handles = exported_handles
-            flexkv_logger.info(f"KVTPClient {device_id}: registration message sent (blocking retry)")
+            while not self._registration_confirmed.is_set():
+                ack_socket = get_zmq_socket(
+                    context, zmq.SocketType.REQ,
+                    f"{self.gpu_register_port}_control", False,
+                )
+                ack_socket.setsockopt(zmq.RCVTIMEO, 10000)
+                ack_socket.setsockopt(zmq.SNDTIMEO, 10000)
+                ack_socket.setsockopt(zmq.LINGER, 0)
+                try:
+                    ack_socket.send_pyobj({
+                        "type": "register_gpu",
+                        "registration": register_req,
+                    })
+                    response = ack_socket.recv_pyobj()
+                except zmq.Again:
+                    # TM not up yet, or the reply was lost; retry with a
+                    # fresh socket.
+                    continue
+                finally:
+                    ack_socket.close(0)
+                if response.get("ok"):
+                    self._registration_confirmed.set()
+                    flexkv_logger.info(
+                        f"KVTPClient {device_id}: registration accepted "
+                        f"(registered={response.get('registered')}/"
+                        f"{response.get('expected')}, "
+                        f"duplicate={response.get('duplicate', False)})")
+                    return
+                flexkv_logger.error(
+                    f"KVTPClient {device_id}: registration rejected: "
+                    f"{response.get('error')}; retrying")
+                time.sleep(1.0)
+        finally:
+            context.term()
 
 
 if __name__ == "__main__":

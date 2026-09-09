@@ -167,10 +167,16 @@ class TransferManager:
 
     def handle_gpu_control(self, request: Dict[str, Any]) -> Dict[str, Any]:
         """Handle synchronous sleep/wake mapping lifecycle requests."""
+        request_type = request.get("type")
+        if request_type == "register_gpu":
+            # Post-init (re)registration: a framework client restarting against
+            # a live TransferManager re-registers its handles here. Idempotent
+            # for an already-registered key, so it also covers retry storms.
+            return self._register_gpu_via_control(request)
+
         if self.transfer_engine is None or self.storage_engine is None:
             raise RuntimeError("Transfer engine is not initialized")
 
-        request_type = request.get("type")
         if request_type == "suspend_gpu":
             registration_key = request.get("registration_key")
             if registration_key not in self.all_gpu_blocks:
@@ -334,41 +340,104 @@ class TransferManager:
         if thread is not None and thread.is_alive():
             thread.join(timeout=1.0)
 
+    def _register_gpu_via_control(self, request: Dict[str, Any]) -> Dict[str, Any]:
+        """Idempotent GPU registration over the REQ/REP control channel.
+
+        Serves ``{"type": "register_gpu", "registration": RegisterTPClientRequest}``
+        from KVTPClient. Unlike the fire-and-forget PUSH path, REQ/REP gives the
+        client an explicit ack, so registration survives any start ordering
+        between the worker connector and the TransferManager subprocess.
+        """
+        registration = request.get("registration")
+        if not isinstance(registration, RegisterTPClientRequest):
+            return {"ok": False, "error": "register_gpu requires RegisterTPClientRequest"}
+        key = registration.registration_key
+        if key in self.all_gpu_blocks:
+            return {
+                "ok": True,
+                "registered": len(self.all_gpu_blocks),
+                "expected": self.expected_gpus,
+                "duplicate": True,
+            }
+        try:
+            self._handle_gpu_blocks_registration(registration)
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+        flexkv_logger.info(
+            f"GPU worker {key} registered via control channel, "
+            f"waiting for {self.expected_gpus - len(self.all_gpu_blocks)} GPUs to register"
+        )
+        return {
+            "ok": True,
+            "registered": len(self.all_gpu_blocks),
+            "expected": self.expected_gpus,
+        }
+
     def _register_gpu_blocks_via_socket(self) -> None:
         try:
             flexkv_logger.info(f"GPU tensor registration server started on port {self.gpu_register_port}, "
                                f"expected {self.expected_gpus} GPUs to register "
                                f"(instance_num={self.instance_num}, gpus_per_node={self.model_config.gpus_per_node}, "
                                f"total_gpus={self.model_config.total_gpus}, nnodes={self.model_config.nnodes})")
+            # Registration may arrive on the PUSH data channel (legacy) or the
+            # REQ/REP control channel (ack'd). Poll both so control requests
+            # are answered while we are still waiting for registrations.
+            poller = zmq.Poller()
+            poller.register(self.recv_from_client, zmq.POLLIN)
+            poller.register(self.gpu_control_socket, zmq.POLLIN)
             last_log_time = time.time()
             while len(self.all_gpu_blocks) < self.expected_gpus:
-                try:
-                    # Recv from: flexkv.server.client.KVTPClient.register_to_server
-                    req = self.recv_from_client.recv_pyobj(zmq.NOBLOCK)
-                except zmq.Again:
-                    # Periodically log waiting status for debugging
-                    now = time.time()
-                    if now - last_log_time >= 5.0:
-                        registered_keys = sorted(self.all_gpu_blocks.keys())
-                        flexkv_logger.info(
-                            f"Still waiting for GPU registrations: "
-                            f"{len(self.all_gpu_blocks)}/{self.expected_gpus} registered "
-                            f"(registered_keys={registered_keys}, "
-                            f"port={self.gpu_register_port})")
-                        last_log_time = now
-                    time.sleep(0.001)
-                    continue
+                socks = dict(poller.poll(timeout=5000.0))
 
-                if isinstance(req, RegisterTPClientRequest):
-                    flexkv_logger.info(f"Received GPU blocks registration request: {type(req)}, "
-                                       f"registration_key={req.registration_key}, "
-                                       f"device_id={req.device_id}, "
-                                       f"dp_client_id={req.dp_client_id}, pp_rank={req.pp_rank}")
-                    self._handle_gpu_blocks_registration(req)
-                    flexkv_logger.info(f"GPU worker {req.registration_key} registered successfully, "
-                                       f"waiting for {self.expected_gpus - len(self.all_gpu_blocks)} GPUs to register")
-                else:
-                    flexkv_logger.error(f"Unrecognized RequestType in SchedulerServer: {type(req)}")
+                if self.recv_from_client in socks:
+                    try:
+                        req = self.recv_from_client.recv_pyobj(zmq.NOBLOCK)
+                    except zmq.Again:
+                        req = None
+                    if isinstance(req, RegisterTPClientRequest):
+                        flexkv_logger.info(f"Received GPU blocks registration request: {type(req)}, "
+                                           f"registration_key={req.registration_key}, "
+                                           f"device_id={req.device_id}, "
+                                           f"dp_client_id={req.dp_client_id}, pp_rank={req.pp_rank}")
+                        if req.registration_key in self.all_gpu_blocks:
+                            flexkv_logger.debug(
+                                f"GPU worker {req.registration_key} already registered; "
+                                f"skipping duplicate PUSH registration")
+                        else:
+                            self._handle_gpu_blocks_registration(req)
+                            flexkv_logger.info(f"GPU worker {req.registration_key} registered successfully, "
+                                               f"waiting for {self.expected_gpus - len(self.all_gpu_blocks)} GPUs to register")
+                    elif req is not None:
+                        flexkv_logger.error(f"Unrecognized RequestType in SchedulerServer: {type(req)}")
+
+                if self.gpu_control_socket in socks:
+                    try:
+                        request = self.gpu_control_socket.recv_pyobj(zmq.NOBLOCK)
+                    except zmq.Again:
+                        request = None
+                    if request is not None:
+                        if request.get("type") == "register_gpu":
+                            response = self._register_gpu_via_control(request)
+                        else:
+                            response = {
+                                "ok": False,
+                                "error": (
+                                    f"unsupported control request during init: "
+                                    f"{request.get('type')}"
+                                ),
+                            }
+                        self.gpu_control_socket.send_pyobj(response)
+
+                # Periodically log waiting status for debugging
+                now = time.time()
+                if now - last_log_time >= 5.0:
+                    registered_keys = sorted(self.all_gpu_blocks.keys())
+                    flexkv_logger.info(
+                        f"Still waiting for GPU registrations: "
+                        f"{len(self.all_gpu_blocks)}/{self.expected_gpus} registered "
+                        f"(registered_keys={registered_keys}, "
+                        f"port={self.gpu_register_port})")
+                    last_log_time = now
 
             flexkv_logger.info(f"All {self.expected_gpus} GPUs registered successfully")
 
