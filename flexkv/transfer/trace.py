@@ -1,9 +1,12 @@
-"""Transfer diagnosis tracing (single switch, raw-data only).
+"""Transfer diagnosis tracing.
 
-One switch: FLEXKV_TRANSFER_TRACE. When on, every transfer prints one
-[XFER] line (lifecycle timing + backlog) plus a periodic [XFER-SUMMARY].
-No verdict; raw data for the operator to grep. Uses flexkv_logger.info,
-so it also obeys FLEXKV_LOG_LEVEL (default INFO => on).
+Two switches, one data path:
+- FLEXKV_TRANSFER_TRACE: print one [XFER] line per transfer (lifecycle timing
+  + backlog) plus a periodic [XFER-SUMMARY]. Raw data for the operator to
+  grep; no verdict. Uses flexkv_logger.info, so it also obeys
+  FLEXKV_LOG_LEVEL (default INFO => on).
+- FLEXKV_ENABLE_METRICS: feed the same timings into the Prometheus
+  histograms. Timing is collected when either switch is on.
 """
 import time
 import threading
@@ -11,9 +14,13 @@ from collections import defaultdict
 from typing import Dict, List, Optional
 
 from flexkv.common.debug import flexkv_logger
+from flexkv.metrics.collector import get_global_collector, init_global_collector
 
 # Set by configure(); caller reads GLOBAL_CONFIG_FROM_ENV.
 _TRACE_ON = False
+_METRICS_ON = False
+# Timing is only worth measuring when something consumes it.
+_COLLECT_ON = False
 
 # Summary window in seconds (hardcoded).
 _SUMMARY_INTERVAL_S = 10.0
@@ -34,15 +41,26 @@ _xfer_ms: List[float] = []
 _type_counts: Dict[str, int] = defaultdict(int)
 
 
-def configure(enabled: bool) -> None:
-    """Enable/disable tracing. Call once at startup from GLOBAL_CONFIG_FROM_ENV."""
-    global _TRACE_ON
+def configure(enabled: bool, metrics_enabled: bool = False) -> None:
+    """Enable/disable tracing. Call once at startup from GLOBAL_CONFIG_FROM_ENV.
+
+    ``metrics_enabled`` routes the same timings into Prometheus, so latency
+    histograms do not require the log trace to be on.
+    """
+    global _TRACE_ON, _METRICS_ON, _COLLECT_ON
     _TRACE_ON = bool(enabled)
+    _METRICS_ON = bool(metrics_enabled)
+    _COLLECT_ON = _TRACE_ON or _METRICS_ON
+
+
+def collect_enabled() -> bool:
+    """Whether per-op timing is being measured at all."""
+    return _COLLECT_ON
 
 
 def set_submit_ns(op_id: int, submitted_ns: int) -> None:
     """Record submit time (scheduler side)."""
-    if not _TRACE_ON:
+    if not _COLLECT_ON:
         return
     with _submit_lock:
         _submit_ns[op_id] = submitted_ns
@@ -50,7 +68,7 @@ def set_submit_ns(op_id: int, submitted_ns: int) -> None:
 
 def consume_submit_ns(op_id: int) -> float:
     """e2e ms from submit to now; 0.0 if unknown."""
-    if not _TRACE_ON:
+    if not _COLLECT_ON:
         return 0.0
     with _submit_lock:
         t = _submit_ns.pop(op_id, None)
@@ -61,7 +79,7 @@ def consume_submit_ns(op_id: int) -> float:
 
 def inc_inflight() -> None:
     """One op submitted to a worker."""
-    if not _TRACE_ON:
+    if not _COLLECT_ON:
         return
     global _inflight, _inflight_max_window
     with _inflight_lock:
@@ -72,7 +90,7 @@ def inc_inflight() -> None:
 
 def dec_inflight() -> int:
     """One op finished; return current inflight."""
-    if not _TRACE_ON:
+    if not _COLLECT_ON:
         return 0
     global _inflight
     with _inflight_lock:
@@ -81,7 +99,7 @@ def dec_inflight() -> int:
 
 
 def inflight_value() -> int:
-    if not _TRACE_ON:
+    if not _COLLECT_ON:
         return 0
     with _inflight_lock:
         return _inflight
@@ -103,7 +121,7 @@ def build_worker_metrics(
     bytes = bytes_per_block * num_blocks; backends without a block byte
     size pass 0 (bytes=0, bandwidth omitted).
     """
-    if not _TRACE_ON:
+    if not _COLLECT_ON:
         return None
     transfer_type = getattr(op, "transfer_type", None)
     type_name = transfer_type.name if transfer_type is not None else "UNKNOWN"
@@ -132,8 +150,19 @@ def build_worker_metrics(
 
 
 def record_xfer(op_id: int, metrics: Optional[dict], e2e_ms: float) -> None:
-    """Engine-side: print one [XFER] line + update the summary window."""
-    if not _TRACE_ON or metrics is None:
+    """Engine-side: feed the latency histograms, print one [XFER] line, update the summary window."""
+    if not _COLLECT_ON or metrics is None:
+        return
+    if _METRICS_ON:
+        # Runs in the TransferManager subprocess, so the collector does not
+        # exist here yet on the first completed op.
+        collector = get_global_collector()
+        if collector is None:
+            collector = init_global_collector()
+        collector.record_transfer_durations(
+            metrics["type"], metrics["wait_ms"], metrics["xfer_ms"], e2e_ms
+        )
+    if not _TRACE_ON:
         return
     backlog = inflight_value()
     bytes_ = metrics.get("bytes", 0)

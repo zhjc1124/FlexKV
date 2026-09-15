@@ -13,6 +13,7 @@ FlexKV 集成了基于 [Prometheus](https://prometheus.io/) 的运行时指标�
 | `FLEXKV_ENABLE_METRICS` | `0` | 启用指标收集（设为 `1` 启用，默认禁用） |
 | `FLEXKV_PY_METRICS_PORT` | `8080` | Python 指标 HTTP 服务端口 |
 | `FLEXKV_CPP_METRICS_PORT` | `8081` | C++ 指标 HTTP 服务端口 |
+| `FLEXKV_PY_METRICS_MULTIPROC_DIR` | 系统临时目录下 `flexkv-multiproc-<port>` | 多进程指标共享目录，一般无需手动指定 |
 
 ### 1.2 配置方式
 
@@ -45,6 +46,27 @@ Python 指标由 `GlobalCacheEngine` 在 `cache_engine.py` 中记录，通过 `F
 | `flexkv_py_evicted_blocks_total` | Counter | `device` | 驱逐的 blocks 总数 |
 | `flexkv_py_allocated_blocks_total` | Counter | `device` | 分配的 blocks 总数 |
 | `flexkv_py_allocation_failures_total` | Counter | `mode` | 资源分配失败次数 |
+| `flexkv_py_transfer_wait_duration_seconds` | Histogram | `transfer_type` | 传输发起前的排队耗时（秒） |
+| `flexkv_py_transfer_xfer_duration_seconds` | Histogram | `transfer_type` | 数据搬运耗时（秒） |
+| `flexkv_py_transfer_e2e_duration_seconds` | Histogram | `transfer_type` | 从提交到完成的端到端耗时（秒） |
+| `flexkv_py_metrics_server_info` | Gauge | `pid` | 恒为 1，标识当前由哪个进程提供 Python 指标端点 |
+
+**延迟指标的口径说明**
+
+三个 Histogram 由传输侧（`TransferEngine`）记录，只有它掌握完整计时。因此它们**只带 `transfer_type` 标签，没有 `operation`**——get/put 的区分只存在于上面的 `flexkv_py_transfer_*_total` 计数器上（由引擎侧按任务类型记录）。两者不能按 operation 直接 join。
+
+三个耗时是包含关系：`wait` 是排队等待，`xfer` 是真正搬数据，`e2e` 是从提交到完成（含前两者）。桶范围 0.5ms ~ 30s，覆盖一次 H2D 命中到一次冷 SSD 读。
+
+**多进程聚合**
+
+FlexKV 的指标来自多个进程：`GlobalCacheEngine` 在引擎进程，而 `TransferEngine`（也就是全部传输计时）跑在 spawn 出来的 TransferManager 子进程里。启用 `FLEXKV_ENABLE_METRICS=1` 后，FlexKV 会自动设置 `PROMETHEUS_MULTIPROC_DIR`，各进程把指标写入共享目录，由占用 `FLEXKV_PY_METRICS_PORT` 的那个进程统一暴露合并后的结果。
+
+因此：
+
+- 同节点上多个 FlexKV 进程（TP / PP / 多 worker）**共用一个端口**，谁先绑定谁就对外服务，指标是全部进程的合并值。
+- 只有主进程会尝试启动 HTTP 服务；子进程只写入共享目录。
+- 端口若被**非 FlexKV 服务**占用会直接报错并提示更换端口，不会静默放弃指标。
+- 进程退出后遗留的 `.db` 文件会在下次启动时清理，不会持续贡献过期数值。
 
 ---
 

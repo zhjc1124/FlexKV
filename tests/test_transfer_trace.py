@@ -122,6 +122,22 @@ def test_record_xfer_and_summary(monkeypatch):
     assert "type: D2H=1" in lines
 
 
+def test_metrics_switch_collects_without_trace(monkeypatch):
+    # FLEXKV_ENABLE_METRICS alone must collect timings for the histograms,
+    # but must not start printing [XFER] lines.
+    trace = _reload_with_env(monkeypatch, None)
+    trace.configure(False, True)
+    assert trace._TRACE_ON is False
+    assert trace._METRICS_ON is True
+    assert trace.collect_enabled() is True
+
+    trace.configure(True, True)
+    assert trace.collect_enabled() is True
+
+    trace.configure(False, False)
+    assert trace.collect_enabled() is False
+
+
 def test_pct(monkeypatch):
     trace = _reload_with_env(monkeypatch, "1")
     vals = [1.0, 2.0, 3.0, 4.0, 5.0]

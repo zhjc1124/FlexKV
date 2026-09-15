@@ -13,6 +13,7 @@ FlexKV integrates a [Prometheus](https://prometheus.io/)-based runtime metrics m
 | `FLEXKV_ENABLE_METRICS` | `0` | Enable metrics collection (set to `1` to enable, disabled by default) |
 | `FLEXKV_PY_METRICS_PORT` | `8080` | Python metrics HTTP server port |
 | `FLEXKV_CPP_METRICS_PORT` | `8081` | C++ metrics HTTP server port |
+| `FLEXKV_PY_METRICS_MULTIPROC_DIR` | `flexkv-multiproc-<port>` under the system temp dir | Shared directory for cross-process metrics; rarely needs to be set |
 
 ### 1.2 Configuration
 
@@ -45,6 +46,27 @@ Python metrics are recorded by `GlobalCacheEngine` in `cache_engine.py` and coll
 | `flexkv_py_evicted_blocks_total` | Counter | `device` | Total number of evicted blocks |
 | `flexkv_py_allocated_blocks_total` | Counter | `device` | Total number of allocated blocks |
 | `flexkv_py_allocation_failures_total` | Counter | `mode` | Number of allocation failures |
+| `flexkv_py_transfer_wait_duration_seconds` | Histogram | `transfer_type` | Time a transfer spent queued before launch, in seconds |
+| `flexkv_py_transfer_xfer_duration_seconds` | Histogram | `transfer_type` | Time spent moving the data, in seconds |
+| `flexkv_py_transfer_e2e_duration_seconds` | Histogram | `transfer_type` | Time from submit to completion, in seconds |
+| `flexkv_py_metrics_server_info` | Gauge | `pid` | Always 1; identifies which process serves the Python endpoint |
+
+**Notes on the duration metrics**
+
+The three histograms are recorded by the transfer side (`TransferEngine`), the only place that sees the full timing. They therefore carry **only `transfer_type`, not `operation`** - the get/put split lives on the `flexkv_py_transfer_*_total` counters above, which the engine side records per task type. The two families cannot be joined on `operation`.
+
+The three durations nest: `wait` is queueing, `xfer` is the actual data movement, `e2e` is submit to completion and includes both. Buckets span 0.5ms to 30s, covering an H2D hit through a cold SSD read.
+
+**Multi-process aggregation**
+
+FlexKV records from more than one process: `GlobalCacheEngine` lives in the engine process, while `TransferEngine` - and therefore all transfer timing - runs in the spawned TransferManager subprocess. With `FLEXKV_ENABLE_METRICS=1`, FlexKV sets `PROMETHEUS_MULTIPROC_DIR` automatically; every process writes into that shared directory and the process that binds `FLEXKV_PY_METRICS_PORT` exposes the merged result.
+
+Consequences:
+
+- Multiple FlexKV processes on one node (TP / PP / multiple workers) **share a single port**. Whoever binds first serves, and the values are the merge of all of them.
+- Only the main process starts the HTTP server; subprocesses just write to the shared directory.
+- If the port is taken by a **non-FlexKV service**, startup raises with a message to change the port instead of silently dropping metrics.
+- `.db` files left behind by exited processes are purged on the next start, so dead processes stop contributing values.
 
 ---
 

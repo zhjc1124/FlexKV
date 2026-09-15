@@ -80,7 +80,10 @@ from flexkv.transfer.compression.common.strategy import (
 )
 from flexkv.transfer.worker_op import WorkerTransferOp, WorkerLayerwiseTransferOp
 from flexkv.transfer import trace
-trace.configure(GLOBAL_CONFIG_FROM_ENV.enable_transfer_trace)
+trace.configure(
+    GLOBAL_CONFIG_FROM_ENV.enable_transfer_trace,
+    GLOBAL_CONFIG_FROM_ENV.enable_metrics,
+)
 
 from flexkv.mooncakeEngineWrapper import MoonCakeTransferEngineWrapper
 from flexkv.external.mooncake_store_keys import PoolKind, build_key
@@ -591,7 +594,7 @@ class WorkerHandle:
             worker_op = WorkerLayerwiseTransferOp(op)
         else:
             worker_op = WorkerTransferOp(op)
-        if trace._TRACE_ON:
+        if trace.collect_enabled():
             submitted_ns = time.perf_counter_ns()
             worker_op.prof_submitted_ns = submitted_ns
             trace.set_submit_ns(op.op_id, submitted_ns)
