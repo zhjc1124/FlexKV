@@ -11,8 +11,13 @@ When enabled, the metrics HTTP server will automatically start on port 8080
 (or the port specified by FLEXKV_PY_METRICS_PORT environment variable).
 """
 
-import os
+import multiprocessing
 from typing import Dict, Optional
+
+# Imported before prometheus_client on purpose: it puts PROMETHEUS_MULTIPROC_DIR
+# in the environment, which is only honoured if it happens before the first
+# metric object is constructed. See flexkv/metrics/registry.py.
+from flexkv.metrics.registry import METRIC_REGISTRY
 
 # Optional import for prometheus_client
 try:
@@ -69,6 +74,10 @@ def _auto_start_metrics_server():
     It will:
     1. Configure C++ metrics with settings from GLOBAL_CONFIG_FROM_ENV
     2. Start the Python metrics HTTP server on port 8080 (or FLEXKV_PY_METRICS_PORT)
+
+    Only the main process serves the endpoint. Every other process (spawned
+    workers, transfer managers, TP ranks) just writes into the shared
+    multiprocess directory, and the main process's collector merges them.
     """
     global _metrics_server_auto_started
     
@@ -83,7 +92,14 @@ def _auto_start_metrics_server():
     if not _should_enable_metrics():
         logger.warning("[FlexKV PyMetrics] Metrics disabled (set FLEXKV_ENABLE_METRICS=1 to enable)")
         return
-    
+
+    if multiprocessing.current_process().name != "MainProcess":
+        logger.debug(
+            f"[FlexKV PyMetrics] Process {multiprocessing.current_process().name} records into "
+            "the shared metrics directory; the main process serves the endpoint"
+        )
+        return
+
     try:
         from flexkv.metrics.server import start_metrics_server, is_server_running
         
@@ -93,6 +109,10 @@ def _auto_start_metrics_server():
                 pass  # server.py already logs the startup message
             else:
                 logger.warning("[FlexKV PyMetrics] Failed to auto-start metrics server")
+    except RuntimeError as e:
+        # A foreign service owns the port: the endpoint will never expose FlexKV
+        # metrics. Say it loudly instead of hiding it in a one-line warning.
+        logger.error(f"[FlexKV PyMetrics] {e}")
     except Exception as e:
         logger.warning(f"[FlexKV PyMetrics] Auto-start metrics server failed: {e}")
 
@@ -148,17 +168,24 @@ class FlexKVMetricsCollector:
         """Initialize Prometheus metrics for cache engine."""
         
         # ========== Cache Engine Metrics ==========
+        # All metrics live in METRIC_REGISTRY, which is never served directly.
+        # The HTTP endpoint serves a separate registry holding only the
+        # multiprocess collector, otherwise every series is reported twice
+        # (once from this process's local objects, once from the merged files).
+        #
         # Cache hit/miss counters by device (cpu/ssd/remote)
         self.cache_hit_blocks_total = Counter(
             name="flexkv_py_cache_hit_blocks_total",
             documentation="Total number of cache hit blocks by device",
             labelnames=["device"],
+            registry=METRIC_REGISTRY,
         )
         
         # Cache miss counter (no device label - miss means not found in any cache level)
         self.cache_miss_blocks_total = Counter(
             name="flexkv_py_cache_miss_blocks_total",
             documentation="Total number of cache miss blocks (not found in any cache level)",
+            registry=METRIC_REGISTRY,
         )
         
         # Allocation failure counter by mode (global/local)
@@ -166,6 +193,7 @@ class FlexKVMetricsCollector:
             name="flexkv_py_allocation_failures_total",
             documentation="Total number of allocation failures by mode (global/local)",
             labelnames=["mode"],
+            registry=METRIC_REGISTRY,
         )
         
         # Transfer counters by transfer type and operation (get/put)
@@ -173,37 +201,49 @@ class FlexKVMetricsCollector:
             name="flexkv_py_transfer_blocks_total",
             documentation="Total number of blocks transferred by transfer type and operation",
             labelnames=["transfer_type", "operation"],
+            registry=METRIC_REGISTRY,
         )
         
         self.transfer_ops_total = Counter(
             name="flexkv_py_transfer_ops_total",
             documentation="Total number of transfer operations by transfer type and operation",
             labelnames=["transfer_type", "operation"],
+            registry=METRIC_REGISTRY,
         )
         
         self.transfer_bytes_total = Counter(
             name="flexkv_py_transfer_bytes_total",
             documentation="Total number of bytes transferred by transfer type and operation",
             labelnames=["transfer_type", "operation"],
+            registry=METRIC_REGISTRY,
         )
-        
-        # Memory pool gauges by device
-        mempool_gauge_kwargs = {
-            "labelnames": ["device"],
-        }
-        if os.environ.get("PROMETHEUS_MULTIPROC_DIR"):
-            mempool_gauge_kwargs["multiprocess_mode"] = "livesum"
-        
+
+        # Memory pool gauges by device.
+        #
+        # livesum, not the default `all`: each process owns its own pool and
+        # writes its own value, so the node-level number is the sum over live
+        # processes. Plain `all` keeps reporting the last value a process
+        # wrote, including after that process is gone.
+        #
+        # `live` only takes effect because the serving collector purges files
+        # of dead processes before merging (see FlexKVMultiProcessCollector).
+        #
+        # If a deployment shares one pool across ranks, every rank reports the
+        # full value and this must become livemax instead.
         self.mempool_total_blocks = Gauge(
             name="flexkv_py_mempool_total_blocks",
-            documentation="Total blocks in memory pool by device",
-            **mempool_gauge_kwargs,
+            documentation="Total blocks in memory pool by device (summed over live processes)",
+            labelnames=["device"],
+            multiprocess_mode="livesum",
+            registry=METRIC_REGISTRY,
         )
         
         self.mempool_free_blocks = Gauge(
             name="flexkv_py_mempool_free_blocks",
-            documentation="Free blocks in memory pool by device",
-            **mempool_gauge_kwargs,
+            documentation="Free blocks in memory pool by device (summed over live processes)",
+            labelnames=["device"],
+            multiprocess_mode="livesum",
+            registry=METRIC_REGISTRY,
         )
         
         # Eviction and allocation counters by device
@@ -211,12 +251,14 @@ class FlexKVMetricsCollector:
             name="flexkv_py_evicted_blocks_total",
             documentation="Total number of evicted blocks by device",
             labelnames=["device"],
+            registry=METRIC_REGISTRY,
         )
         
         self.allocated_blocks_total = Counter(
             name="flexkv_py_allocated_blocks_total",
             documentation="Total number of allocated blocks by device",
             labelnames=["device"],
+            registry=METRIC_REGISTRY,
         )
         
         logger.info("[FlexKV PyMetrics] Prometheus metrics collector initialized")

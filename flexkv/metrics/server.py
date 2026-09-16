@@ -10,6 +10,7 @@ from typing import Optional
 
 from flexkv.common.config import GLOBAL_CONFIG_FROM_ENV
 from flexkv.common.debug import flexkv_logger
+from flexkv.metrics.registry import METRIC_REGISTRY, MULTIPROC_DIR, serve_registry
 
 logger = flexkv_logger
 
@@ -19,6 +20,7 @@ BIND_ADDRESS = "127.0.0.1"
 # Server state
 _server_started = False
 _server_lock = threading.Lock()
+_server_info_gauge = None
 
 
 def get_metrics_port() -> int:
@@ -71,6 +73,31 @@ def _is_prometheus_metrics_server(port: int, timeout: float = 1.0) -> bool:
         return False
 
 
+def _mark_server_info():
+    """Publish an always-present series so the endpoint can be identified.
+
+    Every other FlexKV series only appears once observed, which leaves a
+    freshly started endpoint indistinguishable from a foreign Prometheus
+    exporter when another process probes the port.
+
+    No ``pid`` label on purpose: the merge step strips pid from every gauge
+    that is not in ``all``/``liveall`` mode (prometheus_client
+    ``multiprocess.py``), so the label would survive only in the
+    non-aggregated case and give two different shapes for the same metric.
+    """
+    global _server_info_gauge
+    if _server_info_gauge is None:
+        from prometheus_client import Gauge
+
+        _server_info_gauge = Gauge(
+            name="flexkv_py_metrics_server_info",
+            documentation="1 while a FlexKV process serves Python metrics on this port",
+            multiprocess_mode="max",
+            registry=METRIC_REGISTRY,
+        )
+    _server_info_gauge.set(1)
+
+
 def start_metrics_server(port: Optional[int] = None) -> bool:
     """
     Start the Prometheus metrics HTTP server.
@@ -81,8 +108,13 @@ def start_metrics_server(port: Optional[int] = None) -> bool:
         port: Port number to listen on (default: from env or 8080)
         
     Returns:
-        True if the server was started successfully, False otherwise
-        
+        True if this process serves the endpoint, or if another FlexKV
+        process already does - metrics are merged across processes either way.
+
+    Raises:
+        RuntimeError: the port is taken by something that is not a FlexKV
+            metrics endpoint, or the server could not bind at all.
+
     Note:
         This function is thread-safe and will only start the server once.
         Subsequent calls will return True without starting a new server.
@@ -96,7 +128,7 @@ def start_metrics_server(port: Optional[int] = None) -> bool:
             return True
         
         try:
-            from prometheus_client import start_http_server, REGISTRY
+            from prometheus_client import start_http_server
         except ImportError:
             raise RuntimeError(
                 "[FlexKV PyMetrics] prometheus_client not installed but metrics server requested. "
@@ -107,38 +139,34 @@ def start_metrics_server(port: Optional[int] = None) -> bool:
             port = get_metrics_port()
         
         try:
-            # Start server with default registry (single process mode)
+            # Serve the merged registry: every FlexKV process of the node
+            # writes into the same multiprocess directory.
             # Always bind to localhost (127.0.0.1) for security
-            start_http_server(port, addr=BIND_ADDRESS, registry=REGISTRY)
-            
+            start_http_server(port, addr=BIND_ADDRESS, registry=serve_registry())
+
             _server_started = True
+            _mark_server_info()
             print(
                 f"[FlexKV PyMetrics] Initialized successfully, exposing metrics at http://{BIND_ADDRESS}:{port}/metrics"
             )
             return True
             
         except OSError as e:
-            if "Address already in use" in str(e):
-                # Check if the port is actually running a Prometheus metrics server
-                if _is_prometheus_metrics_server(port):
-                    logger.warning(
-                        f"[FlexKV PyMetrics] Port {port} is already running a Prometheus metrics server. "
-                        "Assuming another instance is handling metrics."
-                    )
-                    _server_started = True
-                    return True
-                else:
-                    logger.warning(
-                        f"[FlexKV PyMetrics] Port {port} is in use by another service (not Prometheus). "
-                        "Please configure a different port via FLEXKV_PY_METRICS_PORT environment variable."
-                    )
-                    return False
-            else:
-                logger.error(f"[FlexKV PyMetrics] Failed to start metrics server: {e}")
-                return False
-        except Exception as e:
-            logger.error(f"[FlexKV PyMetrics] Failed to start metrics server: {e}")
-            return False
+            if "Address already in use" not in str(e):
+                raise RuntimeError(f"[FlexKV PyMetrics] Failed to start metrics server: {e}") from e
+            if not _is_prometheus_metrics_server(port):
+                raise RuntimeError(
+                    f"[FlexKV PyMetrics] Port {port} is occupied by a service that is not a FlexKV "
+                    "metrics endpoint. Pick a free port with FLEXKV_PY_METRICS_PORT."
+                )
+            # Another FlexKV process on this node owns the port. It serves the
+            # same merged directory, so this process is already covered.
+            _server_started = True
+            logger.info(
+                f"[FlexKV PyMetrics] Port {port} is already served by another FlexKV process; "
+                f"sharing it (metrics merged from {MULTIPROC_DIR})."
+            )
+            return True
 
 
 def stop_metrics_server():

@@ -21,6 +21,11 @@ Usage:
     collector.update_mempool_stats("cpu", total_blocks=1000, free_blocks=200)
 """
 
+# Must come first: it puts PROMETHEUS_MULTIPROC_DIR in the environment before
+# prometheus_client is imported, which is the only point where the
+# single/multi-process value backend is decided.
+from flexkv.metrics import registry
+
 from flexkv.metrics.collector import (
     FlexKVMetricsCollector,
     get_global_collector,

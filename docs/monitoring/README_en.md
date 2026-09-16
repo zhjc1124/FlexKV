@@ -13,6 +13,7 @@ FlexKV integrates a [Prometheus](https://prometheus.io/)-based runtime metrics m
 | `FLEXKV_ENABLE_METRICS` | `0` | Enable metrics collection (set to `1` to enable, disabled by default) |
 | `FLEXKV_PY_METRICS_PORT` | `8080` | Python metrics HTTP server port |
 | `FLEXKV_CPP_METRICS_PORT` | `8081` | C++ metrics HTTP server port |
+| `FLEXKV_PY_METRICS_MULTIPROC_DIR` | derived from port | Python metrics aggregation directory, see [section 3](#3-multi-process-aggregation-python-metrics) |
 
 ### 1.2 Configuration
 
@@ -45,6 +46,11 @@ Python metrics are recorded by `GlobalCacheEngine` in `cache_engine.py` and coll
 | `flexkv_py_evicted_blocks_total` | Counter | `device` | Total number of evicted blocks |
 | `flexkv_py_allocated_blocks_total` | Counter | `device` | Total number of allocated blocks |
 | `flexkv_py_allocation_failures_total` | Counter | `mode` | Number of allocation failures |
+| `flexkv_py_metrics_server_info` | Gauge | - | Always `1`; marks the port as owned by a FlexKV metrics endpoint |
+
+> Except for `flexkv_py_metrics_server_info`, every `flexkv_py_*` metric above is the
+> **sum over all FlexKV processes on the node**, not the value of a single process.
+> See [section 3](#3-multi-process-aggregation-python-metrics).
 
 ---
 
@@ -59,9 +65,81 @@ C++ metrics are managed by the `MetricsManager` singleton, primarily instrumente
 
 ---
 
-## 3. Monitoring Stack Deployment
+## 3. Multi-Process Aggregation (Python Metrics)
 
-### 3.1 Directory Structure
+> Deeper reading: [design notes (zh)](./multiprocess_metrics_design_zh.md) ·
+> [fix notes (zh)](./multiprocess_metrics_fix_zh.md)
+
+### 3.1 Why it is needed
+
+Python metrics are recorded by `GlobalCacheEngine`, which initializes the collector
+in its constructor, and there is one `GlobalCacheEngine` **per engine process**. A
+TP/DP deployment, or a FlexKV server with multiple clients, runs several processes
+on the same node; each holds its own counters and each tries to bind the same
+`FLEXKV_PY_METRICS_PORT`.
+
+Only whichever process wins the bind can expose anything. Before aggregation, what
+you saw was not a node-level number but **one arbitrary process** — which one depends
+on who binds first and can change on every restart.
+
+### 3.2 How it works
+
+- Every process writes into one shared mmap directory (prometheus_client's
+  multiprocess mode). The default path is derived from the port:
+  `<tmp>/flexkv-multiproc-<FLEXKV_PY_METRICS_PORT>`, so all processes of one
+  deployment share it.
+- **Only the main process** starts the HTTP endpoint. Other processes write into the
+  directory and are merged into that endpoint.
+- If another FlexKV process already owns the port, this process does not bind again
+  and treats the endpoint as shared.
+- The directory is emptied when a deployment starts up (decided by the owner file
+  holder), so a restart does not double every counter.
+- Files of exited processes are purged before each merge for `gauge_live*` metrics,
+  so pool gauges do not count dead processes. Counter files are kept, so a process
+  exiting never makes a cumulative value go backwards.
+
+### 3.3 Aggregation semantics: sum, not average
+
+prometheus_client has no `avg` multiprocess mode, and that is the right call —
+averaging these metrics would almost always be wrong:
+
+| Metric type | Aggregation | Why not an average |
+|---|---|---|
+| Counter (hit/miss/transfer/evicted/allocation failures) | sum | Cumulative values can only accumulate. For a per-process average, do it in PromQL: `sum(rate(...)) / count(rate(...))` |
+| Gauge `mempool_total/free_blocks` | sum (`livesum`) | Their only use is forming a ratio, and **the ratio has to be taken after summing**. Averaging per-process ratios over-weights small pools: a 1000-block pool at 10% and a 100-block pool at 90% is 17.3% full, not 50% |
+| Gauge `metrics_server_info` | max | An existence flag that is always 1, not an additive quantity |
+
+Counters therefore get **larger after upgrading** (roughly by the process count).
+That is the fix taking effect, not a regression. If nothing changes, the deployment
+already had a single process recording metrics.
+
+### 3.4 Two things to watch
+
+1. **MLA H2D is a broadcast** (every rank reads the full KV), so
+   `flexkv_py_transfer_bytes_total` sums to TP times the logical KV volume. That is
+   physically what crosses PCIe, but reading it as "KV throughput" overstates it.
+2. **`mempool_*_blocks` changes meaning** from "one process's pool" to "the whole
+   node". Alert thresholds tuned against a single instance need to be re-set. This
+   assumes each process owns a disjoint pool; if a deployment shares one pool and
+   every process reports the full value, these two gauges must become `livemax`.
+
+### 3.5 Isolation
+
+Two independent FlexKV deployments on the same host sharing a port also share the
+aggregation directory. To isolate them:
+
+```bash
+export FLEXKV_PY_METRICS_MULTIPROC_DIR=/tmp/flexkv-multiproc-instance-a
+```
+
+If the host engine (sglang/vLLM) already runs prometheus_client in multiprocess mode,
+FlexKV joins that engine's directory instead of overriding it.
+
+---
+
+## 4. Monitoring Stack Deployment
+
+### 4.1 Directory Structure
 
 ```
 FlexKV/monitoring/
@@ -77,7 +155,7 @@ FlexKV/monitoring/
             └── prometheus.yml # Datasource auto-configuration
 ```
 
-### 3.2 Quick Deploy
+### 4.2 Quick Deploy
 
 ```bash
 # 0. Install Python dependency
@@ -100,7 +178,7 @@ cd <path-to-FlexKV>/monitoring
 docker compose down -v
 ```
 
-### 3.3 Service Access
+### 4.3 Service Access
 
 | Service | URL | Description |
 |---|---|---|
@@ -119,7 +197,7 @@ curl -s http://localhost:8080/metrics | grep flexkv_py_
 curl -s http://localhost:8081/metrics | grep flexkv_cpp_
 ```
 
-### 3.4 Accessing Grafana Dashboards
+### 4.4 Accessing Grafana Dashboards
 
 1. Open your browser and navigate to `http://localhost:3000`
 2. Log in with default credentials: username `admin`, password `admin`

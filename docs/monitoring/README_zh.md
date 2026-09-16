@@ -13,6 +13,7 @@ FlexKV 集成了基于 [Prometheus](https://prometheus.io/) 的运行时指标�
 | `FLEXKV_ENABLE_METRICS` | `0` | 启用指标收集（设为 `1` 启用，默认禁用） |
 | `FLEXKV_PY_METRICS_PORT` | `8080` | Python 指标 HTTP 服务端口 |
 | `FLEXKV_CPP_METRICS_PORT` | `8081` | C++ 指标 HTTP 服务端口 |
+| `FLEXKV_PY_METRICS_MULTIPROC_DIR` | 由端口推导 | Python 指标跨进程聚合目录，详见[第三节](#三多进程聚合python-指标) |
 
 ### 1.2 配置方式
 
@@ -45,6 +46,9 @@ Python 指标由 `GlobalCacheEngine` 在 `cache_engine.py` 中记录，通过 `F
 | `flexkv_py_evicted_blocks_total` | Counter | `device` | 驱逐的 blocks 总数 |
 | `flexkv_py_allocated_blocks_total` | Counter | `device` | 分配的 blocks 总数 |
 | `flexkv_py_allocation_failures_total` | Counter | `mode` | 资源分配失败次数 |
+| `flexkv_py_metrics_server_info` | Gauge | - | 恒为 `1`，标记该端口由 FlexKV 指标端点占用 |
+
+> 除 `flexkv_py_metrics_server_info` 外，上表所有 `flexkv_py_*` 指标都是**本节点所有 FlexKV 进程之和**，不是单个进程的值。详见[第三节](#三多进程聚合python-指标)。
 
 ---
 
@@ -59,9 +63,70 @@ C++ 指标由 `MetricsManager` 单例管理，主要在 RadixTree 缓存操作�
 
 ---
 
-## 三、监控组件部署说明
+## 三、多进程聚合（Python 指标）
 
-### 3.1 目录结构
+> 深入阅读：[设计文档](./multiprocess_metrics_design_zh.md)（问题与方案取舍） ·
+> [修复文档](./multiprocess_metrics_fix_zh.md)（改动清单、验证、升级影响）
+
+### 3.1 为什么需要
+
+FlexKV 的 Python 指标由 `GlobalCacheEngine` 记录（`cache_engine.py` 中构造时初始化
+collector），而 `GlobalCacheEngine` **每个引擎进程各有一个**。TP/DP 部署、或多 client
+的 FlexKV server，都会在同一节点上跑出多个进程，每个进程都持有自己的一份计数器，
+并且都会尝试绑定同一个 `FLEXKV_PY_METRICS_PORT`。
+
+只有抢到端口的那个进程能暴露指标。所以聚合之前，看到的并不是"节点指标"，而是
+**随机一个进程的抽样**——是哪个进程取决于谁先 bind，每次重启都可能换一个。
+
+### 3.2 工作方式
+
+- 所有进程把指标写进同一个 mmap 目录（prometheus_client 的多进程模式），默认路径
+  由端口推导：`<tmp>/flexkv-multiproc-<FLEXKV_PY_METRICS_PORT>`。同一次部署的进程
+  端口相同，因此共享同一目录。
+- **只有主进程**起 HTTP 端点；其余进程只写目录。端点上看到的是合并后的结果。
+- 若另一个 FlexKV 进程已经占用了该端口，本进程不再重复绑定，视为共享同一端点。
+- 目录在**首次部署启动时清空**（以 owner 文件的持有者为准），因此重启不会让计数翻倍。
+- 进程退出后，其 `gauge_live*` 文件会在下次采集时被清理，水位类指标不会把死进程算进去；
+  Counter 文件则保留，累计量不会因为某个进程退出而回退。
+
+### 3.3 聚合语义：求和，不是平均
+
+prometheus_client 的多进程模式没有 `avg`，这是合理的——这批指标取平均基本都是错的：
+
+| 指标类型 | 聚合方式 | 说明 |
+|---|---|---|
+| Counter（命中/未命中/传输/驱逐/分配失败） | 求和 | 累计量只能累加。要看"单进程平均"请在 PromQL 层做：`sum(rate(...)) / count(rate(...))` |
+| Gauge `mempool_total/free_blocks` | 求和（livesum） | 这两个指标唯一用途是算水位，而**比值必须先求和再相除**。先算各进程水位再平均，会让小池被等权放大：1000 块的池用了 10%、100 块的池用了 90%，真实水位 17.3%，平均得 50% |
+| Gauge `metrics_server_info` | 取最大值 | 恒为 1 的存在性标志，不是可累加量 |
+
+因此**升级后计数类指标会变大**（约等于进程数倍），这是修复生效，不是回归。若升级后
+数字没变，说明该部署本来就只有一个进程在记录。
+
+### 3.4 需要注意的两点
+
+1. **MLA 的 H2D 是 broadcast**（每个 rank 各读一份全量 KV），所以
+   `flexkv_py_transfer_bytes_total` 求和后会是逻辑 KV 量的 TP 倍。这是物理真值
+   （PCIe 上确实过了 N 份），但按"KV 吞吐量"解读会虚高。
+2. **`mempool_*_blocks` 的含义从"一个进程的池"变成"全节点之和"**。如果之前拿它当
+   单实例水位配告警，阈值需要重设。前提是各进程的池互不相交；如果某部署所有进程
+   共享同一个池、各自上报全量，这两个 Gauge 要改成 `livemax`。
+
+### 3.5 隔离
+
+同机运行两套独立 FlexKV 且共用一个端口时，会共享同一聚合目录。需要隔离时显式指定：
+
+```bash
+export FLEXKV_PY_METRICS_MULTIPROC_DIR=/tmp/flexkv-multiproc-instance-a
+```
+
+若宿主引擎（sglang/vLLM）已经启用了 prometheus_client 的多进程模式，FlexKV 会
+沿用引擎的目录，不会覆盖。
+
+---
+
+## 四、监控组件部署说明
+
+### 4.1 目录结构
 
 ```
 FlexKV/monitoring/
@@ -77,7 +142,7 @@ FlexKV/monitoring/
             └── prometheus.yml # Datasource auto-configuration
 ```
 
-### 3.2 快速部署
+### 4.2 快速部署
 
 ```bash
 # 0. Install Python dependency
@@ -100,7 +165,7 @@ cd <path-to-FlexKV>/monitoring
 docker compose down -v
 ```
 
-### 3.3 访问服务
+### 4.3 访问服务
 
 | 服务 | 地址 | 说明 |
 |---|---|---|
@@ -119,7 +184,7 @@ curl -s http://localhost:8080/metrics | grep flexkv_py_
 curl -s http://localhost:8081/metrics | grep flexkv_cpp_
 ```
 
-### 3.4 访问 Grafana 仪表板
+### 4.4 访问 Grafana 仪表板
 
 1. 打开浏览器访问 `http://localhost:3000`
 2. 使用默认账号登录：用户名 `admin`，密码 `admin`
