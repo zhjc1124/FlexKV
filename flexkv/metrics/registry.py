@@ -1,10 +1,21 @@
 """FlexKV metric registries and cross-process aggregation.
 
-FlexKV records metrics from more than one process. ``GlobalCacheEngine`` is
-built once per engine process (``flexkv/cache/cache_engine.py``), so a TP/DP
-deployment or a multi-client FlexKV server has one metrics collector per
-process, and every one of them tries to bind the same metrics port. Only one
-binds; without aggregation the rest is silently dropped.
+FlexKV may record metrics from more than one process. The collector is built
+in ``GlobalCacheEngine.__init__`` (``flexkv/cache/cache_engine.py``), and how
+many processes hold one depends on the integration:
+
+- sglang: exactly one. Only the sync leader builds a ``KVManager``
+  (``integration/sglang/connector.py``; the gate is ``pp_rank == 0 and
+  attn_tp_rank == 0 and attn_cp_rank == 0`` in ``integration/sglang/comm.py``).
+  Under ``server_client_mode`` the single ``KVTaskEngine`` lives in the
+  ``KVServer`` subprocess instead.
+- vLLM / TRT-LLM and multi-instance hosts: potentially several, because those
+  adapters build a ``KVManager`` without a leader gate.
+- The spawned TransferManager subprocess becomes a second writer the moment
+  transfer durations are exported.
+
+Without aggregation, any writer that does not win the bind is silently
+dropped, and losing the bind used to report success anyway.
 
 ``prometheus_client`` merges across processes only when
 PROMETHEUS_MULTIPROC_DIR is set *before* the first metric object is built, so

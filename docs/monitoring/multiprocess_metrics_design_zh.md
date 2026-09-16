@@ -5,9 +5,27 @@
 
 ## 0. 一句话结论
 
-FlexKV 的 Python 指标之前**只暴露了随机一个进程的数据**，且失败时没有任何报错。
-原因是多个引擎进程抢同一个指标端口，抢不到的静默放弃。本设计用 prometheus_client
-的多进程模式把所有进程合并到同一个端点，并把"静默失败"改成"显式报错"。
+**先纠正一个前提**（第一版写错过）：sglang 接入路径下 `GlobalCacheEngine` 是
+**全局唯一**的——只有 sync leader 会建 `KVManager`。所以 Python 指标当前**只有一
+个写方，覆盖率本来就是 100%**，不存在"只看到 1/8 的数据"这回事。
+
+那么这次改动解决的是什么：
+
+1. **端口冲突静默成功**（真实且当前可触发）：多个部署共用 8080 时，抢不到的进程
+   `return True` 假装已经在暴露指标，日志里只有一行 warning。现在改成显式报错。
+2. **为 TransferManager 子进程的指标铺路**（真正的必要性来源）：传输计时天然产生
+   在 spawn 出来的子进程里（`transfer_manager.py:803`）。只要把 `[XFER]` 的耗时接
+   进 Prometheus，就**必须**有跨进程聚合，否则全丢。这个分支不含该改动，但地基是它。
+3. **非 sglang 路径的保险**：vLLM / TRT-LLM adapter 建 `KVManager` 时没有 sync
+   leader 门控，进程数取决于宿主引擎；多实例同机部署时同样会有多个写方。
+
+如何确认自己当前有几个进程在记录：
+
+```bash
+ls ${FLEXKV_PY_METRICS_MULTIPROC_DIR:-/tmp/flexkv-multiproc-8080}
+# counter_1234.db  counter_1235.db  ...  → 每个 counter_<pid>.db 是一个记录进程
+# 只有 1 个 counter_*.db ⇒ 单写方，本改动对数值没有影响
+```
 
 ---
 
@@ -23,40 +41,59 @@ flexkv/cache/cache_engine.py:811-813
         self._metrics_collector = init_global_collector()
 ```
 
-`GlobalCacheEngine` 的持有者是 `KVTaskManager`（`flexkv/kvtask.py:137`），而
-`KVTaskManager` 是**每个引擎进程各建一个**。所以进程拓扑是：
+所以"有几个进程写指标"等价于"有几个进程持有 `GlobalCacheEngine`"。往上追两层：
+
+```
+GlobalCacheEngine  ← 唯一构造点 flexkv/kvtask.py:137（在 KVTaskEngine 内）
+        ↑
+KVTaskEngine       ← flexkv/kvmanager.py:98     非 server_client_mode，进程内
+                   ← flexkv/server/server.py:183 server_client_mode，KVServer 独立进程
+        ↑
+KVManager          ← sglang:     connector.py:244-245  仅 sync leader
+                   ← vLLM:       vllm_v1_adapter.py:243 无门控
+                   ← TRT-LLM:    trtllm_adapter.py:38
+```
+
+**sglang 的 sync leader 是全局唯一的**：
+
+```
+flexkv/integration/sglang/comm.py:160-162
+    self.is_pp_stage_leader = self.attn_tp_rank == 0 and self.attn_cp_rank == 0
+    self.is_sync_leader = self.pp_rank == 0 and self.is_pp_stage_leader
+
+flexkv/integration/sglang/comm.py:82-84（类注释）
+    "sync leader" is the unique rank that talks to the FlexKV
+    KVManager: pp_rank=0, attn_cp_rank=0, attn_tp_rank=0.
+```
+
+即 TP/CP 组里只有 rank0 建 `KVManager`，其余 rank 只建 `KVTPClient`
+（`connector.py:257`，只注册 GPU buffer，不碰 metrics）。于是 sglang 路径的拓扑是：
 
 ```mermaid
 graph TB
-    subgraph node["一个节点 / 一次部署"]
-        P1["引擎进程 rank0<br/>GlobalCacheEngine → collector"]
-        P2["引擎进程 rank1<br/>GlobalCacheEngine → collector"]
-        PN["引擎进程 rankN<br/>GlobalCacheEngine → collector"]
-        TM1["TransferManager 子进程<br/>(spawn, 不记录 Python 指标)"]
-        TM2["TransferManager 子进程"]
+    subgraph node["sglang 部署（server_client_mode=0）"]
+        P0["sync leader 进程<br/>(pp=0,tp=0,cp=0)<br/>KVManager → KVTaskEngine<br/>→ GlobalCacheEngine → collector"]
+        P1["其他 TP/CP rank<br/>只有 KVTPClient<br/>不写指标"]
+        TM["TransferManager 子进程<br/>(spawn)<br/>当前不写 Python 指标"]
     end
 
-    P1 -->|spawn| TM1
-    P2 -->|spawn| TM2
-
-    P1 -.->|"bind 8080 ✅"| EP["/metrics 端点"]
-    P2 -.->|"bind 8080 ❌ 静默失败"| EP
-    PN -.->|"bind 8080 ❌ 静默失败"| EP
+    P0 -->|spawn| TM
+    P0 -->|"bind 8080"| EP["/metrics 端点"]
+    P1 -.->|"不参与"| EP
 
     style EP fill:#e8f0fe
-    style P2 stroke-dasharray: 4 4
-    style PN stroke-dasharray: 4 4
+    style P1 stroke-dasharray: 4 4
+    style TM stroke-dasharray: 4 4
 ```
 
-图里被虚线划掉的，就是修复前**完全不可见**的部分。TP=8 的部署意味着看到的数字
-只覆盖 1/8，而且覆盖的是哪个 rank 每次重启都可能不同。
+`server_client_mode`（`kvmanager.py:66-68`：`dp_size > 1` 或 `instance_num > 1` 或
+`FLEXKV_SERVER_CLIENT_MODE`）下形状不同，但写方数量仍然是 1：sync leader 只建
+`KVDPClient`，真正的 `KVTaskEngine` 在 `KVServer` 子进程里（`server.py:275/286`
+用 `subprocess.Popen` 或 `mp.Process` 起）——**指标仍然只有那一个进程在写**。
 
-如何确认自己有几个进程在记录：
-
-```bash
-ls ${FLEXKV_PY_METRICS_MULTIPROC_DIR:-/tmp/flexkv-multiproc-8080}
-# counter_1234.db  counter_1235.db  ...  → 每个 counter_<pid>.db 是一个记录进程
-```
+结论：sglang 路径下无论哪种模式，Python 指标都是**单写方**。多进程聚合在当前代码
+状态下不改变任何数值，它解决的是"一旦出现第二个写方就必须有"的正确性，以及端口
+冲突的静默失败。
 
 ---
 
@@ -64,12 +101,14 @@ ls ${FLEXKV_PY_METRICS_MULTIPROC_DIR:-/tmp/flexkv-multiproc-8080}
 
 | 编号 | 缺陷 | 位置（修复前 main） | 后果 |
 |---|---|---|---|
-| **D1** | 端点绑定进程内默认注册表 `REGISTRY`，只反映本进程 | `metrics/server.py:112` | N 个进程只有 1 个的数据可见 |
-| **D2** | 抢不到端口时 `warning` + `return True`，调用方以为自己已经在暴露指标 | `metrics/server.py:121-129` + `metrics/collector.py:87-95` | 其余 N-1 个进程零感知地丢数据 |
-| **D3** | 端口被**非 FlexKV** 服务占用时也走同一个"共享"分支 | `metrics/server.py:123-129` | 指标端点根本不是 FlexKV 的，仍报成功 |
+| **D1** | 端点绑定进程内默认注册表 `REGISTRY`，只反映本进程 | `metrics/server.py:112` | 任何写在**其他进程**的指标都不可见。当前单写方下无症状；一旦出现第二个写方（TransferManager 埋点、非 sglang 多引擎）就全丢 |
+| **D2** | 抢不到端口时 `warning` + `return True`，调用方以为自己已经在暴露指标 | `metrics/server.py:121-129` + `metrics/collector.py:87-95` | 共享端口的第二个部署全程"以为自己在报指标"，实际一个字节都没出去 |
+| **D3** | 端口被**非 FlexKV** 服务占用时也走同一个"共享"分支 | `metrics/server.py:123-129` | 指标端点根本不是 FlexKV 的，仍报成功——Prometheus 抓到的是别人的数据 |
 
 D2 和 D3 叠加的杀伤力最大：日志里只有一行混在启动输出里的 warning，
 `init_global_collector()` 照常返回 collector，从调用方看一切正常。
+这两条**与进程数无关**，同机跑两套 FlexKV（例如 P/D 分离的两个引擎共用 8080）
+就会命中。
 
 另外还有两个此前没被注意到、但同样属于"多进程正确性"的问题：
 

@@ -73,14 +73,30 @@ C++ metrics are managed by the `MetricsManager` singleton, primarily instrumente
 ### 3.1 Why it is needed
 
 Python metrics are recorded by `GlobalCacheEngine`, which initializes the collector
-in its constructor, and there is one `GlobalCacheEngine` **per engine process**. A
-TP/DP deployment, or a FlexKV server with multiple clients, runs several processes
-on the same node; each holds its own counters and each tries to bind the same
-`FLEXKV_PY_METRICS_PORT`.
+in its constructor, so "how many processes write metrics" equals "how many processes
+hold a `GlobalCacheEngine`".
 
-Only whichever process wins the bind can expose anything. Before aggregation, what
-you saw was not a node-level number but **one arbitrary process** — which one depends
-on who binds first and can change on every restart.
+**On the sglang path that number is 1.** Only the sync leader builds a `KVManager`
+(`connector.py:244-245`; the predicate is `comm.py:160-162`,
+`pp_rank==0 and tp_rank==0 and cp_rank==0`, described in the class docstring as
+"the unique rank"). Every other rank only owns a `KVTPClient` and never touches
+metrics. `server_client_mode` also leaves exactly one writer — the `KVTaskEngine`
+lives in the `KVServer` subprocess (`server.py:183`).
+
+Why aggregate anyway:
+
+1. **Port conflicts used to be silent.** A process that lost the bind logged a
+   warning and then `return True`, so the caller believed it was exposing metrics.
+   Two FlexKV deployments on one host sharing port 8080 (e.g. the P and D engines
+   of a disaggregated setup) hit this: the second one runs empty with no error.
+2. **A second writer is one change away.** Transfer timing is produced in the
+   spawned TransferManager subprocess (`transfer_manager.py:803`); as soon as those
+   durations are exported, aggregation becomes mandatory. The vLLM / TRT-LLM
+   adapters build `KVManager` without a sync-leader gate, so they can also produce
+   more than one writer.
+
+Before aggregation, only whichever process won the bind could expose anything, and
+losing was silent.
 
 ### 3.2 How it works
 

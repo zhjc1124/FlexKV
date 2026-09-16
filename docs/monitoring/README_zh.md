@@ -70,13 +70,25 @@ C++ 指标由 `MetricsManager` 单例管理，主要在 RadixTree 缓存操作�
 
 ### 3.1 为什么需要
 
-FlexKV 的 Python 指标由 `GlobalCacheEngine` 记录（`cache_engine.py` 中构造时初始化
-collector），而 `GlobalCacheEngine` **每个引擎进程各有一个**。TP/DP 部署、或多 client
-的 FlexKV server，都会在同一节点上跑出多个进程，每个进程都持有自己的一份计数器，
-并且都会尝试绑定同一个 `FLEXKV_PY_METRICS_PORT`。
+Python 指标由 `GlobalCacheEngine` 记录（`cache_engine.py` 构造时初始化 collector），
+所以"有几个进程写指标" = "有几个进程持有 `GlobalCacheEngine`"。
 
-只有抢到端口的那个进程能暴露指标。所以聚合之前，看到的并不是"节点指标"，而是
-**随机一个进程的抽样**——是哪个进程取决于谁先 bind，每次重启都可能换一个。
+**sglang 路径下这个数字是 1**：只有 sync leader 会建 `KVManager`
+（`connector.py:244-245`；判据 `comm.py:160-162` 的
+`pp_rank==0 and tp_rank==0 and cp_rank==0`，类注释称其为 "the unique rank"），
+其余 rank 只有 `KVTPClient`，不碰 metrics。`server_client_mode` 下同样只有一个
+写方——`KVTaskEngine` 在 `KVServer` 独立子进程里（`server.py:183`）。
+
+既然如此，为什么还要做跨进程聚合：
+
+1. **端口冲突此前是静默的**：抢不到端口的进程 `warning` 后 `return True`，调用方
+   以为自己已经在暴露指标。同机跑两套 FlexKV（例如 P/D 分离的两个引擎共用 8080）
+   就会命中——第二个部署全程空转且零报错。
+2. **第二个写方随时会出现**：传输计时天然产生在 spawn 的 TransferManager 子进程
+   里（`transfer_manager.py:803`）。只要把耗时接进 Prometheus，没有聚合就全丢。
+   vLLM / TRT-LLM adapter 建 `KVManager` 时没有 sync leader 门控，也是同理。
+
+聚合之前，多写方场景下只有抢到端口的进程能暴露指标，且失败无任何报错。
 
 ### 3.2 工作方式
 

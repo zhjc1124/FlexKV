@@ -5,20 +5,28 @@
 
 ## 0. 结论先行
 
-**修的不是"指标不准"，是"大部分指标根本没被暴露"。** 修复前后差的不只是精度，是分母。
+> **前提更正**：第一版这里写"TP=8 只看到 1/8"是错的。sglang 路径下
+> `GlobalCacheEngine` 全局唯一（只有 sync leader 建 `KVManager`，
+> `comm.py:160-162`），Python 指标**本来就只有一个写方，覆盖率 100%**。
+> 详见[设计文档 §1](./multiprocess_metrics_design_zh.md#1-背景指标在哪里产生)。
 
-| 指标 | 修复前实际口径 | 修复后 |
+这次改动的实际收益分三块：
+
+| 项 | 修复前 | 修复后 |
 |---|---|---|
-| `cache_hit/miss_blocks_total` | **1 个进程**（谁先 bind 到 8080） | 全节点所有进程求和 |
-| `transfer_blocks/ops/bytes_total` | 同上 | 全节点求和 |
-| `allocation_failures_total`、`evicted/allocated_blocks_total` | 同上 | 全节点求和 |
-| `mempool_total/free_blocks` | 1 个进程的池 | `livesum` = 存活进程求和 |
-| `metrics_server_info` | 不存在（新增） | 恒为 1，标记端口归属 |
+| 端口被**非 FlexKV** 服务占用 | warning 后 `return True`，端点其实是别人的 | `raise`，日志显式报错（不阻断启动） |
+| 端口被**另一个 FlexKV** 占用 | 同样 `return True`，第二个部署全程空转 | 识别为共享，走聚合目录，两边数据都可见 |
+| 第二个写方出现时（TransferManager 埋点 / 非 sglang 多引擎 / 多实例同机） | 全部丢失且无报错 | 自动合并 |
 
-也就是说，命中率、传输量、内存池水位**之前都是单进程抽样值**。TP=8 时你看到的是
-1/8，且是哪个 rank 不确定。
+| 指标 | 单写方部署（sglang 现状） | 多写方部署 |
+|---|---|---|
+| `cache_hit/miss_blocks_total` 等 Counter | **数值不变** | 所有进程求和 |
+| `mempool_total/free_blocks` | **数值不变** | `livesum` = 存活进程求和 |
+| `metrics_server_info` | 新增，恒为 1，用于识别端口归属 | 同左 |
 
-**升级后计数类指标会跳到约 N 倍，这是修复生效的标志，不是回归。**
+**所以：sglang 单实例部署升级后数值不应有任何跳变。** 如果计数跳到 N 倍，说明
+该部署本来就有 N 个进程在写（多实例同机、或 vLLM/TRT-LLM 路径），那是修复生效，
+不是回归。
 
 ---
 
@@ -153,8 +161,11 @@ curl -s http://127.0.0.1:8080/metrics | grep flexkv_py_metrics_server_info
 curl -s http://127.0.0.1:8080/metrics | grep flexkv_py_cache_hit_blocks_total
 ```
 
-对比升级前后同 workload 的 `cache_hit_blocks_total`：TP=N 部署应约为原来的 N 倍。
-**若数字没变，说明该部署本就只有 1 个进程在记录指标**（例如只有 rank0 做 get/put）。
+对比升级前后同 workload 的 `cache_hit_blocks_total`：
+
+- **数字没变** → 该部署本来就只有 1 个写方（sglang 单实例正是如此），符合预期。
+- **跳到约 N 倍** → 该部署有 N 个进程在写（多实例同机、或 vLLM / TRT-LLM 路径），
+  修复生效，不是回归。
 
 ### 3.3 `livesum` 正确性判据（需要你确认）
 
@@ -214,7 +225,8 @@ flexkv_py_mempool_total_blocks{device="cpu"} = ?
 git revert <commit>          # 或整体回退到 origin/main
 ```
 
-回滚后指标回到"单进程抽样"口径，无数据损坏（聚合目录在 `/tmp`，部署启动时会清空）。
+回滚后指标回到"只有抢到端口的进程可见"的口径，无数据损坏（聚合目录在 `/tmp`，
+部署启动时会清空）。单写方部署回滚前后数值一致。
 
 只想关掉聚合、保留其他行为（不需要，仅说明）：设 `FLEXKV_ENABLE_METRICS=0`
 会连指标一起关掉，没有单独关闭聚合的开关。
